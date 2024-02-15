@@ -226,8 +226,6 @@ where
                     if let Err(error) = this.on_block_response(response) {
                         this.on_error(error, Some(peer_id));
                     }
-
-                    maybe_more_pending_requests = true;
                 }
                 Err(error) => {
                     if error.is_channel_closed() {
@@ -237,6 +235,8 @@ where
                     this.on_error(error.into(), None);
                 }
             }
+
+            maybe_more_pending_requests = true;
         }
 
         let mut budget: u32 = 1024;
