@@ -1,15 +1,15 @@
 //! Blocks/Headers management for the p2p network.
 
-use crate::{
-    budget::DEFAULT_BUDGET_TRY_DRAIN_STREAM, metrics::EthRequestHandlerMetrics, peers::PeersHandle,
-    poll_nested_stream_with_yield_points,
-};
+use crate::{metrics::EthRequestHandlerMetrics, peers::PeersHandle};
 use futures::StreamExt;
 use reth_eth_wire::{
     BlockBodies, BlockHeaders, GetBlockBodies, GetBlockHeaders, GetNodeData, GetReceipts, NodeData,
     Receipts,
 };
 use reth_interfaces::p2p::error::RequestResult;
+use reth_net_common::{
+    budget::DEFAULT_BUDGET_TRY_DRAIN_STREAM, poll_nested_stream_with_yield_points,
+};
 use reth_primitives::{BlockBody, BlockHashOrNumber, Header, HeadersDirection, PeerId};
 use reth_provider::{BlockReader, HeaderProvider, ReceiptProvider};
 use std::{

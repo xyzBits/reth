@@ -6057,6 +6057,7 @@ dependencies = [
  "reth-db",
  "reth-interfaces",
  "reth-metrics",
+ "reth-net-common",
  "reth-primitives",
  "reth-provider",
  "reth-tasks",

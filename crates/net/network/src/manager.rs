@@ -16,7 +16,7 @@
 //! to the local node. Once a (tcp) connection is established, both peers start to authenticate a [RLPx session](https://github.com/ethereum/devp2p/blob/master/rlpx.md) via a handshake. If the handshake was successful, both peers announce their capabilities and are now ready to exchange sub-protocol messages via the RLPx session.
 
 use crate::{
-    budget::{DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL, DEFAULT_BUDGET_TRY_DRAIN_STREAM},
+    budgets::DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL,
     config::NetworkConfig,
     discovery::Discovery,
     error::{NetworkError, ServiceKind},
@@ -27,7 +27,6 @@ use crate::{
     metrics::{DisconnectMetrics, NetworkMetrics, NETWORK_POOL_TRANSACTIONS_SCOPE},
     network::{NetworkHandle, NetworkHandleMessage},
     peers::{PeersHandle, PeersManager},
-    poll_nested_stream_with_yield_points,
     protocol::IntoRlpxSubProtocol,
     session::SessionManager,
     state::NetworkState,
@@ -42,7 +41,10 @@ use reth_eth_wire::{
     DisconnectReason, EthVersion, Status,
 };
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
-use reth_net_common::bandwidth_meter::BandwidthMeter;
+use reth_net_common::{
+    bandwidth_meter::BandwidthMeter, budget::DEFAULT_BUDGET_TRY_DRAIN_STREAM,
+    poll_nested_stream_with_yield_points,
+};
 use reth_network_api::ReputationChangeKind;
 use reth_primitives::{ForkId, NodeRecord, PeerId, B256};
 use reth_provider::{BlockNumReader, BlockReader};
@@ -675,7 +677,10 @@ where
             DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL,
             this.from_handle_rx.poll_next_unpin(cx),
             |msg| this.on_handle_message(msg),
-            error!("Network channel closed");
+            {
+                error!("Network channel closed");
+                return Poll::Ready(Some(()))
+            }
         );
 
         let maybe_more_swarm_events = poll_nested_stream_with_yield_points!(

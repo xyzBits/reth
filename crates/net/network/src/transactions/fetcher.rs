@@ -1,7 +1,6 @@
 use crate::{
     cache::{LruCache, LruMap},
     message::PeerRequest,
-    poll_nested_stream_with_yield_points,
 };
 use derive_more::Constructor;
 use futures::{stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt};
@@ -13,6 +12,7 @@ use reth_interfaces::p2p::error::{RequestError, RequestResult};
 use reth_metrics::common::mpsc::{
     metered_unbounded_channel, UnboundedMeteredReceiver, UnboundedMeteredSender,
 };
+use reth_net_common::poll_nested_stream_with_yield_points;
 use reth_primitives::{PeerId, PooledTransactionsElement, TxHash};
 use schnellru::{ByLength, Unlimited};
 use std::{
