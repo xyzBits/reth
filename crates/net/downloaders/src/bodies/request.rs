@@ -211,37 +211,56 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        loop {
-            if this.pending_headers.is_empty() {
-                return Poll::Ready(Ok(std::mem::take(&mut this.buffer)))
-            }
+        if this.pending_headers.is_empty() {
+            return Poll::Ready(Ok(std::mem::take(&mut this.buffer)))
+        }
 
-            // Check if there is a pending requests. It might not exist if all
-            // headers are empty and there is nothing to download.
-            if let Some(fut) = this.fut.as_mut() {
-                match ready!(fut.poll_unpin(cx)) {
-                    Ok(response) => {
-                        let peer_id = response.peer_id();
-                        if let Err(error) = this.on_block_response(response) {
-                            this.on_error(error, Some(peer_id));
-                        }
-                    }
-                    Err(error) => {
-                        if error.is_channel_closed() {
-                            return Poll::Ready(Err(error.into()))
-                        }
+        let mut maybe_more_pending_requests = false;
 
-                        this.on_error(error.into(), None);
+        // Check if there is a pending requests. It might not exist if all
+        // headers are empty and there is nothing to download.
+        if let Some(fut) = this.fut.as_mut() {
+            match ready!(fut.poll_unpin(cx)) {
+                Ok(response) => {
+                    let peer_id = response.peer_id();
+                    if let Err(error) = this.on_block_response(response) {
+                        this.on_error(error, Some(peer_id));
                     }
+
+                    maybe_more_pending_requests = true;
+                }
+                Err(error) => {
+                    if error.is_channel_closed() {
+                        return Poll::Ready(Err(error.into()))
+                    }
+
+                    this.on_error(error.into(), None);
                 }
             }
+        }
 
-            // Buffer any empty headers
-            while this.pending_headers.front().map(|h| h.is_empty()).unwrap_or_default() {
+        let mut budget: u32 = 1024;
+
+        // Buffer any empty headers
+        let maybe_more_pending_headers = loop {
+            if this.pending_headers.front().map(|h| h.is_empty()).unwrap_or_default() {
                 let header = this.pending_headers.pop_front().unwrap();
                 this.buffer.push(BlockResponse::Empty(header));
             }
+
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
+                break true
+            }
+        };
+
+        if maybe_more_pending_requests || maybe_more_pending_headers {
+            // make sure we're woken up again
+            cx.waker().wake_by_ref();
+            return Poll::Pending
         }
+
+        Poll::Pending
     }
 }
 
