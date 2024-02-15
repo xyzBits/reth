@@ -769,11 +769,11 @@ where
 
         // If we have a new tip request we need to complete that first before we send batched
         // requests
-        while let Some(mut req) = this.sync_target_request.take() {
+        if let Some(mut req) = this.sync_target_request.take() {
             match req.poll_unpin(cx) {
                 Poll::Ready(outcome) => {
                     match this.on_sync_target_outcome(outcome) {
-                        Ok(()) => break,
+                        Ok(()) => (),
                         Err(ReverseHeadersDownloaderError::Response(error)) => {
                             trace!(target: "downloaders::headers", ?error, "invalid sync target response");
                             if error.is_channel_closed() {
@@ -810,74 +810,73 @@ where
         // headers for 3.) 2. exhaust all capacity by sending requests
         // 3. return batch, if enough validated
         // 4. return Pending if 2.) did not submit a new request, else continue
-        loop {
-            // poll requests
-            while let Poll::Ready(Some(outcome)) = this.in_progress_queue.poll_next_unpin(cx) {
-                this.metrics.in_flight_requests.decrement(1.);
-                // handle response
-                match this.on_headers_outcome(outcome) {
-                    Ok(()) => (),
-                    Err(ReverseHeadersDownloaderError::Response(error)) => {
-                        if error.is_channel_closed() {
-                            // download channel closed which means the network was dropped
-                            return Poll::Ready(None)
-                        }
-                        this.on_headers_error(error);
+
+        // poll requests
+        if let Poll::Ready(Some(outcome)) = this.in_progress_queue.poll_next_unpin(cx) {
+            this.metrics.in_flight_requests.decrement(1.);
+            // handle response
+            match this.on_headers_outcome(outcome) {
+                Ok(()) => (),
+                Err(ReverseHeadersDownloaderError::Response(error)) => {
+                    if error.is_channel_closed() {
+                        // download channel closed which means the network was dropped
+                        return Poll::Ready(None)
                     }
-                    Err(ReverseHeadersDownloaderError::Downloader(error)) => {
-                        this.clear();
-                        return Poll::Ready(Some(Err(error)))
-                    }
-                };
-            }
-
-            // shrink the buffer after handling headers outcomes
-            this.buffered_responses.shrink_to_fit();
-
-            // marks the loop's exit condition: exit if no requests submitted
-            let mut progress = false;
-
-            let concurrent_request_limit = this.concurrent_request_limit();
-            // populate requests
-            while this.in_progress_queue.len() < concurrent_request_limit &&
-                this.buffered_responses.len() < this.max_buffered_responses
-            {
-                if let Some(request) = this.next_request() {
-                    trace!(
-                        target: "downloaders::headers",
-                        "Requesting headers {request:?}"
-                    );
-                    progress = true;
-                    this.submit_request(request, Priority::Normal);
-                } else {
-                    // no more requests
-                    break
+                    this.on_headers_error(error);
                 }
-            }
-
-            // yield next batch
-            if this.queued_validated_headers.len() >= this.stream_batch_size {
-                let next_batch = this.split_next_batch();
-
-                // Note: if this would drain all headers, we need to keep the lowest (last index)
-                // around so we can continue validating headers responses.
-                if this.queued_validated_headers.is_empty() {
-                    this.lowest_validated_header = next_batch.last().cloned();
+                Err(ReverseHeadersDownloaderError::Downloader(error)) => {
+                    this.clear();
+                    return Poll::Ready(Some(Err(error)))
                 }
+            };
+        }
 
-                trace!(target: "downloaders::headers", batch=%next_batch.len(), "Returning validated batch");
+        // shrink the buffer after handling headers outcomes
+        this.buffered_responses.shrink_to_fit();
 
-                this.metrics.total_flushed.increment(next_batch.len() as u64);
-                return Poll::Ready(Some(Ok(next_batch)))
-            }
+        // marks the loop's exit condition: exit if no requests submitted
+        let mut progress = false;
 
-            if !progress {
+        let concurrent_request_limit = this.concurrent_request_limit();
+        // populate requests
+        while this.in_progress_queue.len() < concurrent_request_limit &&
+            this.buffered_responses.len() < this.max_buffered_responses
+        {
+            if let Some(request) = this.next_request() {
+                trace!(
+                    target: "downloaders::headers",
+                    "Requesting headers {request:?}"
+                );
+                progress = true;
+                this.submit_request(request, Priority::Normal);
+            } else {
+                // no more requests
                 break
             }
         }
 
+        // yield next batch
+        if this.queued_validated_headers.len() >= this.stream_batch_size {
+            let next_batch = this.split_next_batch();
+
+            // Note: if this would drain all headers, we need to keep the lowest (last index)
+            // around so we can continue validating headers responses.
+            if this.queued_validated_headers.is_empty() {
+                this.lowest_validated_header = next_batch.last().cloned();
+            }
+
+            trace!(target: "downloaders::headers", batch=%next_batch.len(), "Returning validated batch");
+
+            this.metrics.total_flushed.increment(next_batch.len() as u64);
+            return Poll::Ready(Some(Ok(next_batch)))
+        }
+
+        //  if !progress {
+        //     break
+        // }
+
         // all requests are handled, stream is finished
-        if this.in_progress_queue.is_empty() {
+        if !this.queued_validated_headers.is_empty() {
             let next_batch = this.split_next_batch();
             if next_batch.is_empty() {
                 this.clear();
