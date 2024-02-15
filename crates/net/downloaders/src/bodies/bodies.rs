@@ -14,6 +14,7 @@ use reth_interfaces::{
         error::{DownloadError, DownloadResult},
     },
 };
+use reth_net_common::budget::DEFAULT_BUDGET_TRY_DRAIN_STREAM;
 use reth_primitives::{BlockNumber, SealedHeader};
 use reth_provider::HeaderProvider;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
@@ -346,32 +347,41 @@ where
             return Poll::Ready(None)
         }
         // Submit new requests and poll any in progress
-        loop {
-            // Yield next batch if ready
-            if let Some(next_batch) = this.try_split_next_batch() {
-                return Poll::Ready(Some(Ok(next_batch)))
-            }
 
-            // Poll requests
-            while let Poll::Ready(Some(response)) = this.in_progress_queue.poll_next_unpin(cx) {
-                this.metrics.in_flight_requests.decrement(1.);
-                match response {
-                    Ok(response) => {
-                        this.buffer_bodies_response(response);
-                    }
-                    Err(error) => {
-                        tracing::debug!(target: "downloaders::bodies", ?error, "Request failed");
-                        this.clear();
-                        return Poll::Ready(Some(Err(error)))
-                    }
-                };
-            }
+        // Yield next batch if ready
+        if let Some(next_batch) = this.try_split_next_batch() {
+            return Poll::Ready(Some(Ok(next_batch)))
+        }
 
-            // Loop exit condition
-            let mut new_request_submitted = false;
-            // Submit new requests
-            let concurrent_requests_limit = this.concurrent_request_limit();
-            'inner: while this.in_progress_queue.len() < concurrent_requests_limit &&
+        // Poll requests
+        let mut budget = DEFAULT_BUDGET_TRY_DRAIN_STREAM;
+        let maybe_more_requests = loop {
+            let Poll::Ready(Some(response)) = this.in_progress_queue.poll_next_unpin(cx) else {
+                break false
+            };
+
+            this.metrics.in_flight_requests.decrement(1.);
+            match response {
+                Ok(response) => {
+                    this.buffer_bodies_response(response);
+                }
+                Err(error) => {
+                    tracing::debug!(target: "downloaders::bodies", ?error, "Request failed");
+                    this.clear();
+                    return Poll::Ready(Some(Err(error)))
+                }
+            }
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
+                break true
+            }
+        };
+
+        // Submit new requests
+        let mut budget = DEFAULT_BUDGET_TRY_DRAIN_STREAM; // reset budget
+        let concurrent_requests_limit = this.concurrent_request_limit();
+        let maybe_more_submissions = loop {
+            if this.in_progress_queue.len() < concurrent_requests_limit &&
                 this.has_buffer_capacity()
             {
                 match this.next_headers_request() {
@@ -382,40 +392,55 @@ where
                             Arc::clone(&this.consensus),
                             request,
                         );
-                        new_request_submitted = true;
+
+                        budget = budget.saturating_sub(1);
+                        if budget == 0 {
+                            break true
+                        }
                     }
-                    Ok(None) => break 'inner,
+                    Ok(None) => break false,
                     Err(error) => {
                         tracing::error!(target: "downloaders::bodies", ?error, "Failed to download from next request");
                         this.clear();
                         return Poll::Ready(Some(Err(error)))
                     }
-                };
+                }
+            } else {
+                break false
             }
+        };
 
-            while let Some(buf_response) = this.try_next_buffered() {
-                this.queue_bodies(buf_response);
-            }
+        // Queue bodies
+        let mut budget = DEFAULT_BUDGET_TRY_DRAIN_STREAM; // reset budget
+        loop {
+            let Some(buf_response) = this.try_next_buffered() else { break };
 
-            // shrink the buffer so that it doesn't grow indefinitely
-            this.buffered_responses.shrink_to_fit();
+            this.queue_bodies(buf_response);
 
-            if !new_request_submitted {
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
                 break
             }
         }
 
-        // All requests are handled, stream is finished
-        if this.in_progress_queue.is_empty() {
-            if this.queued_bodies.is_empty() {
-                return Poll::Ready(None)
-            }
+        // shrink the buffer so that it doesn't grow indefinitely
+        this.buffered_responses.shrink_to_fit();
+
+        if !this.queued_bodies.is_empty() {
             let batch_size = this.stream_batch_size.min(this.queued_bodies.len());
             let next_batch = this.queued_bodies.drain(..batch_size).collect::<Vec<_>>();
             this.queued_bodies.shrink_to_fit();
+            // update metrics
             this.metrics.total_flushed.increment(next_batch.len() as u64);
             this.metrics.queued_blocks.set(this.queued_bodies.len() as f64);
+
             return Poll::Ready(Some(Ok(next_batch)))
+        }
+
+        if maybe_more_requests || maybe_more_submissions {
+            // make sure we're woken up again
+            cx.waker().wake_by_ref();
+            return Poll::Pending
         }
 
         Poll::Pending

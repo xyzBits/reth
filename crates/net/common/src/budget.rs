@@ -5,7 +5,26 @@ pub const DEFAULT_BUDGET_TRY_DRAIN_STREAM: u32 = 1024;
 /// register wake up, caller's scope is responsible for doing so.
 #[macro_export]
 macro_rules! poll_nested_stream_with_yield_points {
-    ($target:literal, $label:literal, $budget:ident, $poll_stream:expr, $on_ready_some:expr $(, $on_ready_none:expr;)? $(,)?) => {{
+    ($target:literal, $label:literal, $budget:ident, $poll_stream:expr, $on_ready_some:expr,  $on_ready_none:expr $(,)?) => {{
+        let mut budget: u32 = $budget;
+
+        loop {
+            match $poll_stream {
+                Poll::Ready(Some(item)) => {
+                    let mut f = $on_ready_some;
+                    f(item);
+
+                    budget = budget.saturating_sub(1);
+                    if budget == 0 {
+                        break true
+                    }
+                }
+                Poll::Ready(None) => $on_ready_none,
+                Poll::Pending => break false,
+            }
+        }
+    }};
+    ($target:literal, $label:literal, $budget:ident, $poll_stream:expr, $on_ready_some:expr $(,)?) => {{
         let mut budget: u32 = $budget;
 
         loop {
@@ -20,7 +39,7 @@ macro_rules! poll_nested_stream_with_yield_points {
                     }
                 }
                 Poll::Ready(None) => {
-                    $($on_ready_none;)?
+                    // todo: handle none as log error for all except futures unordered
                     break false
                 }
                 Poll::Pending => break false,

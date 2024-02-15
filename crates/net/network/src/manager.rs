@@ -679,7 +679,7 @@ where
             |msg| this.on_handle_message(msg),
             {
                 error!("Network channel closed");
-                return Poll::Ready(Some(()))
+                return Poll::Ready(())
             }
         );
 
