@@ -20,7 +20,6 @@ reth-rpc-types.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-network-api.workspace = true
-reth-network.workspace = true
 reth-rpc-engine-api.workspace = true
 reth-revm = { workspace = true, features = ["js-tracer"] }
 reth-tasks.workspace = true
