@@ -1371,12 +1371,12 @@ impl<T: PoolTransaction> AllTransactions<T> {
         if let Some(ancestor) = ancestor {
             let Some(ancestor_tx) = self.txs.get(&ancestor) else {
                 // ancestor tx is missing, so we can't insert the new blob
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) })
+                return Err(InsertErr::BlobTxHasNonceGap { transaction: new_blob_tx })
             };
             if ancestor_tx.state.has_nonce_gap() {
                 // the ancestor transaction already has a nonce gap, so we can't insert the new
                 // blob
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: Arc::new(new_blob_tx) })
+                return Err(InsertErr::BlobTxHasNonceGap { transaction: new_blob_tx })
             }
 
             // the max cost executing this transaction requires
@@ -1524,7 +1524,14 @@ impl<T: PoolTransaction> AllTransactions<T> {
             state.insert(TxState::BLOB_TRANSACTION);
 
             transaction =
-                self.ensure_valid_blob_transaction(transaction, on_chain_balance, ancestor)?;
+                match self.ensure_valid_blob_transaction(transaction, on_chain_balance, ancestor) {
+                    Ok(tx) => {
+                        state.insert(TxState::NO_NONCE_GAPS);
+                        tx
+                    }
+                    Err(InsertErr::BlobTxHasNonceGap { transaction }) => transaction,
+                    Err(err) => return Err(err),
+                };
             let blob_fee_cap = transaction.transaction.max_fee_per_blob_gas().unwrap_or_default();
             if blob_fee_cap >= self.pending_fees.blob_fee {
                 state.insert(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK);
@@ -1538,7 +1545,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // If there's no ancestor tx then this is the next transaction.
         if ancestor.is_none() {
-            state.insert(TxState::NO_NONCE_GAPS);
             state.insert(TxState::NO_PARKED_ANCESTORS);
         }
 
@@ -1757,7 +1763,7 @@ pub(crate) enum InsertErr<T: PoolTransaction> {
         existing: TxHash,
     },
     /// Attempted to insert a blob transaction with a nonce gap
-    BlobTxHasNonceGap { transaction: Arc<ValidPoolTransaction<T>> },
+    BlobTxHasNonceGap { transaction: ValidPoolTransaction<T> },
     /// Attempted to insert a transaction that would overdraft the sender's balance at the time of
     /// insertion.
     Overdraft { transaction: Arc<ValidPoolTransaction<T>> },
