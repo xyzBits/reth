@@ -578,12 +578,9 @@ impl<T: TransactionOrdering> TxPool<T> {
                             ),
                         ),
                     )),
-                    InsertErr::BlobTxHasNonceGap { transaction } => Err(PoolError::new(
-                        *transaction.hash(),
-                        PoolErrorKind::InvalidTransaction(
-                            Eip4844PoolTransactionError::Eip4844NonceGap.into(),
-                        ),
-                    )),
+                    InsertErr::BlobTxHasNonceGap { .. } => {
+                        unreachable!("tx with nonce gap is already inserted into queued pool")
+                    }
                     InsertErr::Overdraft { transaction } => Err(PoolError::new(
                         *transaction.hash(),
                         PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Overdraft),
@@ -1357,58 +1354,58 @@ impl<T: PoolTransaction> AllTransactions<T> {
         Ok(transaction)
     }
 
-    /// Enforces additional constraints for blob transactions before attempting to insert:
-    ///    - new blob transactions must not have any nonce gaps
-    ///    - blob transactions cannot go into overdraft
+    /// Enforces additional constraint for blob transactions w.r.t. its ancestor before attempting
+    /// to insert:
     ///    - replacement blob transaction with a higher fee must not shift an already propagated
     ///      descending blob transaction into overdraft
-    fn ensure_valid_blob_transaction(
+    fn ensure_valid_blob_transaction_has_ancestor(
         &self,
         new_blob_tx: ValidPoolTransaction<T>,
         on_chain_balance: U256,
-        ancestor: Option<TransactionId>,
+        ancestor_tx: &PoolInternalTransaction<T>,
     ) -> Result<ValidPoolTransaction<T>, InsertErr<T>> {
-        if let Some(ancestor) = ancestor {
-            let Some(ancestor_tx) = self.txs.get(&ancestor) else {
-                // ancestor tx is missing, so we can't insert the new blob
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: new_blob_tx })
-            };
-            if ancestor_tx.state.has_nonce_gap() {
-                // the ancestor transaction already has a nonce gap, so we can't insert the new
-                // blob
-                return Err(InsertErr::BlobTxHasNonceGap { transaction: new_blob_tx })
-            }
+        // the max cost executing this transaction requires
+        let mut cumulative_cost = ancestor_tx.next_cumulative_cost() + new_blob_tx.cost();
 
-            // the max cost executing this transaction requires
-            let mut cumulative_cost = ancestor_tx.next_cumulative_cost() + new_blob_tx.cost();
+        // check if the new blob would go into overdraft
+        if cumulative_cost > on_chain_balance {
+            // the transaction would go into overdraft
+            return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
+        }
 
-            // check if the new blob would go into overdraft
-            if cumulative_cost > on_chain_balance {
-                // the transaction would go into overdraft
-                return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
-            }
+        // ensure that a replacement would not shift already propagated blob transactions into
+        // overdraft
+        let id = new_blob_tx.transaction_id;
+        let mut descendants = self.descendant_txs_inclusive(&id).peekable();
+        if let Some((maybe_replacement, _)) = descendants.peek() {
+            if **maybe_replacement == new_blob_tx.transaction_id {
+                // replacement transaction
+                descendants.next();
 
-            // ensure that a replacement would not shift already propagated blob transactions into
-            // overdraft
-            let id = new_blob_tx.transaction_id;
-            let mut descendants = self.descendant_txs_inclusive(&id).peekable();
-            if let Some((maybe_replacement, _)) = descendants.peek() {
-                if **maybe_replacement == new_blob_tx.transaction_id {
-                    // replacement transaction
-                    descendants.next();
-
-                    // check if any of descendant blob transactions should be shifted into overdraft
-                    for (_, tx) in descendants {
-                        cumulative_cost += tx.transaction.cost();
-                        if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
-                            // the transaction would shift
-                            return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
-                        }
+                // check if any of descendant blob transactions should be shifted into overdraft
+                for (_, tx) in descendants {
+                    cumulative_cost += tx.transaction.cost();
+                    if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
+                        // the transaction would shift
+                        return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
                     }
                 }
             }
-        } else if new_blob_tx.cost() > on_chain_balance {
-            // the transaction would go into overdraft
+        }
+
+        Ok(new_blob_tx)
+    }
+
+    /// Enforces additional constraint for a blob transaction without ancestors before attempting
+    /// to insert:
+    ///
+    /// - Checks if the transaction would go into overdraft.
+    fn ensure_valid_blob_transaction_no_ancestor(
+        &self,
+        new_blob_tx: ValidPoolTransaction<T>,
+        on_chain_balance: U256,
+    ) -> Result<ValidPoolTransaction<T>, InsertErr<T>> {
+        if new_blob_tx.cost() > on_chain_balance {
             return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
         }
 
@@ -1523,15 +1520,30 @@ impl<T: PoolTransaction> AllTransactions<T> {
         if transaction.is_eip4844() {
             state.insert(TxState::BLOB_TRANSACTION);
 
-            transaction =
-                match self.ensure_valid_blob_transaction(transaction, on_chain_balance, ancestor) {
-                    Ok(tx) => {
+            if ancestor.is_none() {
+                // If there's no ancestor tx then this is the next transaction.
+                state.insert(TxState::NO_PARKED_ANCESTORS);
+                state.insert(TxState::NO_NONCE_GAPS);
+                transaction =
+                    self.ensure_valid_blob_transaction_no_ancestor(transaction, on_chain_balance)?
+            } else {
+                // if nonce gaps exist, tx waits for its parent in 'queued' subpool.
+                if let Some(ancestor_tx) = self.txs.get(&ancestor.unwrap()) {
+                    // if parent transaction is present and has no nonce gap, blob tx can be
+                    // inserted into blob subpool. otherwise, blob tx will wait for its
+                    // grandparent in the 'queued' subpool.
+                    if !ancestor_tx.state.has_nonce_gap() {
                         state.insert(TxState::NO_NONCE_GAPS);
-                        tx
                     }
-                    Err(InsertErr::BlobTxHasNonceGap { transaction }) => transaction,
-                    Err(err) => return Err(err),
-                };
+
+                    transaction = self.ensure_valid_blob_transaction_has_ancestor(
+                        transaction,
+                        on_chain_balance,
+                        ancestor_tx,
+                    )?
+                }
+            }
+
             let blob_fee_cap = transaction.transaction.max_fee_per_blob_gas().unwrap_or_default();
             if blob_fee_cap >= self.pending_fees.blob_fee {
                 state.insert(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK);
@@ -1542,11 +1554,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
         }
 
         let transaction = Arc::new(transaction);
-
-        // If there's no ancestor tx then this is the next transaction.
-        if ancestor.is_none() {
-            state.insert(TxState::NO_PARKED_ANCESTORS);
-        }
 
         // Check dynamic fee
         let fee_cap = transaction.max_fee_per_gas();

@@ -146,7 +146,7 @@ pub enum Eip4844PoolTransactionError {
     /// Thrown if an EIP-4844 transaction without any blobs arrives
     #[error("blobless blob transaction")]
     NoEip4844Blobs,
-    /// Thrown if an EIP-4844 transaction without any blobs arrives
+    /// Thrown if an EIP-4844 transaction with too many blobs arrives
     #[error("too many blobs in transaction: have {have}, permitted {permitted}")]
     TooManyEip4844Blobs {
         /// Number of blobs the transaction has
@@ -157,14 +157,6 @@ pub enum Eip4844PoolTransactionError {
     /// Thrown if validating the blob sidecar for the transaction failed.
     #[error(transparent)]
     InvalidEip4844Blob(BlobTransactionValidationError),
-    /// EIP-4844 transactions are only accepted if they're gapless, meaning the previous nonce of
-    /// the transaction (`tx.nonce -1`) must either be in the pool or match the on chain nonce of
-    /// the sender.
-    ///
-    /// This error is thrown on validation if a valid blob transaction arrives with a nonce that
-    /// would introduce gap in the nonce sequence.
-    #[error("nonce too high")]
-    Eip4844NonceGap,
 }
 
 /// Represents errors that can happen when validating transactions for the pool
@@ -271,11 +263,6 @@ impl InvalidPoolTransactionError {
                         // This is only reachable when the blob is invalid
                         true
                     }
-                    Eip4844PoolTransactionError::Eip4844NonceGap => {
-                        // it is possible that the pool sees `nonce n` before `nonce n-1` and this
-                        // is only thrown for valid(good) blob transactions
-                        false
-                    }
                     Eip4844PoolTransactionError::NoEip4844Blobs => {
                         // this is a malformed transaction and should not be sent over the network
                         true
@@ -287,16 +274,5 @@ impl InvalidPoolTransactionError {
                 }
             }
         }
-    }
-
-    /// Returns `true` if an import failed due to nonce gap.
-    pub const fn is_nonce_gap(&self) -> bool {
-        matches!(
-            self,
-            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent)
-        ) || matches!(
-            self,
-            InvalidPoolTransactionError::Eip4844(Eip4844PoolTransactionError::Eip4844NonceGap)
-        )
     }
 }
