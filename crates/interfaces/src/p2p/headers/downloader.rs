@@ -32,6 +32,9 @@ pub trait HeaderDownloader:
 
     /// Sets the headers batch size that the Stream should return.
     fn set_batch_size(&mut self, limit: usize);
+
+    #[cfg(debug_assertions)]
+    fn dump_state() -> String;
 }
 
 /// Specifies the target to sync for [HeaderDownloader::update_sync_target]

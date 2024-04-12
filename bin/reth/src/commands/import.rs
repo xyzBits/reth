@@ -69,7 +69,7 @@ pub struct ImportCommand {
     /// Chunk import.
     #[arg(long, verbatim_doc_comment)]
     chunk: bool,
-    
+
     /// Import OP Mainnet chain below Bedrock. Caution! Flag must be set as env var, since the env
     /// var is read by another process too, in order to make below Bedrock import work.
     #[arg(long, verbatim_doc_comment, env = OP_RETH_MAINNET_BELOW_BEDROCK)]

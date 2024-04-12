@@ -744,6 +744,11 @@ where
     fn set_batch_size(&mut self, batch_size: usize) {
         self.stream_batch_size = batch_size;
     }
+
+    #[cfg(debug_assertions)]
+    fn dump_state() -> String {
+        format!("{:?}", self)
+    }
 }
 
 impl<H> Stream for ReverseHeadersDownloader<H>
