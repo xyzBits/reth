@@ -69,6 +69,9 @@ pub struct ImportCommand {
     /// Chunk import.
     #[arg(long, verbatim_doc_comment)]
     chunk: bool,
+    
+    #[arg(long, verbatim_doc_comment, env = "OP_RETH_MAINNET_BELOW_BEDROCK")]
+    op_mainnet_below_bedrock: bool,
 
     #[command(flatten)]
     db: DatabaseArgs,
@@ -86,8 +89,13 @@ impl ImportCommand {
     pub async fn execute(mut self) -> eyre::Result<()> {
         info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
 
-        if std::env::var(OP_RETH_MAINNET_BELOW_BEDROCK) == Ok("1".to_string()) {
+        if self.op_mainnet_below_bedrock {
             self.disable_execution = true;
+            debug!(target: "reth::cli", "Importing OP mainnet below bedrock");
+        }
+
+        if self.disable_execution {
+            debug!(target: "reth::cli", "Execution stage disabled");
         }
 
         // add network name to data dir
