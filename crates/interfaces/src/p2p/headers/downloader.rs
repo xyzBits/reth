@@ -1,3 +1,5 @@
+use std::fmt;
+
 use super::error::HeadersDownloaderResult;
 use crate::{
     consensus::Consensus,
@@ -34,7 +36,9 @@ pub trait HeaderDownloader:
     fn set_batch_size(&mut self, limit: usize);
 
     #[cfg(debug_assertions)]
-    fn dump_state() -> String;
+    fn dump_state(&self) -> String
+    where
+        Self: fmt::Debug;
 }
 
 /// Specifies the target to sync for [HeaderDownloader::update_sync_target]

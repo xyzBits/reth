@@ -26,6 +26,7 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{binary_heap::PeekMut, BinaryHeap},
+    fmt,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -746,7 +747,10 @@ where
     }
 
     #[cfg(debug_assertions)]
-    fn dump_state() -> String {
+    fn dump_state(&self) -> String
+    where
+        Self: fmt::Debug,
+    {
         format!("{:?}", self)
     }
 }
