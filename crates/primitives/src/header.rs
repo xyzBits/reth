@@ -186,6 +186,10 @@ impl Header {
     ///
     /// Note: This check is relevant only pre-merge.
     pub fn is_timestamp_in_past(&self, parent_timestamp: u64) -> bool {
+        #[cfg(feature = "optimism")]
+        if std::env::var(crate::OP_RETH_MAINNET_BELOW_BEDROCK) == Ok(true.to_string()) {
+            return self.timestamp < parent_timestamp
+        }
         self.timestamp <= parent_timestamp
     }
 
