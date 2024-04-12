@@ -100,10 +100,7 @@ impl HeaderDownloader for TaskDownloader {
     }
 
     #[cfg(debug_assertions)]
-    fn dump_state(&self) -> String
-    where
-        Self: fmt::Debug,
-    {
+    fn dump_client_state(&self) -> String {
         format!("{:?}", self)
     }
 }

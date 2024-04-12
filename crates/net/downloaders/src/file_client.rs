@@ -234,6 +234,11 @@ impl HeadersClient for FileClient {
 
         Box::pin(async move { Ok((PeerId::default(), headers).into()) })
     }
+
+    #[cfg(debug_assertions)]
+    fn dump_state(&self) -> String {
+        String::new()
+    }
 }
 
 impl BodiesClient for FileClient {

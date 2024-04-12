@@ -747,11 +747,8 @@ where
     }
 
     #[cfg(debug_assertions)]
-    fn dump_state(&self) -> String
-    where
-        Self: fmt::Debug,
-    {
-        format!("{:?}", self)
+    fn dump_client_state(&self) -> String {
+        format!("{:?}", self.client.dump_state())
     }
 }
 

@@ -36,9 +36,7 @@ pub trait HeaderDownloader:
     fn set_batch_size(&mut self, limit: usize);
 
     #[cfg(debug_assertions)]
-    fn dump_state(&self) -> String
-    where
-        Self: fmt::Debug;
+    fn dump_client_state(&self) -> String;
 }
 
 /// Specifies the target to sync for [HeaderDownloader::update_sync_target]
