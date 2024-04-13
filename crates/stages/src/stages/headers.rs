@@ -232,6 +232,7 @@ where
 
         // let the downloader know what to sync
         self.downloader.update_sync_gap(gap.local_head, gap.target);
+        trace!(target: "sync::stages::headers",  downloader=self.downloader.dump_client_state());
 
         // We only want to stop once we have all the headers on ETL filespace (disk).
         loop {

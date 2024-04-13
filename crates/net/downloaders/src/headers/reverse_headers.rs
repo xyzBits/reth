@@ -26,6 +26,7 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{binary_heap::PeekMut, BinaryHeap},
+    fmt,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -743,6 +744,11 @@ where
 
     fn set_batch_size(&mut self, batch_size: usize) {
         self.stream_batch_size = batch_size;
+    }
+
+    #[cfg(debug_assertions)]
+    fn dump_client_state(&self) -> String {
+        format!("{:?}", self.client.dump_state())
     }
 }
 

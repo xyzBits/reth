@@ -8,6 +8,7 @@ use reth_interfaces::p2p::headers::{
 use reth_primitives::SealedHeader;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
+    fmt,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll},
@@ -96,6 +97,11 @@ impl HeaderDownloader for TaskDownloader {
 
     fn set_batch_size(&mut self, limit: usize) {
         let _ = self.to_downloader.send(DownloaderUpdates::SetBatchSize(limit));
+    }
+
+    #[cfg(debug_assertions)]
+    fn dump_client_state(&self) -> String {
+        format!("{:?}", self)
     }
 }
 
