@@ -8,7 +8,6 @@ use reth_interfaces::p2p::headers::{
 use reth_primitives::SealedHeader;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
-    fmt,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll},

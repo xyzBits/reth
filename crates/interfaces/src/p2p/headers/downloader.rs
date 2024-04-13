@@ -1,5 +1,3 @@
-use std::fmt;
-
 use super::error::HeadersDownloaderResult;
 use crate::{
     consensus::Consensus,

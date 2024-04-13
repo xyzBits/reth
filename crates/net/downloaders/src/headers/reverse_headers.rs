@@ -26,7 +26,6 @@ use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{binary_heap::PeekMut, BinaryHeap},
-    fmt,
     future::Future,
     pin::Pin,
     sync::Arc,
