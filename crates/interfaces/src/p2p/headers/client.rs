@@ -63,11 +63,6 @@ pub trait HeadersClient: DownloadClient {
         let fut = self.get_headers_with_priority(req, priority);
         SingleHeaderRequest { fut }
     }
-
-    #[cfg(debug_assertions)]
-    fn dump_state(&self) -> String {
-        String::new()
-    }
 }
 
 /// A Future that resolves to a single block body.

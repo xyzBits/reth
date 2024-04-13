@@ -98,11 +98,6 @@ impl HeaderDownloader for TaskDownloader {
     fn set_batch_size(&mut self, limit: usize) {
         let _ = self.to_downloader.send(DownloaderUpdates::SetBatchSize(limit));
     }
-
-    #[cfg(debug_assertions)]
-    fn dump_client_state(&self) -> String {
-        format!("{:?}", self)
-    }
 }
 
 impl Stream for TaskDownloader {
