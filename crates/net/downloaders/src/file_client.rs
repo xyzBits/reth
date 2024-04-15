@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt};
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Byte length of chunk to read from chain file.
 ///
@@ -310,8 +310,8 @@ impl DownloadClient for FileClient {
 pub struct ChunkedFileReader {
     /// File to read from.
     file: File,
-    /// Current file length.
-    file_len: u64,
+    /// Current file byte length.
+    file_byte_len: u64,
     /// Bytes that have been read.
     chunk: Vec<u8>,
     /// Max bytes per chunk.
@@ -335,15 +335,21 @@ impl ChunkedFileReader {
     pub async fn from_file(file: File, chunk_byte_len: u64) -> Result<Self, FileClientError> {
         // get file len from metadata before reading
         let metadata = file.metadata().await?;
-        let file_len = metadata.len();
+        let file_byte_len = metadata.len();
 
-        Ok(Self { file, file_len, chunk: vec![], chunk_byte_len })
+        debug!(target: "downloaders::file",
+            chunk_byte_len,
+            file_byte_len,
+            "opened reader for file"
+        );
+
+        Ok(Self { file, file_byte_len, chunk: vec![], chunk_byte_len })
     }
 
     /// Calculates the number of bytes to read from the chain file. Returns a tuple of the chunk
     /// length and the remaining file length.
     fn chunk_len(&self) -> u64 {
-        let Self { chunk_byte_len, file_len, .. } = *self;
+        let Self { chunk_byte_len, file_byte_len: file_len, .. } = *self;
         let file_len = file_len + self.chunk.len() as u64;
 
         if chunk_byte_len > file_len {
@@ -356,7 +362,7 @@ impl ChunkedFileReader {
 
     /// Read next chunk from file. Returns [`FileClient`] containing decoded chunk.
     pub async fn next_chunk(&mut self) -> Result<Option<FileClient>, FileClientError> {
-        if self.file_len == 0 && self.chunk.is_empty() {
+        if self.file_byte_len == 0 && self.chunk.is_empty() {
             // eof
             return Ok(None)
         }
@@ -372,13 +378,13 @@ impl ChunkedFileReader {
         self.file.read_buf(&mut reader).await.unwrap();
 
         // update remaining file length
-        self.file_len -= new_bytes_len;
+        self.file_byte_len -= new_bytes_len;
 
         trace!(target: "downloaders::file",
             max_chunk_byte_len=self.chunk_byte_len,
             prev_read_bytes_len=self.chunk.len(),
             new_bytes_len,
-            remaining_file_byte_len=self.file_len,
+            remaining_file_byte_len=self.file_byte_len,
             "new bytes were read from file"
         );
 
