@@ -207,6 +207,16 @@ impl FileClient {
         }
         self
     }
+
+    /// Returns the current number of headers in the client.
+    pub fn headers_len(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// Returns the current number of bodies in the client.
+    pub fn bodies_len(&self) -> usize {
+        self.bodies.len()
+    }
 }
 
 impl HeadersClient for FileClient {

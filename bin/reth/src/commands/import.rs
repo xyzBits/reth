@@ -148,6 +148,8 @@ impl ImportCommand {
         while let Some(file_client) = reader.next_chunk().await? {
             // create a new FileClient from chunk read from file
             info!(target: "reth::cli",
+                headers=file_client.headers_len(),
+                bodies=file_client.bodies_len(),
                 "Importing chain file {}", if self.chunk { "chunk" } else { "" }
             );
 
