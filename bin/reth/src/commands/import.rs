@@ -266,7 +266,8 @@ impl ImportCommand {
                         .max(config.stages.storage_hashing.clean_threshold),
                     config.prune.clone().map(|prune| prune.segments).unwrap_or_default(),
                 ))
-                .disable_if(StageId::Execution, || disable_execution),
+                .disable_if(StageId::Execution, || disable_execution)
+                .disable_if(StageId::MerkleExecute, || disable_execution),
             )
             .build(provider_factory, static_file_producer);
 
