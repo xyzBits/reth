@@ -68,9 +68,9 @@ pub struct ImportCommand {
     )]
     chain: Arc<ChainSpec>,
 
-    /// Disables execution stage.
+    /// Disables stages that require execution.
     #[arg(long, verbatim_doc_comment)]
-    disable_execution: bool,
+    no_state: bool,
 
     /// Import OP Mainnet chain below Bedrock. Caution! Flag must be set as env var, since the env
     /// var is read by another process too, in order to make below Bedrock import work.
@@ -102,12 +102,12 @@ impl ImportCommand {
         info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
 
         if self.op_mainnet_below_bedrock {
-            self.disable_execution = true;
+            self.no_state = true;
             debug!(target: "reth::cli", "Importing OP mainnet below bedrock");
         }
 
-        if self.disable_execution {
-            debug!(target: "reth::cli", "Execution stage disabled");
+        if self.no_state {
+            debug!(target: "reth::cli", "Stages requiring state disabled");
         }
 
         if self.chunk_len.is_some() {
@@ -166,7 +166,7 @@ impl ImportCommand {
                         provider_factory.static_file_provider(),
                         PruneModes::default(),
                     ),
-                    self.disable_execution,
+                    self.no_state,
                 )
                 .await?;
 
@@ -204,7 +204,7 @@ impl ImportCommand {
         consensus: &Arc<C>,
         file_client: Arc<FileClient>,
         static_file_producer: StaticFileProducer<DB>,
-        disable_execution: bool,
+        no_state: bool,
     ) -> eyre::Result<(Pipeline<DB>, impl Stream<Item = NodeEvent>)>
     where
         DB: Database + Clone + Unpin + 'static,
@@ -266,8 +266,13 @@ impl ImportCommand {
                         .max(config.stages.storage_hashing.clean_threshold),
                     config.prune.clone().map(|prune| prune.segments).unwrap_or_default(),
                 ))
-                .disable_if(StageId::Execution, || disable_execution)
-                .disable_if(StageId::MerkleExecute, || disable_execution),
+                .disable_if(StageId::Execution, || no_state)
+                .disable_if(StageId::MerkleUnwind, || no_state)
+                .disable_if(StageId::AccountHashing, || no_state)
+                .disable_if(StageId::StorageHashing, || no_state)
+                .disable_if(StageId::MerkleExecute, || no_state)
+                .disable_if(StageId::IndexStorageHistory, || no_state)
+                .disable_if(StageId::IndexAccountHistory, || no_state),
             )
             .build(provider_factory, static_file_producer);
 
