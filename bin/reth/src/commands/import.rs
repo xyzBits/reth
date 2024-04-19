@@ -19,7 +19,6 @@ use reth_downloaders::{
     file_client::{ChunkedFileReader, FileClient, DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE},
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
 };
-use reth_exex::ExExManagerHandle;
 use reth_interfaces::{
     consensus::Consensus,
     p2p::{
@@ -30,13 +29,8 @@ use reth_interfaces::{
 use reth_node_core::init::init_genesis;
 use reth_node_ethereum::EthEvmConfig;
 use reth_node_events::node::NodeEvent;
-<<<<<<< HEAD
 use reth_primitives::{stage::StageId, ChainSpec, PruneModes, SealedHeader, B256};
 use reth_provider::{HeaderProvider, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
-=======
-use reth_primitives::{stage::StageId, ChainSpec, PruneModes, B256};
-use reth_provider::{HeaderSyncMode, ProviderFactory, StageCheckpointReader};
->>>>>>> emhane/disable-stages-import
 use reth_stages::{
     prelude::*,
     stages::{ExecutionStage, ExecutionStageThresholds, SenderRecoveryStage},
@@ -291,7 +285,6 @@ impl ImportCommand {
                         .max(config.stages.account_hashing.clean_threshold)
                         .max(config.stages.storage_hashing.clean_threshold),
                     config.prune.as_ref().map(|prune| prune.segments.clone()).unwrap_or_default(),
-                    ExExManagerHandle::empty(),
                 ))
                 .disable_all_if(STATE_STAGES, || no_state),
             )

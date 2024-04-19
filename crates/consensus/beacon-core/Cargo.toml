@@ -17,8 +17,4 @@ reth-primitives.workspace = true
 reth-interfaces.workspace = true
 
 [features]
-<<<<<<< HEAD
-optimism = []
-=======
 optimism = ["reth-primitives/optimism"]
->>>>>>> emhane/disable-stages-import

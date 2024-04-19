@@ -989,22 +989,8 @@ impl TransactionSignedNoHash {
         self.transaction.encode_without_signature(buffer);
 
         #[cfg(feature = "optimism")]
-<<<<<<< HEAD
         if let Some(address) = get_deposit_or_null_address(&self.transaction, &self.signature) {
             return Some(address)
-=======
-        {
-            if let Transaction::Deposit(TxDeposit { from, .. }) = self.transaction {
-                return Some(from)
-            }
-
-            // pre bedrock system transactions were sent from the zero address as legacy
-            // transactions with an empty signature Note: this is very hacky and only
-            // relevant for op-mainnet pre bedrock
-            if self.is_legacy() && self.signature == Signature::optimism_deposit_tx_signature() {
-                return Some(Address::ZERO)
-            }
->>>>>>> emhane/disable-stages-import
         }
 
         self.signature.recover_signer_unchecked(keccak256(buffer))
@@ -1829,11 +1815,11 @@ fn get_deposit_or_null_address(
     if let Transaction::Deposit(TxDeposit { from, .. }) = transaction {
         return Some(*from)
     }
-    // OP blocks below bedrock include transactions sent from the null address
-    if std::env::var(OP_RETH_MAINNET_BELOW_BEDROCK) == Ok(true.to_string()) &&
-        *signature == Signature::optimism_deposit_tx_signature()
-    {
-        return Some(Address::default())
+    // pre bedrock system transactions were sent from the zero address as legacy
+    // transactions with an empty signature Note: this is very hacky and only
+    // relevant for op-mainnet pre bedrock
+    if self.is_legacy() && self.signature == Signature::optimism_deposit_tx_signature() {
+        return Some(Address::ZERO)
     }
 
     None
