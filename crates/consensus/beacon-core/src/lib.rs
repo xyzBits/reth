@@ -47,6 +47,10 @@ impl Consensus for BeaconConsensus {
     }
 
     #[allow(unused_assignments)]
+<<<<<<< HEAD
+=======
+    #[allow(unused_mut)]
+>>>>>>> emhane/disable-stages-import
     fn validate_header_with_total_difficulty(
         &self,
         header: &Header,

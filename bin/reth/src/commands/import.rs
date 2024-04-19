@@ -30,8 +30,13 @@ use reth_interfaces::{
 use reth_node_core::init::init_genesis;
 use reth_node_ethereum::EthEvmConfig;
 use reth_node_events::node::NodeEvent;
+<<<<<<< HEAD
 use reth_primitives::{stage::StageId, ChainSpec, PruneModes, SealedHeader, B256};
 use reth_provider::{HeaderProvider, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
+=======
+use reth_primitives::{stage::StageId, ChainSpec, PruneModes, B256};
+use reth_provider::{HeaderSyncMode, ProviderFactory, StageCheckpointReader};
+>>>>>>> emhane/disable-stages-import
 use reth_stages::{
     prelude::*,
     stages::{ExecutionStage, ExecutionStageThresholds, SenderRecoveryStage},
