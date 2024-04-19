@@ -12,13 +12,14 @@ use clap::Parser;
 use eyre::Context;
 use futures::{Stream, StreamExt};
 use reth_beacon_consensus::BeaconConsensus;
-use reth_config::Config;
+use reth_config::{config::EtlConfig, Config};
 use reth_db::{database::Database, init_db};
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     file_client::{ChunkedFileReader, FileClient, DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE},
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
 };
+use reth_exex::ExExManagerHandle;
 use reth_interfaces::{
     consensus::Consensus,
     p2p::{
@@ -26,18 +27,31 @@ use reth_interfaces::{
         headers::downloader::{HeaderDownloader, SyncTarget},
     },
 };
-use reth_node_core::{events::node::NodeEvent, init::init_genesis};
+use reth_node_core::init::init_genesis;
 use reth_node_ethereum::EthEvmConfig;
-use reth_primitives::{stage::StageId, ChainSpec, PruneModes, B256, OP_RETH_MAINNET_BELOW_BEDROCK};
-use reth_provider::{HeaderSyncMode, ProviderFactory, StageCheckpointReader};
+use reth_node_events::node::NodeEvent;
+use reth_primitives::{stage::StageId, ChainSpec, PruneModes, SealedHeader, B256};
+use reth_provider::{HeaderProvider, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
 use reth_stages::{
     prelude::*,
     stages::{ExecutionStage, ExecutionStageThresholds, SenderRecoveryStage},
+    Pipeline, StageSet,
 };
 use reth_static_file::StaticFileProducer;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 use tracing::{debug, info};
+
+/// Stages that require state.
+const STATE_STAGES: &[StageId] = &[
+    StageId::Execution,
+    StageId::MerkleUnwind,
+    StageId::AccountHashing,
+    StageId::StorageHashing,
+    StageId::MerkleExecute,
+    StageId::IndexStorageHistory,
+    StageId::IndexAccountHistory,
+];
 
 /// Syncs RLP encoded blocks from a file.
 #[derive(Debug, Parser)]
@@ -68,18 +82,14 @@ pub struct ImportCommand {
     )]
     chain: Arc<ChainSpec>,
 
-    /// Disables stages that require execution.
+    /// Disables stages that require state.
     #[arg(long, verbatim_doc_comment)]
     no_state: bool,
 
     /// Import OP Mainnet chain below Bedrock. Caution! Flag must be set as env var, since the env
     /// var is read by another process too, in order to make below Bedrock import work.
-    #[arg(long, verbatim_doc_comment, env = OP_RETH_MAINNET_BELOW_BEDROCK)]
+    #[arg(long, verbatim_doc_comment, env = "OP_RETH_MAINNET_BELOW_BEDROCK")]
     op_mainnet_below_bedrock: bool,
-
-    /// Chunk import.
-    #[arg(long, verbatim_doc_comment)]
-    chunk: bool,
 
     /// Chunk byte length.
     #[arg(long, value_name = "CHUNK_LEN", verbatim_doc_comment)]
@@ -87,6 +97,9 @@ pub struct ImportCommand {
 
     #[command(flatten)]
     db: DatabaseArgs,
+
+    #[arg(long, value_name = "START", verbatim_doc_comment, default_value_t)]
+    start: u64,
 
     /// The path to a block file for import.
     ///
@@ -110,22 +123,21 @@ impl ImportCommand {
             debug!(target: "reth::cli", "Stages requiring state disabled");
         }
 
-        if self.chunk_len.is_some() {
-            self.chunk = true;
-        }
-
-        if self.chunk {
-            debug!(target: "reth::cli",
-                chunk_byte_len=self.chunk_len.unwrap_or(DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE), "Chunking chain import"
-            );
-        }
+        debug!(target: "reth::cli",
+            chunk_byte_len=self.chunk_len.unwrap_or(DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE), "Chunking chain import"
+        );
 
         // add network name to data dir
         let data_dir = self.datadir.unwrap_or_chain_default(self.chain.chain);
         let config_path = self.config.clone().unwrap_or_else(|| data_dir.config_path());
 
-        let config: Config = self.load_config(config_path.clone())?;
+        let mut config: Config = self.load_config(config_path.clone())?;
         info!(target: "reth::cli", path = ?config_path, "Configuration loaded");
+
+        // Make sure ETL doesn't default to /tmp/, but to whatever datadir is set to
+        if config.stages.etl.dir.is_none() {
+            config.stages.etl.dir = Some(EtlConfig::from_datadir(&data_dir.data_dir_path()));
+        }
 
         let db_path = data_dir.db_path();
 
@@ -145,17 +157,21 @@ impl ImportCommand {
         // open file
         let mut reader = ChunkedFileReader::new(&self.path, self.chunk_len).await?;
 
+        let mut start_header: Option<SealedHeader> = None;
+
+        start_header = provider_factory
+            .provider()?
+            .sealed_header(self.start)
+            .expect("start block is not canonical with db");
+
         while let Some(file_client) = reader.next_chunk().await? {
             // create a new FileClient from chunk read from file
             info!(target: "reth::cli",
-                headers=file_client.headers_len(),
-                bodies=file_client.bodies_len(),
-                "Importing chain file {}", if self.chunk { "chunk" } else { "" }
+                "Importing chain file chunk"
             );
 
-            // override the tip
             let tip = file_client.tip().expect("file client has no tip");
-            info!(target: "reth::cli", "Chain file {} read", if self.chunk { "chunk" } else { "" });
+            info!(target: "reth::cli", "Chain file chunk read");
 
             let (mut pipeline, events) = self
                 .build_import_pipeline(
@@ -169,6 +185,7 @@ impl ImportCommand {
                         PruneModes::default(),
                     ),
                     self.no_state,
+                    start_header.take().unwrap(),
                 )
                 .await?;
 
@@ -180,7 +197,7 @@ impl ImportCommand {
 
             let latest_block_number =
                 provider.get_stage_checkpoint(StageId::Finish)?.map(|ch| ch.block_number);
-            tokio::spawn(reth_node_core::events::node::handle_events(
+            tokio::spawn(reth_node_events::node::handle_events(
                 None,
                 latest_block_number,
                 events,
@@ -195,10 +212,11 @@ impl ImportCommand {
             }
         }
 
-        info!(target: "reth::cli", "Finishing up");
+        info!(target: "reth::cli", "Chain file imported");
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_import_pipeline<DB, C>(
         &self,
         config: &Config,
@@ -207,6 +225,7 @@ impl ImportCommand {
         file_client: Arc<FileClient>,
         static_file_producer: StaticFileProducer<DB>,
         no_state: bool,
+        start_header: SealedHeader,
     ) -> eyre::Result<(Pipeline<DB>, impl Stream<Item = NodeEvent>)>
     where
         DB: Database + Clone + Unpin + 'static,
@@ -219,7 +238,7 @@ impl ImportCommand {
         let mut header_downloader = ReverseHeadersDownloaderBuilder::new(config.stages.headers)
             .build(file_client.clone(), consensus.clone())
             .into_task();
-        header_downloader.update_local_head(file_client.start_header().unwrap());
+        header_downloader.update_local_head(start_header);
         header_downloader.update_sync_target(SyncTarget::Tip(file_client.tip().unwrap()));
 
         let mut body_downloader = BodiesDownloaderBuilder::new(config.stages.bodies)
@@ -266,15 +285,10 @@ impl ImportCommand {
                         .clean_threshold
                         .max(config.stages.account_hashing.clean_threshold)
                         .max(config.stages.storage_hashing.clean_threshold),
-                    config.prune.clone().map(|prune| prune.segments).unwrap_or_default(),
+                    config.prune.as_ref().map(|prune| prune.segments.clone()).unwrap_or_default(),
+                    ExExManagerHandle::empty(),
                 ))
-                .disable_if(StageId::Execution, || no_state)
-                .disable_if(StageId::MerkleUnwind, || no_state)
-                .disable_if(StageId::AccountHashing, || no_state)
-                .disable_if(StageId::StorageHashing, || no_state)
-                .disable_if(StageId::MerkleExecute, || no_state)
-                .disable_if(StageId::IndexStorageHistory, || no_state)
-                .disable_if(StageId::IndexAccountHistory, || no_state),
+                .disable_all_if(STATE_STAGES, || no_state),
             )
             .build(provider_factory, static_file_producer);
 
