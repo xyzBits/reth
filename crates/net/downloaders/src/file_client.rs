@@ -93,8 +93,6 @@ impl FileClient {
         // use with_capacity to make sure the internal buffer contains the entire chunk
         let mut stream = FramedRead::with_capacity(reader, BlockFileCodec, num_bytes as usize);
 
-        *stream.read_buffer_mut() = BytesMut::zeroed(num_bytes as usize);
-
         trace!(target: "downloaders::file",
             target_num_bytes=num_bytes,
             capacity=stream.read_buffer().capacity(),
@@ -382,7 +380,7 @@ impl ChunkedFileReader {
 
         // read new bytes from file
         let mut reader = BytesMut::zeroed(new_read_bytes_target_len as usize);
-        let new_read_bytes_len = self.file.read(&mut reader).await.unwrap() as u64;
+        let new_read_bytes_len = self.file.read_exact(&mut reader).await.unwrap() as u64;
         // actual bytes that have been read
 
         // update remaining file length
