@@ -190,7 +190,8 @@ impl Header {
         #[cfg(feature = "optimism")]
         // block below bedrock block
         if self.beneficiary == Address::ZERO {
-            return self.timestamp < parent_timestamp
+            // allow parent to be younger than child by 10 minutes.
+            return self.timestamp + 600 < parent_timestamp
         }
         self.timestamp <= parent_timestamp
     }
