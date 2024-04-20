@@ -19,7 +19,7 @@ use tokio_util::codec::FramedRead;
 use tracing::{debug, trace, warn};
 
 /// Default byte length of chunk to read from chain file.
-pub const DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE: u64 = 1_000_000_000;
+pub const DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE: u64 = 2018429;
 
 /// Front-end API for fetching chain data from a file.
 ///
@@ -135,7 +135,7 @@ impl FileClient {
             log_interval += 1;
         }
 
-        trace!(blocks = headers.len(), "Initialized file client");
+        trace!(target: "downloaders::file", blocks = headers.len(), "Initialized file client");
 
         Ok((Self { headers, hash_to_number, bodies }, remaining_bytes))
     }
@@ -362,28 +362,40 @@ impl ChunkedFileReader {
         let old_bytes_len = self.chunk.len() as u64;
 
         // calculate reserved space in chunk
-        let new_bytes_len = chunk_len - old_bytes_len;
+        let new_read_bytes_len = chunk_len - old_bytes_len;
 
         // read new bytes from file
-        let mut reader = BytesMut::with_capacity(new_bytes_len as usize);
+        let mut reader = BytesMut::with_capacity(new_read_bytes_len as usize);
         self.file.read_buf(&mut reader).await.unwrap();
+        // the actual new bytes len
+        let new_read_bytes_len = reader.len() as u64;
 
         // update remaining file length
-        self.file_byte_len -= new_bytes_len;
+        self.file_byte_len -= new_read_bytes_len;
 
-        trace!(target: "downloaders::file",
-            max_chunk_byte_len=self.chunk_byte_len,
-            prev_read_bytes_len=self.chunk.len(),
-            new_bytes_len,
-            remaining_file_byte_len=self.file_byte_len,
-            "new bytes were read from file"
-        );
+        let prev_read_bytes_len = self.chunk.len();
 
         // read new bytes from file into chunk
         self.chunk.extend_from_slice(&reader[..]);
 
+        debug!(target: "downloaders::file",
+            max_chunk_byte_len=self.chunk_byte_len,
+            prev_read_bytes_len,
+            new_read_bytes_len,
+            next_chunk_byte_len=self.chunk.len(),
+            remaining_file_byte_len=self.file_byte_len,
+            "new bytes were read from file"
+        );
+
         // make new file client from chunk
         let (file_client, bytes) = FileClient::from_reader(&self.chunk[..], chunk_len).await?;
+
+        debug!(target: "downloaders::file",
+            headers_len=file_client.headers.len(),
+            bodies_len=file_client.bodies.len(),
+            remaining_bytes_len=bytes.len(),
+            "parsed blocks that were read"
+        );
 
         // save left over bytes
         self.chunk = bytes;
