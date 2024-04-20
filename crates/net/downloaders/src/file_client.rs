@@ -399,7 +399,7 @@ impl ChunkedFileReader {
 
         // make new file client from chunk
         let (file_client, bytes) =
-            FileClient::from_reader(&self.chunk[..], next_chunk_byte_len).await?;
+            FileClient::from_reader(&self.chunk[..], next_chunk_byte_len as u64).await?;
 
         debug!(target: "downloaders::file",
             headers_len=file_client.headers.len(),
