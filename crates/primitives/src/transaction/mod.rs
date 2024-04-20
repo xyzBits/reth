@@ -45,9 +45,7 @@ mod eip4844;
 mod error;
 mod legacy;
 mod meta;
-#[cfg(feature = "c-kzg")]
 mod pooled;
-#[cfg(feature = "c-kzg")]
 mod sidecar;
 mod signature;
 mod tx_type;
@@ -2203,7 +2201,16 @@ mod tests {
         );
 
         let encoded = &alloy_rlp::encode(signed_tx);
-        assert_eq!(hex!("c98080808080801b8080"), encoded[..]);
+
+        assert_eq!(
+            if cfg!(feature = "optimism") {
+                hex!("c9808080808080808080")
+            } else {
+                hex!("c98080808080801b8080")
+            },
+            &encoded[..]
+        );
+
         assert_eq!(MIN_LENGTH_LEGACY_TX_ENCODED, encoded.len());
 
         TransactionSigned::decode(&mut &encoded[..]).unwrap();
