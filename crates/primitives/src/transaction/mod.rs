@@ -963,8 +963,8 @@ impl TransactionSignedNoHash {
         // Optimism's Deposit transaction does not have a signature. Directly return the
         // `from` address.
         #[cfg(feature = "optimism")]
-        if let Some(address) = get_deposit_or_null_address(&self.transaction, &self.signature) {
-            return Some(address)
+        if let Transaction::Deposit(TxDeposit { from, .. }) = self.transaction {
+            return Some(from)
         }
 
         let signature_hash = self.signature_hash();
@@ -988,9 +988,20 @@ impl TransactionSignedNoHash {
         buffer.clear();
         self.transaction.encode_without_signature(buffer);
 
+        // Optimism's Deposit transaction does not have a signature. Directly return the
+        // `from` address.
         #[cfg(feature = "optimism")]
-        if let Some(address) = get_deposit_or_null_address(&self.transaction, &self.signature) {
-            return Some(address)
+        {
+            if let Transaction::Deposit(TxDeposit { from, .. }) = self.transaction {
+                return Some(from)
+            }
+
+            // pre bedrock system transactions were sent from the zero address as legacy
+            // transactions with an empty signature Note: this is very hacky and only
+            // relevant for op-mainnet pre bedrock
+            if self.is_legacy() && self.signature == Signature::optimism_deposit_tx_signature() {
+                return Some(Address::ZERO)
+            }
         }
 
         self.signature.recover_signer_unchecked(keccak256(buffer))
@@ -1205,8 +1216,8 @@ impl TransactionSigned {
         // Optimism's Deposit transaction does not have a signature. Directly return the
         // `from` address.
         #[cfg(feature = "optimism")]
-        if let Some(address) = get_deposit_or_null_address(&self.transaction, &self.signature) {
-            return Some(address)
+        if let Transaction::Deposit(TxDeposit { from, .. }) = self.transaction {
+            return Some(from)
         }
         let signature_hash = self.signature_hash();
         self.signature.recover_signer(signature_hash)
@@ -1221,8 +1232,8 @@ impl TransactionSigned {
         // Optimism's Deposit transaction does not have a signature. Directly return the
         // `from` address.
         #[cfg(feature = "optimism")]
-        if let Some(address) = get_deposit_or_null_address(&self.transaction, &self.signature) {
-            return Some(address)
+        if let Transaction::Deposit(TxDeposit { from, .. }) = self.transaction {
+            return Some(from)
         }
         let signature_hash = self.signature_hash();
         self.signature.recover_signer_unchecked(signature_hash)
@@ -1809,26 +1820,6 @@ impl IntoRecoveredTransaction for TransactionSignedEcRecovered {
     fn to_recovered_transaction(&self) -> TransactionSignedEcRecovered {
         self.clone()
     }
-}
-
-#[cfg(feature = "optimism")]
-fn get_deposit_or_null_address(
-    transaction: &Transaction,
-    signature: &Signature,
-) -> Option<Address> {
-    // Optimism's Deposit transaction does not have a signature. Directly return the
-    // `from` address.
-    if let Transaction::Deposit(TxDeposit { from, .. }) = transaction {
-        return Some(*from)
-    }
-    // pre bedrock system transactions were sent from the zero address as legacy
-    // transactions with an empty signature Note: this is very hacky and only
-    // relevant for op-mainnet pre bedrock
-    if transaction.is_legacy() && *signature == Signature::optimism_deposit_tx_signature() {
-        return Some(Address::ZERO)
-    }
-
-    None
 }
 
 #[cfg(test)]
