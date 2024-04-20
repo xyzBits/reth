@@ -365,37 +365,41 @@ impl ChunkedFileReader {
             return Ok(None)
         }
 
-        let chunk_len = self.chunk_len();
+        let chunk_target_len = self.chunk_len();
         let old_bytes_len = self.chunk.len() as u64;
 
         // calculate reserved space in chunk
-        let new_read_bytes_target_len = chunk_len - old_bytes_len;
+        let new_read_bytes_target_len = chunk_target_len - old_bytes_len;
 
         // read new bytes from file
         let mut reader = BytesMut::with_capacity(new_read_bytes_target_len as usize);
         self.file.read_buf(&mut reader).await.unwrap();
+        // actual bytes that have been read
+        let new_read_bytes_len = reader.len() as u64;
 
         // update remaining file length
-        self.file_byte_len -= new_read_bytes_target_len;
+        self.file_byte_len -= new_read_bytes_len;
 
         let prev_read_bytes_len = self.chunk.len();
 
         // read new bytes from file into chunk
         self.chunk.extend_from_slice(&reader[..]);
+        let next_chunk_byte_len = self.chunk.len();
 
         debug!(target: "downloaders::file",
             max_chunk_byte_len=self.chunk_byte_len,
             prev_read_bytes_len,
             new_read_bytes_target_len,
-            new_read_bytes_len=reader.len() as u64,
+            new_read_bytes_len,
             reader_capacity=reader.capacity(),
-            next_chunk_byte_len=self.chunk.len(),
+            next_chunk_byte_len,
             remaining_file_byte_len=self.file_byte_len,
             "new bytes were read from file"
         );
 
         // make new file client from chunk
-        let (file_client, bytes) = FileClient::from_reader(&self.chunk[..], chunk_len).await?;
+        let (file_client, bytes) =
+            FileClient::from_reader(&self.chunk[..], next_chunk_byte_len).await?;
 
         debug!(target: "downloaders::file",
             headers_len=file_client.headers.len(),
