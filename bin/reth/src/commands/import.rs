@@ -172,6 +172,7 @@ impl ImportCommand {
 
             let tip = file_client.tip().expect("file client has no tip");
             info!(target: "reth::cli", "Chain file chunk read");
+            let tip_header = file_client.tip_header();
 
             let (mut pipeline, events) = self
                 .build_import_pipeline(
@@ -192,6 +193,8 @@ impl ImportCommand {
             // override the tip
             pipeline.set_tip(tip);
             debug!(target: "reth::cli", ?tip, "Tip manually set");
+
+            start_header = tip_header;
 
             let provider = provider_factory.provider()?;
 
