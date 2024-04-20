@@ -19,7 +19,9 @@ use tokio_util::codec::FramedRead;
 use tracing::{debug, trace, warn};
 
 /// Default byte length of chunk to read from chain file.
-pub const DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE: u64 = 78723;
+///
+/// Default is 1 GB.
+pub const DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE: u64 = 1_000_000_000;
 
 /// Front-end API for fetching chain data from a file.
 ///
