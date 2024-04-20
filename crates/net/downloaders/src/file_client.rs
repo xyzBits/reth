@@ -92,6 +92,12 @@ impl FileClient {
         // use with_capacity to make sure the internal buffer contains the entire chunk
         let mut stream = FramedRead::with_capacity(reader, BlockFileCodec, num_bytes as usize);
 
+        trace!(target: "downloaders::file",
+            target_num_bytes=num_bytes,
+            capacity=stream.read_buffer().capacity(),
+            "init decode stream"
+        );
+
         let mut remaining_bytes = vec![];
 
         let mut log_interval = 0;
