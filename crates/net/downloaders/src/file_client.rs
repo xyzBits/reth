@@ -1,4 +1,5 @@
 use super::file_codec::BlockFileCodec;
+use alloy_rlp::Bytes;
 use itertools::Either;
 use reth_interfaces::p2p::{
     bodies::client::{BodiesClient, BodiesFut},
@@ -92,7 +93,7 @@ impl FileClient {
         // use with_capacity to make sure the internal buffer contains the entire chunk
         let mut stream = FramedRead::with_capacity(reader, BlockFileCodec, num_bytes as usize);
 
-        stream.read_buffer_mut().reserve(num_bytes as usize);
+        *stream.read_buffer_mut() = BytesMut::zeroed(num_bytes as usize);
 
         trace!(target: "downloaders::file",
             target_num_bytes=num_bytes,
@@ -380,11 +381,9 @@ impl ChunkedFileReader {
         let new_read_bytes_target_len = chunk_target_len - old_bytes_len;
 
         // read new bytes from file
-        let mut reader = BytesMut::with_capacity(new_read_bytes_target_len as usize);
-        reader.reserve(new_read_bytes_target_len as usize);
-        self.file.read(&mut reader).await.unwrap();
+        let mut reader = BytesMut::zeroed(new_read_bytes_target_len as usize);
+        let new_read_bytes_len = self.file.read(&mut reader).await.unwrap() as u64;
         // actual bytes that have been read
-        let new_read_bytes_len = reader.len() as u64;
 
         // update remaining file length
         self.file_byte_len -= new_read_bytes_len;
