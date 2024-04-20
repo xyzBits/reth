@@ -83,9 +83,7 @@ impl Signature {
             self.odd_y_parity as u64 + chain_id * 2 + 35
         } else {
             #[cfg(feature = "optimism")]
-            if std::env::var("OP_RETH_MAINNET_BELOW_BEDROCK") == Ok(true.to_string()) &&
-                *self == Self::optimism_deposit_tx_signature()
-            {
+            if *self == Self::optimism_deposit_tx_signature() {
                 return 0
             }
             self.odd_y_parity as u64 + 27
@@ -104,6 +102,10 @@ impl Signature {
         if v < 35 {
             // non-EIP-155 legacy scheme, v = 27 for even y-parity, v = 28 for odd y-parity
             if v != 27 && v != 28 {
+                #[cfg(feature = "optimism")]
+                if v == 0 && r == U256::ZERO && s == U256::ZERO {
+                    return Ok((Signature { r, s, odd_y_parity: false }, None))
+                }
                 return Err(RlpError::Custom("invalid Ethereum signature (V is not 27 or 28)"))
             }
             let odd_y_parity = v == 28;
