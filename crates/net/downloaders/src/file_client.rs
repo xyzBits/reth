@@ -373,7 +373,7 @@ impl ChunkedFileReader {
 
         // read new bytes from file
         let mut reader = BytesMut::with_capacity(new_read_bytes_target_len as usize);
-        self.file.read_buf(&mut reader).await.unwrap();
+        self.file.read(&mut reader).await.unwrap();
         // actual bytes that have been read
         let new_read_bytes_len = reader.len() as u64;
 
