@@ -89,7 +89,7 @@ impl FileClient {
         let mut hash_to_number = HashMap::new();
         let mut bodies = HashMap::new();
 
-        // use with_capacity to make sure the internal buffer contains the entire file
+        // use with_capacity to make sure the internal buffer contains the entire chunk
         let mut stream = FramedRead::with_capacity(reader, BlockFileCodec, num_bytes as usize);
 
         let mut remaining_bytes = vec![];
@@ -100,7 +100,12 @@ impl FileClient {
         while let Some(block_res) = stream.next().await {
             let block = match block_res {
                 Ok(block) => block,
-                Err(FileClientError::Rlp(_err, bytes)) => {
+                Err(FileClientError::Rlp(err, bytes)) => {
+                    trace!(target: "downloaders::file",
+                        %err,
+                        bytes_len=bytes.len(),
+                        "partial block returned from decoding chunk"
+                    );
                     remaining_bytes = bytes;
                     break
                 }
@@ -364,16 +369,14 @@ impl ChunkedFileReader {
         let old_bytes_len = self.chunk.len() as u64;
 
         // calculate reserved space in chunk
-        let new_read_bytes_len = chunk_len - old_bytes_len;
+        let new_read_bytes_target_len = chunk_len - old_bytes_len;
 
         // read new bytes from file
-        let mut reader = BytesMut::with_capacity(new_read_bytes_len as usize);
+        let mut reader = BytesMut::with_capacity(new_read_bytes_target_len as usize);
         self.file.read_buf(&mut reader).await.unwrap();
-        // the actual new bytes len
-        let new_read_bytes_len = reader.len() as u64;
 
         // update remaining file length
-        self.file_byte_len -= new_read_bytes_len;
+        self.file_byte_len -= new_read_bytes_target_len;
 
         let prev_read_bytes_len = self.chunk.len();
 
@@ -383,7 +386,8 @@ impl ChunkedFileReader {
         debug!(target: "downloaders::file",
             max_chunk_byte_len=self.chunk_byte_len,
             prev_read_bytes_len,
-            new_read_bytes_len,
+            new_read_bytes_target_len,
+            new_read_bytes_len=reader.len() as u64,
             reader_capacity=reader.capacity(),
             next_chunk_byte_len=self.chunk.len(),
             remaining_file_byte_len=self.file_byte_len,
@@ -397,7 +401,7 @@ impl ChunkedFileReader {
             headers_len=file_client.headers.len(),
             bodies_len=file_client.bodies.len(),
             remaining_bytes_len=bytes.len(),
-            "parsed blocks that were read"
+            "parsed blocks that were read from file"
         );
 
         // save left over bytes
