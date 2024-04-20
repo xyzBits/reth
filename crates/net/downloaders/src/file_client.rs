@@ -384,6 +384,7 @@ impl ChunkedFileReader {
             max_chunk_byte_len=self.chunk_byte_len,
             prev_read_bytes_len,
             new_read_bytes_len,
+            reader_capacity=reader.capacity(),
             next_chunk_byte_len=self.chunk.len(),
             remaining_file_byte_len=self.file_byte_len,
             "new bytes were read from file"
