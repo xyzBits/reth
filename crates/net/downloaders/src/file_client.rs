@@ -73,7 +73,7 @@ impl FileClient {
         let file_len = metadata.len();
 
         let mut reader = vec![];
-        file.read_to_end(&mut reader).await.unwrap();
+        file.read_to_end(&mut reader).await?;
 
         Ok(Self::from_reader(&reader[..], file_len).await?.0)
     }
@@ -178,12 +178,6 @@ impl FileClient {
     /// before returning.
     pub fn tip_header(&self) -> Option<SealedHeader> {
         self.headers.get(&self.max_block()?).map(|h| h.clone().seal_slow())
-    }
-
-    /// Clones and returns the lowest header of this client has or `None` if empty. Seals header
-    /// before returning.
-    pub fn start_header(&self) -> Option<SealedHeader> {
-        self.headers.get(&self.min_block()?).map(|h| h.clone().seal_slow())
     }
 
     /// Returns true if all blocks are canonical (no gaps)
@@ -380,8 +374,8 @@ impl ChunkedFileReader {
 
         // read new bytes from file
         let mut reader = BytesMut::zeroed(new_read_bytes_target_len as usize);
-        let new_read_bytes_len = self.file.read_exact(&mut reader).await.unwrap() as u64;
         // actual bytes that have been read
+        let new_read_bytes_len = self.file.read_exact(&mut reader).await? as u64;
 
         // update remaining file length
         self.file_byte_len -= new_read_bytes_len;
