@@ -28,15 +28,8 @@ use reth_interfaces::p2p::{
 use reth_node_core::init::init_genesis;
 use reth_node_ethereum::EthEvmConfig;
 use reth_node_events::node::NodeEvent;
-use reth_primitives::{stage::StageId, ChainSpec, PruneModes, SealedHeader, B256};
-<<<<<<< HEAD
-use reth_provider::{HeaderProvider, HeaderSyncMode, ProviderFactory, StageCheckpointReader};
-=======
-use reth_provider::{
-    BlockNumReader, HeaderProvider, HeaderSyncMode, ProviderError, ProviderFactory,
-    StageCheckpointReader,
-};
->>>>>>> emhane/import-cmd-start-header
+use reth_primitives::{stage::StageId, ChainSpec, PruneModes, B256};
+use reth_provider::{BlockNumReader, HeaderProvider, HeaderSyncMode, ProviderError, ProviderFactory, StageCheckpointReader};
 use reth_stages::{
     prelude::*,
     stages::{ExecutionStage, ExecutionStageThresholds, SenderRecoveryStage},
@@ -162,26 +155,14 @@ impl ImportCommand {
         // open file
         let mut reader = ChunkedFileReader::new(&self.path, self.chunk_len).await?;
 
-        let mut start_header: Option<SealedHeader> = None;
-
-        start_header = provider_factory
-            .provider()?
-            .sealed_header(self.start)
-            .expect("start block is not canonical with db");
-
         while let Some(file_client) = reader.next_chunk().await? {
             // create a new FileClient from chunk read from file
             info!(target: "reth::cli",
                 "Importing chain file chunk"
             );
 
-<<<<<<< HEAD
-            let tip = file_client.tip().expect("file client has no tip");
-=======
             let tip = file_client.tip().ok_or(eyre::eyre!("file client has no tip"))?;
->>>>>>> emhane/import-cmd-start-header
             info!(target: "reth::cli", "Chain file chunk read");
-            let tip_header = file_client.tip_header();
 
             let (mut pipeline, events) = self
                 .build_import_pipeline(
@@ -195,15 +176,12 @@ impl ImportCommand {
                         PruneModes::default(),
                     ),
                     self.no_state,
-                    start_header.take().unwrap(),
                 )
                 .await?;
 
             // override the tip
             pipeline.set_tip(tip);
             debug!(target: "reth::cli", ?tip, "Tip manually set");
-
-            start_header = tip_header;
 
             let provider = provider_factory.provider()?;
 
@@ -237,7 +215,6 @@ impl ImportCommand {
         file_client: Arc<FileClient>,
         static_file_producer: StaticFileProducer<DB>,
         no_state: bool,
-        start_header: SealedHeader,
     ) -> eyre::Result<(Pipeline<DB>, impl Stream<Item = NodeEvent>)>
     where
         DB: Database + Clone + Unpin + 'static,
@@ -256,13 +233,9 @@ impl ImportCommand {
         let mut header_downloader = ReverseHeadersDownloaderBuilder::new(config.stages.headers)
             .build(file_client.clone(), consensus.clone())
             .into_task();
-<<<<<<< HEAD
-        header_downloader.update_local_head(start_header);
-=======
         // TODO: The pipeline should correctly configure the downloader on its own.
         // Find the possibility to remove unnecessary pre-configuration.
         header_downloader.update_local_head(local_head);
->>>>>>> emhane/import-cmd-start-header
         header_downloader.update_sync_target(SyncTarget::Tip(file_client.tip().unwrap()));
 
         let mut body_downloader = BodiesDownloaderBuilder::new(config.stages.bodies)

@@ -3,11 +3,9 @@ use reth_config::config::EtlConfig;
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW},
     database::Database,
-    mdbx,
-    table::Table,
     tables,
     transaction::{DbTx, DbTxMut},
-    DatabaseError, RawKey, RawValue,
+    RawKey, RawValue,
 };
 use reth_etl::Collector;
 use reth_interfaces::provider::ProviderError;
