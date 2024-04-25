@@ -404,19 +404,42 @@ fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::
 
     let tx = provider.tx_ref();
     let mut intermediate_state: Option<IntermediateStateRootState> = None;
+    let mut total_updates = 0;
+
     let root = loop {
         match StateRootComputer::from_tx(tx)
             .with_intermediate_state(intermediate_state)
             .root_with_progress()?
         {
             StateRootProgress::Progress(state, _, updates) => {
-                trace!(target: "reth::cli", last_account_key = %state.last_account_key, updates_len = updates.len(), "Flushing trie updates");
+                let updates_len = updates.len();
+
+                trace!(target: "reth::cli",
+                    last_account_key = %state.last_account_key,
+                    updates_len,
+                    total_updates,
+                    "Flushing trie updates"
+                );
+
                 intermediate_state = Some(*state);
                 updates.flush(tx)?;
+
+                total_updates += updates_len;
             }
             StateRootProgress::Complete(root, _, updates) => {
-                trace!(target: "reth::cli", updates_len = updates.len(), "State root has been computed");
+                let updates_len = updates.len();
+
                 updates.flush(tx)?;
+
+                total_updates += updates_len;
+
+                trace!(target: "reth::cli",
+                    %root,
+                    updates_len = updates_len,
+                    total_updates,
+                    "State root has been computed"
+                );
+
                 break root
             }
         }
