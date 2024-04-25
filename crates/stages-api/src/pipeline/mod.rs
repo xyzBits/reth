@@ -524,6 +524,7 @@ fn on_stage_error<DB: Database>(
         Ok(Some(ControlFlow::Unwind { target: block.number - 1, bad_block: block }))
     } else if err.is_fatal() {
         error!(target: "sync::pipeline", stage = %stage_id, "Stage encountered a fatal error: {err}");
+        panic!();
         Err(err.into())
     } else {
         // On other errors we assume they are recoverable if we discard the
