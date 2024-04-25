@@ -7,9 +7,8 @@ use reth_db::{
 };
 use reth_interfaces::{db::DatabaseError, provider::ProviderResult};
 use reth_primitives::{
-    stage::{StageCheckpoint, StageId},
-    Account, Address, Bytecode, ChainSpec, GenesisAccount, Receipts, StaticFileSegment,
-    StorageEntry, B256, U256,
+    stage::StageId, Account, Address, Bytecode, ChainSpec, GenesisAccount, Receipts,
+    StaticFileSegment, StorageEntry, B256, U256,
 };
 use reth_provider::{
     bundle_state::{BundleStateInit, RevertsInit},
@@ -26,7 +25,7 @@ use std::{
     ops::DerefMut,
     sync::Arc,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 /// Default soft limit for number of bytes to read from state dump file, before inserting into
 /// database.
@@ -57,10 +56,19 @@ pub enum InitDatabaseError {
         /// Actual genesis hash.
         database_hash: B256,
     },
-
     /// Provider error.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// Computed state root doesn't match state root in state dump file.
+    #[error(
+        "state root mismatch, state dump: {expected_state_root}, computed: {computed_state_root}"
+    )]
+    SateRootMismatch {
+        /// Expected state root.
+        expected_state_root: B256,
+        /// Actual state root.
+        computed_state_root: B256,
+    },
 }
 
 impl From<DatabaseError> for InitDatabaseError {
@@ -126,7 +134,7 @@ pub fn insert_genesis_state<'a, 'b, DB: Database>(
     capacity: usize,
     alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)>,
 ) -> ProviderResult<()> {
-    insert_state::<DB>(tx, capacity, alloc, 0, false)
+    insert_state::<DB>(tx, capacity, alloc, 0)
 }
 
 /// Inserts state at given block into database.
@@ -135,7 +143,6 @@ pub fn insert_state<'a, 'b, DB: Database>(
     capacity: usize,
     alloc: impl Iterator<Item = (&'a Address, &'b GenesisAccount)>,
     block: u64,
-    append_only: bool,
 ) -> ProviderResult<()> {
     let mut state_init: BundleStateInit = HashMap::with_capacity(capacity);
     let mut reverts_init = HashMap::with_capacity(capacity);
@@ -193,7 +200,7 @@ pub fn insert_state<'a, 'b, DB: Database>(
         block,
     );
 
-    bundle.write_to_storage_with_mode(tx, None, OriginalValuesKnown::Yes, append_only)?;
+    bundle.write_to_storage(tx, None, OriginalValuesKnown::Yes)?;
 
     trace!(target: "reth::cli", "Inserted state");
 
@@ -307,22 +314,13 @@ pub fn init_from_state_dump<DB: Database>(
 
     // first line can be state root, then it can be used for verifying against computed state root
     reader.read_line(&mut line)?;
-    let expected_state_root = match serde_json::from_str::<StateRoot>(&line) {
-        Ok(root) => {
-            trace!(target: "reth::cli",
-                root=%root.root,
-                "Read state root from file"
-            );
-            Some(root)
-        }
-        Err(_) => {
-            let GenesisAccountWithAddress { genesis_account, address } =
-                serde_json::from_str(&line)?;
-            accounts.push((address, genesis_account));
+    let expected_state_root = serde_json::from_str::<StateRoot>(&line)?.root;
 
-            None
-        }
-    };
+    trace!(target: "reth::cli",
+        root=%expected_state_root,
+        "Read state root from file"
+    );
+
     line.clear();
 
     // remaining lines are accounts
@@ -361,13 +359,7 @@ pub fn init_from_state_dump<DB: Database>(
                 accounts.len(),
                 accounts.iter().map(|(address, account)| (address, account)),
                 block,
-                false,
             )?;
-
-            // insert sync stage
-            for stage in StageId::ALL.iter() {
-                tx.put::<tables::StageCheckpoints>(stage.to_string(), StageCheckpoint::new(block))?;
-            }
 
             accounts.clear();
         }
@@ -382,28 +374,23 @@ pub fn init_from_state_dump<DB: Database>(
         line.clear();
     }
 
-    // compute and compare state root
-    //
-    // note: we compute it even if we have nothing to compare to because we set the stage
-    // checkpoints further up.
+    // compute and compare state root. this advances the stage checkpoints.
     let computed_state_root = compute_state_root(&provider_rw)?;
-    if let Some(expected_state_root) = expected_state_root {
-        if computed_state_root != expected_state_root {
-            error!(target: "reth::cli",
-                ?computed_state_root,
-                ?expected_state_root,
-                "Computed state root does not match state root in state dump"
-            );
-            eyre::bail!("Computed state root differs from state root in state dump. Got {:?}, expected {:?}", computed_state_root, expected_state_root);
-        } else {
-            info!(target: "reth::cli",
-                ?computed_state_root,
-                
-            "Computed state root matches state root in state dump");
-        }
+    if computed_state_root != expected_state_root {
+        error!(target: "reth::cli",
+            ?computed_state_root,
+            ?expected_state_root,
+            "Computed state root does not match state root in state dump"
+        );
+
+        Err(InitDatabaseError::SateRootMismatch { expected_state_root, computed_state_root })?
     } else {
-        warn!(target: "reth::cli", "No state root found in file, skipping verification.");
+        info!(target: "reth::cli",
+            ?computed_state_root,
+            "Computed state root matches state root in state dump"
+        );
     }
+
     provider_rw.commit()?;
 
     Ok(hash)
@@ -411,14 +398,14 @@ pub fn init_from_state_dump<DB: Database>(
 
 /// Computes the state root (from scratch) based on the accounts and storages present in the
 /// database.
-fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::Result<StateRoot> {
+fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::Result<B256> {
     trace!(target: "reth::cli", "Computing state root");
 
     let tx = provider.tx_ref();
     let mut intermediate_state: Option<IntermediateStateRootState> = None;
-    let mut total_updates = 0;
+    let mut total_flushed_updates = 0;
 
-    let root = loop {
+    loop {
         match StateRootComputer::from_tx(tx)
             .with_intermediate_state(intermediate_state)
             .root_with_progress()?
@@ -429,18 +416,18 @@ fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::
                 trace!(target: "reth::cli",
                     last_account_key = %state.last_account_key,
                     updates_len,
-                    total_updates,
+                    total_flushed_updates,
                     "Flushing trie updates"
                 );
 
                 intermediate_state = Some(*state);
                 updates.flush(tx)?;
 
-                total_updates += updates_len;
+                total_flushed_updates += updates_len;
 
-                if total_updates % SOFT_LIMIT_COUNT_FLUSHED_UPDATES == 0 {
+                if total_flushed_updates % SOFT_LIMIT_COUNT_FLUSHED_UPDATES == 0 {
                     info!(target: "reth::cli",
-                        total_updates,
+                        total_flushed_updates,
                         "Flushing trie updates"
                     );
                 }
@@ -450,23 +437,22 @@ fn compute_state_root<DB: Database>(provider: &DatabaseProviderRW<DB>) -> eyre::
 
                 updates.flush(tx)?;
 
-                total_updates += updates_len;
+                total_flushed_updates += updates_len;
 
                 trace!(target: "reth::cli",
                     %root,
                     updates_len = updates_len,
-                    total_updates,
+                    total_flushed_updates,
                     "State root has been computed"
                 );
 
-                break root
+                return Ok(root)
             }
         }
-    };
-
-    Ok(StateRoot { root })
+    }
 }
 
+/// Type to deserialize state root from state dump file.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct StateRoot {
     root: B256,
