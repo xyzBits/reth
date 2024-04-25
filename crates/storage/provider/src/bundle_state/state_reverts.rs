@@ -1,6 +1,6 @@
 use rayon::slice::ParallelSliceMut;
 use reth_db::{
-    cursor::{DbCursorRO, DbDupCursorRO, DbDupCursorRW},
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     models::{AccountBeforeTx, BlockNumberAddress},
     tables,
     transaction::{DbTx, DbTxMut},
@@ -21,13 +21,27 @@ impl From<PlainStateReverts> for StateReverts {
 }
 
 impl StateReverts {
-    /// Write reverts to database.
-    ///
-    /// Note:: Reverts will delete all wiped storage from plain state.
+    /// Write reverts to database, when [`StateReverts`] contains all values that will be inserted
+    /// for the given keys. See [`write_to_db_with_mode`](Self::write_to_db_with_mode).
     pub fn write_to_db<TX: DbTxMut + DbTx>(
         self,
         tx: &TX,
         first_block: BlockNumber,
+    ) -> Result<(), DatabaseError> {
+        self.write_to_db_with_mode(tx, first_block, true)
+    }
+
+    /// Write reverts to database.
+    ///
+    /// Passing `true` to to 'exhaustive_data_for_keys' parameter, will bring slight performance
+    /// gain, but will panic if values are not all that will be inserted for any given key.
+    ///
+    /// Note:: Reverts will delete all wiped storage from plain state.
+    pub fn write_to_db_with_mode<TX: DbTxMut + DbTx>(
+        self,
+        tx: &TX,
+        first_block: BlockNumber,
+        exhaustive_data_for_keys: bool,
     ) -> Result<(), DatabaseError> {
         // Write storage changes
         tracing::trace!(target: "provider::reverts", "Writing storage changes");
@@ -78,11 +92,29 @@ impl StateReverts {
             let block_number = first_block + block_index as BlockNumber;
             // Sort accounts by address.
             account_block_reverts.par_sort_by_key(|a| a.0);
-            for (address, info) in account_block_reverts {
-                account_changeset_cursor.append_dup(
-                    block_number,
-                    AccountBeforeTx { address, info: info.map(into_reth_acc) },
-                )?;
+
+            let mut account_block_reverts_iter = account_block_reverts.into_iter();
+
+            if exhaustive_data_for_keys {
+                if let Some((address, info)) = account_block_reverts_iter.next() {
+                    // upsert on dup sort tables will seek and then append.
+                    //
+                    // upsert on dupsort table will **not** overwrite the existing value for the
+                    // `block-number` key
+                    account_changeset_cursor.upsert(
+                        block_number,
+                        AccountBeforeTx { address, info: info.map(into_reth_acc) },
+                    )?;
+                }
+            }
+
+            for (address, info) in account_block_reverts_iter {
+                if exhaustive_data_for_keys {
+                    account_changeset_cursor.append_dup(
+                        block_number,
+                        AccountBeforeTx { address, info: info.map(into_reth_acc) },
+                    )?;
+                }
             }
         }
 

@@ -6105,6 +6105,7 @@ dependencies = [
  "serde_json",
  "similar-asserts",
  "tempfile",
+ "thiserror",
  "tikv-jemallocator",
  "tokio",
  "toml",
