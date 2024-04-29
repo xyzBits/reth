@@ -8,7 +8,7 @@ use std::{
 
 use derive_more::Display;
 use discv5::ListenConfig;
-use multiaddr::{Multiaddr, Protocol};
+use discv5::multiaddr::{Multiaddr, Protocol};
 use reth_primitives::{Bytes, EnrForkIdEntry, ForkId, NodeRecord, MAINNET};
 
 use crate::{enr::discv4_id_to_multiaddr_id, filter::MustNotIncludeKeys, network_key};
