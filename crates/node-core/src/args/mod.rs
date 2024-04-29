@@ -51,6 +51,10 @@ pub use dev::DevArgs;
 mod pruning;
 pub use pruning::PruningArgs;
 
+/// BenchmarkArgs struct for configuring the benchmark to run
+mod benchmark_args;
+pub use benchmark_args::BenchmarkArgs;
+
 pub mod utils;
 
 pub mod types;
