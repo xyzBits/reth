@@ -423,23 +423,20 @@ impl TransactionFetcher {
     ) {
         let init_capacity_req = approx_capacity_get_pooled_transactions_req_eth68(&self.info);
         let mut hashes_to_request = RequestTxHashes::with_capacity(init_capacity_req);
-        let is_session_active = |peer_id: &PeerId| peers.contains_key(peer_id);
+        //let is_session_active = |peer_id: &PeerId| peers.contains_key(peer_id);
 
         let mut search_durations = TxFetcherSearchDurations::default();
 
-        // budget to look for an idle peer before giving up
+        /*// budget to look for an idle peer before giving up
         let budget_find_idle_fallback_peer = self
-            .search_breadth_budget_find_idle_fallback_peer(&has_capacity_wrt_pending_pool_imports);
+            .search_breadth_budget_find_idle_fallback_peer(&has_capacity_wrt_pending_pool_imports);*/
 
         let acc = &mut search_durations.fill_request;
         let peer_id = duration_metered_exec!(
             {
-                let Some(peer_id) = self.find_any_idle_fallback_peer_for_any_pending_hash(
-                    &mut hashes_to_request,
-                    is_session_active,
-                    budget_find_idle_fallback_peer,
-                ) else {
-                    // no peers are idle or budget is depleted
+                let Some((peer_id, _)) =
+                    peers.iter().find(|(ref peer_id, _)| self.is_idle(peer_id))
+                else {
                     return
                 };
 
@@ -449,7 +446,7 @@ impl TransactionFetcher {
         );
 
         // peer should always exist since `is_session_active` already checked
-        let Some(peer) = peers.get(&peer_id) else { return };
+        let Some(peer) = peers.get(peer_id) else { return };
         let conn_eth_version = peer.version;
 
         // fill the request with more hashes pending fetch that have been announced by the peer.
@@ -496,7 +493,7 @@ impl TransactionFetcher {
                 "failed sending request to peer's session, buffering hashes"
             );
 
-            self.buffer_hashes(failed_to_request_hashes, Some(peer_id));
+            self.buffer_hashes(failed_to_request_hashes, Some(*peer_id));
         }
     }
 
@@ -732,7 +729,7 @@ impl TransactionFetcher {
         seen_hashes: &LruCache<TxHash>,
         mut budget_fill_request: Option<usize>, // check max `budget` lru pending hashes
     ) {
-        let Some(hash) = hashes_to_request.iter().next() else { return };
+        /*let Some(hash) = hashes_to_request.iter().next() else { return };
 
         let mut acc_size_response = self
             .hashes_fetch_inflight_and_pending_fetch
@@ -745,7 +742,9 @@ impl TransactionFetcher {
             DEFAULT_SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESPONSE_ON_FETCH_PENDING_HASHES
         {
             return
-        }
+        }*/
+
+        let mut acc_size_response = 0;
 
         // try to fill request by checking if any other hashes pending fetch (in lru order) are
         // also seen by peer
