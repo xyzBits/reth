@@ -2471,7 +2471,7 @@ dependencies = [
 [[package]]
 name = "discv5"
 version = "0.6.0"
-source = "git+https://github.com/onbjerg/discv5?branch=onbjerg/slim-deps#e41a2543b72846eb9fefe28bdd31429ef40a131c"
+source = "git+https://github.com/sigp/discv5?rev=567da5b7000a2b2146fff06f998ed77ec56e01b4#567da5b7000a2b2146fff06f998ed77ec56e01b4"
 dependencies = [
  "aes 0.7.5",
  "aes-gcm",
