@@ -11,7 +11,7 @@ use futures::{future, future::Either, stream, stream_select, StreamExt};
 use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, PruneHook, StaticFileHook},
-    BeaconConsensus, BeaconConsensusEngine,
+    BeaconConsensus, BeaconConsensusEngine, DEFAULT_ENGINE_MESSAGE_CAPACITY,
 };
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
@@ -36,7 +36,10 @@ use reth_tasks::TaskExecutor;
 use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::TransactionPool;
 use std::{future::Future, sync::Arc};
-use tokio::sync::{mpsc::unbounded_channel, oneshot};
+use tokio::sync::{
+    mpsc::{channel, unbounded_channel},
+    oneshot,
+};
 
 pub mod common;
 pub use common::LaunchContext;
@@ -261,11 +264,12 @@ where
 
         // create pipeline
         let network_client = node_adapter.network().fetch_client().await?;
-        let (consensus_engine_tx, mut consensus_engine_rx) = unbounded_channel();
+        let (consensus_engine_tx, mut consensus_engine_rx) =
+            channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
 
         if let Some(skip_fcu_threshold) = ctx.node_config().debug.skip_fcu {
             debug!(target: "reth::cli", "spawning skip FCU task");
-            let (skip_fcu_tx, skip_fcu_rx) = unbounded_channel();
+            let (skip_fcu_tx, skip_fcu_rx) = channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
             let engine_skip_fcu = EngineApiSkipFcu::new(skip_fcu_threshold);
             ctx.task_executor().spawn_critical(
                 "skip FCU interceptor",
@@ -276,7 +280,8 @@ where
 
         if let Some(store_path) = ctx.node_config().debug.engine_api_store.clone() {
             debug!(target: "reth::cli", "spawning engine API store");
-            let (engine_intercept_tx, engine_intercept_rx) = unbounded_channel();
+            let (engine_intercept_tx, engine_intercept_rx) =
+                channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
             let engine_api_store = EngineApiStore::new(store_path);
             ctx.task_executor().spawn_critical(
                 "engine api interceptor",
@@ -402,7 +407,7 @@ address.to_string(), format_ether(alloc.balance));
 
         let events = stream_select!(
             node_adapter.components.network().event_listener().map(Into::into),
-            beacon_engine_handle.event_listener().map(Into::into),
+            beacon_engine_handle.event_listener().await.map(Into::into),
             pipeline_events.map(Into::into),
             if ctx.node_config().debug.tip.is_none() && !ctx.is_dev() {
                 Either::Left(

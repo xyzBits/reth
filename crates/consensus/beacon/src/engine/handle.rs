@@ -10,7 +10,7 @@ use reth_interfaces::RethResult;
 use reth_rpc_types::engine::{
     CancunPayloadFields, ExecutionPayload, ForkchoiceState, ForkchoiceUpdated, PayloadStatus,
 };
-use tokio::sync::{mpsc, mpsc::UnboundedSender, oneshot};
+use tokio::sync::{mpsc, mpsc::Sender, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// A _shareable_ beacon consensus frontend type. Used to interact with the spawned beacon consensus
@@ -22,7 +22,7 @@ pub struct BeaconConsensusEngineHandle<Engine>
 where
     Engine: EngineTypes,
 {
-    pub(crate) to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
+    pub(crate) to_engine: Sender<BeaconEngineMessage<Engine>>,
 }
 
 impl<Engine> Clone for BeaconConsensusEngineHandle<Engine>
@@ -41,7 +41,7 @@ where
     Engine: EngineTypes,
 {
     /// Creates a new beacon consensus engine handle.
-    pub fn new(to_engine: UnboundedSender<BeaconEngineMessage<Engine>>) -> Self {
+    pub fn new(to_engine: Sender<BeaconEngineMessage<Engine>>) -> Self {
         Self { to_engine }
     }
 
@@ -54,7 +54,10 @@ where
         cancun_fields: Option<CancunPayloadFields>,
     ) -> Result<PayloadStatus, BeaconOnNewPayloadError> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::NewPayload { payload, cancun_fields, tx });
+        let _ = self
+            .to_engine
+            .send(BeaconEngineMessage::NewPayload { payload, cancun_fields, tx })
+            .await;
         rx.await.map_err(|_| BeaconOnNewPayloadError::EngineUnavailable)?
     }
 
@@ -68,6 +71,7 @@ where
     ) -> Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError> {
         Ok(self
             .send_fork_choice_updated(state, payload_attrs)
+            .await
             .map_err(|_| BeaconForkChoiceUpdateError::EngineUnavailable)
             .await??
             .await?)
@@ -75,17 +79,16 @@ where
 
     /// Sends a forkchoice update message to the beacon consensus engine and returns the receiver to
     /// wait for a response.
-    fn send_fork_choice_updated(
+    async fn send_fork_choice_updated(
         &self,
         state: ForkchoiceState,
         payload_attrs: Option<Engine::PayloadAttributes>,
     ) -> oneshot::Receiver<RethResult<OnForkChoiceUpdated>> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::ForkchoiceUpdated {
-            state,
-            payload_attrs,
-            tx,
-        });
+        let _ = self
+            .to_engine
+            .send(BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx })
+            .await;
         rx
     }
 
@@ -93,13 +96,13 @@ where
     ///
     /// See also <https://github.com/ethereum/execution-apis/blob/3d627c95a4d3510a8187dd02e0250ecb4331d27e/src/engine/paris.md#engine_exchangetransitionconfigurationv1>
     pub async fn transition_configuration_exchanged(&self) {
-        let _ = self.to_engine.send(BeaconEngineMessage::TransitionConfigurationExchanged);
+        let _ = self.to_engine.send(BeaconEngineMessage::TransitionConfigurationExchanged).await;
     }
 
     /// Creates a new [`BeaconConsensusEngineEvent`] listener stream.
-    pub fn event_listener(&self) -> UnboundedReceiverStream<BeaconConsensusEngineEvent> {
+    pub async fn event_listener(&self) -> UnboundedReceiverStream<BeaconConsensusEngineEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::EventListener(tx));
+        let _ = self.to_engine.send(BeaconEngineMessage::EventListener(tx)).await;
         UnboundedReceiverStream::new(rx)
     }
 }

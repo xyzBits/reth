@@ -2,7 +2,7 @@
 
 use reth_beacon_consensus::{BeaconEngineMessage, OnForkChoiceUpdated};
 use reth_engine_primitives::EngineTypes;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Intercept Engine API message and skip FCUs.
 #[derive(Debug)]
@@ -27,8 +27,8 @@ impl EngineApiSkipFcu {
     /// to the engine depending on current number of skipped FCUs.
     pub async fn intercept<Engine>(
         mut self,
-        mut rx: UnboundedReceiver<BeaconEngineMessage<Engine>>,
-        to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
+        mut rx: Receiver<BeaconEngineMessage<Engine>>,
+        to_engine: Sender<BeaconEngineMessage<Engine>>,
     ) where
         Engine: EngineTypes,
         BeaconEngineMessage<Engine>: std::fmt::Debug,
@@ -41,14 +41,12 @@ impl EngineApiSkipFcu {
                     let _ = tx.send(Ok(OnForkChoiceUpdated::syncing()));
                 } else {
                     self.skipped = 0;
-                    let _ = to_engine.send(BeaconEngineMessage::ForkchoiceUpdated {
-                        state,
-                        payload_attrs,
-                        tx,
-                    });
+                    let _ = to_engine
+                        .send(BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx })
+                        .await;
                 }
             } else {
-                let _ = to_engine.send(msg);
+                let _ = to_engine.send(msg).await;
             }
         }
     }

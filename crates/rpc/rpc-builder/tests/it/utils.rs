@@ -1,4 +1,4 @@
-use reth_beacon_consensus::BeaconConsensusEngineHandle;
+use reth_beacon_consensus::{BeaconConsensusEngineHandle, DEFAULT_ENGINE_MESSAGE_CAPACITY};
 use reth_network_api::noop::NoopNetwork;
 use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 use reth_payload_builder::test_utils::spawn_test_payload_service;
@@ -14,7 +14,7 @@ use reth_rpc_engine_api::EngineApi;
 use reth_tasks::TokioTaskExecutor;
 use reth_transaction_pool::test_utils::{TestPool, TestPoolBuilder};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::channel;
 
 /// Localhost with port 0 so a free port is used.
 pub fn test_address() -> SocketAddr {
@@ -24,7 +24,7 @@ pub fn test_address() -> SocketAddr {
 /// Launches a new server for the auth module
 pub async fn launch_auth(secret: JwtSecret) -> AuthServerHandle {
     let config = AuthServerConfig::builder(secret).socket_addr(test_address()).build();
-    let (tx, _rx) = unbounded_channel();
+    let (tx, _rx) = channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
     let beacon_engine_handle = BeaconConsensusEngineHandle::<EthEngineTypes>::new(tx);
     let engine_api = EngineApi::new(
         NoopProvider::default(),

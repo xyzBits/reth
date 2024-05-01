@@ -43,11 +43,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{
-    mpsc,
-    mpsc::{UnboundedReceiver, UnboundedSender},
+    mpsc::{self, Receiver, Sender, UnboundedSender},
     oneshot,
 };
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::*;
 
 mod message;
@@ -94,6 +93,15 @@ const MAX_INVALID_HEADERS: u32 = 512u32;
 /// This is the default threshold, the distance to the head that the tree will be used for sync.
 /// If the distance exceeds this threshold, the pipeline will be used for sync.
 pub const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
+
+/// The capacity of the engine message channel.
+///
+/// The channel is bounded to prevent unbounded memory growth. Geth has a similar upper bound for
+/// headers and payloads, at 10 and 96 respectively.
+///
+/// Since we do not distinguish between message types in the channel, by default we set a reasonable
+/// cap of 256 messages.
+pub const DEFAULT_ENGINE_MESSAGE_CAPACITY: usize = 256;
 
 /// The beacon consensus engine is the driver that switches between historical and live sync.
 ///
@@ -181,7 +189,7 @@ where
     /// Used for emitting updates about whether the engine is syncing or not.
     sync_state_updater: Box<dyn NetworkSyncUpdater>,
     /// The Engine API message receiver.
-    engine_message_rx: UnboundedReceiverStream<BeaconEngineMessage<EngineT>>,
+    engine_message_rx: ReceiverStream<BeaconEngineMessage<EngineT>>,
     /// A clone of the handle
     handle: BeaconConsensusEngineHandle<EngineT>,
     /// Tracks the received forkchoice state updates received by the CL.
@@ -240,7 +248,7 @@ where
         pipeline_run_threshold: u64,
         hooks: EngineHooks,
     ) -> RethResult<(Self, BeaconConsensusEngineHandle<EngineT>)> {
-        let (to_engine, rx) = mpsc::unbounded_channel();
+        let (to_engine, rx) = mpsc::channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
         Self::with_channel(
             client,
             pipeline,
@@ -282,8 +290,8 @@ where
         payload_builder: PayloadBuilderHandle<EngineT>,
         target: Option<B256>,
         pipeline_run_threshold: u64,
-        to_engine: UnboundedSender<BeaconEngineMessage<EngineT>>,
-        rx: UnboundedReceiver<BeaconEngineMessage<EngineT>>,
+        to_engine: Sender<BeaconEngineMessage<EngineT>>,
+        rx: Receiver<BeaconEngineMessage<EngineT>>,
         hooks: EngineHooks,
     ) -> RethResult<(Self, BeaconConsensusEngineHandle<EngineT>)> {
         let handle = BeaconConsensusEngineHandle { to_engine };
@@ -302,7 +310,7 @@ where
             payload_validator: ExecutionPayloadValidator::new(blockchain.chain_spec()),
             blockchain,
             sync_state_updater,
-            engine_message_rx: UnboundedReceiverStream::new(rx),
+            engine_message_rx: ReceiverStream::new(rx),
             handle: handle.clone(),
             forkchoice_state_tracker: Default::default(),
             payload_builder,

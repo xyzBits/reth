@@ -9,7 +9,7 @@ use reth_rpc_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::*;
 
 /// A message from the engine API that has been stored to disk.
@@ -113,8 +113,8 @@ impl EngineApiStore {
     /// engine channel.
     pub async fn intercept<Engine>(
         self,
-        mut rx: UnboundedReceiver<BeaconEngineMessage<Engine>>,
-        to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
+        mut rx: Receiver<BeaconEngineMessage<Engine>>,
+        to_engine: Sender<BeaconEngineMessage<Engine>>,
     ) where
         Engine: EngineTypes,
         BeaconEngineMessage<Engine>: std::fmt::Debug,
@@ -123,7 +123,7 @@ impl EngineApiStore {
             if let Err(error) = self.on_message(&msg, SystemTime::now()) {
                 error!(target: "engine::intercept", ?msg, %error, "Error handling Engine API message");
             }
-            let _ = to_engine.send(msg);
+            let _ = to_engine.send(msg).await;
         }
     }
 }

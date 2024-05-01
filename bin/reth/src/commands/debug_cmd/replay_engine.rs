@@ -9,7 +9,9 @@ use crate::{
 use clap::Parser;
 use eyre::Context;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
-use reth_beacon_consensus::{hooks::EngineHooks, BeaconConsensus, BeaconConsensusEngine};
+use reth_beacon_consensus::{
+    hooks::EngineHooks, BeaconConsensus, BeaconConsensusEngine, DEFAULT_ENGINE_MESSAGE_CAPACITY,
+};
 use reth_blockchain_tree::{
     BlockchainTree, BlockchainTreeConfig, ShareableBlockchainTree, TreeExternals,
 };
@@ -191,7 +193,8 @@ impl Command {
 
         // Configure the consensus engine
         let network_client = network.fetch_client().await?;
-        let (consensus_engine_tx, consensus_engine_rx) = mpsc::unbounded_channel();
+        let (consensus_engine_tx, consensus_engine_rx) =
+            mpsc::channel(DEFAULT_ENGINE_MESSAGE_CAPACITY);
         let (beacon_consensus_engine, beacon_engine_handle) = BeaconConsensusEngine::with_channel(
             network_client,
             Pipeline::builder().build(
