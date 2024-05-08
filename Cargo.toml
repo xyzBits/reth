@@ -89,6 +89,7 @@ members = [
     "examples/custom-inspector/",
     "examples/exex/*",
     "examples/db-access",
+    "examples/sled",
     "testing/ef-tests/",
     "testing/testing-utils",
 ]
@@ -278,8 +279,13 @@ reth-node-events = { path = "crates/node/events" }
 reth-testing-utils = { path = "testing/testing-utils" }
 
 # revm
-revm = { version = "8.0.0", features = ["std", "secp256k1"], default-features = false }
-revm-primitives = { version = "3.1.0", features = ["std"], default-features = false }
+revm = { version = "8.0.0", features = [
+    "std",
+    "secp256k1",
+], default-features = false }
+revm-primitives = { version = "3.1.0", features = [
+    "std",
+], default-features = false }
 revm-inspectors = { git = "https://github.com/paradigmxyz/evm-inspectors", rev = "089efac" }
 
 # eth
@@ -377,7 +383,10 @@ secp256k1 = { version = "0.28", default-features = false, features = [
     "recovery",
 ] }
 # TODO: Remove `k256` feature: https://github.com/sigp/enr/pull/74
-enr = { version = "0.12.0", default-features = false, features = ["k256", "rust-secp256k1"] }
+enr = { version = "0.12.0", default-features = false, features = [
+    "k256",
+    "rust-secp256k1",
+] }
 
 # for eip-4844
 c-kzg = "1.0.0"
