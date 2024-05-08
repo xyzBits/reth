@@ -1,5 +1,5 @@
 use reth_db::{cursor::DbCursorRO, open_db_read_only, table::Compress, tables, transaction::DbTx};
-use reth_primitives::{Address, ChainSpecBuilder, B256};
+use reth_primitives::{keccak256, Address, ChainSpecBuilder, TransactionSignedNoHash, B256};
 use reth_provider::{
     AccountReader, BlockReader, BlockSource, DatabaseProviderFactory, HeaderProvider,
     ProviderFactory, ReceiptProvider, StateProvider, TransactionsProvider,
@@ -21,13 +21,24 @@ fn main() -> eyre::Result<()> {
     // open ro tx
     let provider = factory.provider()?.disable_long_read_transaction_safety();
 
+    #[inline]
+    fn calculate_hash(tx: TransactionSignedNoHash) -> B256 {
+        let mut buf = Vec::new();
+        tx.transaction.encode_with_signature(&tx.signature, &mut buf, false);
+        keccak256(buf)
+    }
+
     // migrate tx's
     let tx_tree = sled.open_tree("Transactions").expect("could not open tx tree");
+    let lookup_tree = sled.open_tree("TxLookup").expect("could not open lookup tree");
     let tx = provider.into_tx();
     let mut cursor = tx.cursor_read::<tables::Transactions>().expect("could not open tx cursor");
     for item in cursor.walk_range(0..).expect("could not open walker") {
         let (tx_id, tx) = item.expect("db read error");
-        tx_tree.insert(tx_id.to_be_bytes(), tx.compress()).expect("could not insert tx");
+        tx_tree.insert(tx_id.to_be_bytes(), tx.clone().compress()).expect("could not insert tx");
+        lookup_tree
+            .insert(calculate_hash(tx), &tx_id.to_be_bytes())
+            .expect("could not insert lookup entry");
     }
 
     Ok(())
