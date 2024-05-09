@@ -16,20 +16,48 @@ use std::{io::Write, mem::size_of, path::Path};
 // reth size:
 //  | PlainAccountState          | 33781302  | 6340         | 664574     | 0              | 2.6 GiB    |
 //
-// sled size:
+// sled size (default, zstd 3):
 //  ❯ du -sh reth
 //  785M	reth
-//
-// todo: check if diff is mostly because data was inserted sorted into sled
 //
 // reth-holesky-state-root-wink-2024-05-02T04-32Z.tar
 //
 // mdbx.dat size:
 //  30.06GB
-// sled size:
+// sled size (default, zstd 3):
 //  10GB
+// sled size (zstd 1):
+//  10GB(?!)
 //
 // todo: is all of this just from sorted inserts?
+//
+// parameters interesting to bench:
+// - leaf fanout (refer architecture.md for tradeoff): write/read speed, disk size
+// - zstd compression level: write/read speed, disk size
+// - cache size: read speed
+// - entry cache size: read speed
+//
+// pros so far:
+// - can prune while syncing (multiple writers)
+// - no overflow pages, no freelist(?)
+// - built in compression, can remove homebaked
+// - rust only
+// - remove bunch of deps for building
+// - smaller binary size
+//
+// cons:
+// - major refactor
+// - experimental
+// - unknown sync speed/real rpc performance w/o refactoring
+//  - maybe just refactor pipeline?
+// - mdbx super inertia cus we rely on it for metrics etc
+// - unclear how to properly use transaction api in our architecture
+// - background autoflusher (need to re-examine what consistency means)
+// - no duptables (might not matter?)
+// - cant disable zstd (might not matter? can be prd?)
+//
+// inserting storagestrie is really slow - is this compression or decompression? i.e. is this
+// present in current reth, too?
 fn main() -> eyre::Result<()> {
     // open reth db
     let db_path = std::env::var("RETH_DB_PATH")?;
@@ -39,7 +67,12 @@ fn main() -> eyre::Result<()> {
     let factory = ProviderFactory::new(db, spec.into(), db_path.join("static_files"))?;
 
     // open sled
-    let sled = sled::open("reth").expect("could not open sled");
+    //let sled = sled::open("reth-sled-default").expect("could not open sled");
+    let sled = sled::Config::new()
+        .path("reth-sled-zstd-1")
+        .zstd_compression_level(1)
+        .open()
+        .expect("could not open sled");
 
     // open ro tx
     let provider = factory.provider()?.disable_long_read_transaction_safety();
