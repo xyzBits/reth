@@ -1,5 +1,8 @@
 use reth_db::{cursor::DbCursorRO, open_db_read_only, table::Compress, tables, transaction::DbTx};
-use reth_primitives::{keccak256, Address, ChainSpecBuilder, TransactionSignedNoHash, B256};
+use reth_primitives::{
+    keccak256, revm_primitives::FixedBytes, Address, ChainSpecBuilder, TransactionSignedNoHash,
+    B256,
+};
 use reth_provider::{
     AccountReader, BlockReader, BlockSource, DatabaseProviderFactory, HeaderProvider,
     ProviderFactory, ReceiptProvider, StateProvider, TransactionsProvider,
@@ -7,7 +10,20 @@ use reth_provider::{
 use reth_rpc_types::{Filter, FilteredParams};
 use std::path::Path;
 
+// in reth: 33781302 accounts
+// in sled: 33781302 accounts
+//
+// reth size:
+//  | PlainAccountState          | 33781302  | 6340         | 664574     | 0              | 2.6 GiB    |
+//
+// sled size:
+//  ❯ du -sh reth
+//  785M	reth
+//
+// todo: check if diff is mostly because data was inserted sorted into sled
 fn main() -> eyre::Result<()> {
+    println!("open");
+
     // open reth db
     let db_path = std::env::var("RETH_DB_PATH")?;
     let db_path = Path::new(&db_path);
@@ -21,25 +37,34 @@ fn main() -> eyre::Result<()> {
     // open ro tx
     let provider = factory.provider()?.disable_long_read_transaction_safety();
 
-    #[inline]
-    fn calculate_hash(tx: TransactionSignedNoHash) -> B256 {
-        let mut buf = Vec::new();
-        tx.transaction.encode_with_signature(&tx.signature, &mut buf, false);
-        keccak256(buf)
-    }
-
     // migrate tx's
-    let tx_tree = sled.open_tree("Transactions").expect("could not open tx tree");
-    let lookup_tree = sled.open_tree("TxLookup").expect("could not open lookup tree");
-    let tx = provider.into_tx();
-    let mut cursor = tx.cursor_read::<tables::Transactions>().expect("could not open tx cursor");
-    for item in cursor.walk_range(0..).expect("could not open walker") {
-        let (tx_id, tx) = item.expect("db read error");
-        tx_tree.insert(tx_id.to_be_bytes(), tx.clone().compress()).expect("could not insert tx");
-        lookup_tree
-            .insert(calculate_hash(tx), &tx_id.to_be_bytes())
-            .expect("could not insert lookup entry");
+    let account_tree = sled.open_tree("Accounts").expect("could not open tx tree");
+    println!("entries: {}", account_tree.len());
+    return Ok(());
+    for item in account_tree.iter() {
+        let item = item.unwrap();
+        println!(
+            "existing item: {}",
+            Address::from_word(FixedBytes::from(
+                TryInto::<[u8; 32]>::try_into(item.0.as_ref()).unwrap()
+            ))
+        );
     }
+    let tx = provider.into_tx();
+    let mut cursor =
+        tx.cursor_read::<tables::PlainAccountState>().expect("could not open acc cursor");
+    for item in cursor.walk_range(Address::ZERO..).expect("could not open walker") {
+        let (address, account) = item.expect("db read error");
+        println!("writing account {address}");
+        account_tree
+            .insert(address.as_slice(), account.clone().compress())
+            .expect("could not insert acc");
+        println!("wrote account");
+    }
+    println!("wrote accounts");
+
+    account_tree.flush().unwrap();
+    println!("flushed");
 
     Ok(())
 }
