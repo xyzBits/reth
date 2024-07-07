@@ -12,24 +12,28 @@
 //! cast rpc myrpcExt_customMethod
 //! ```
 
+use std::{path::Path, sync::Arc};
+
 use reth::{
-    primitives::ChainSpecBuilder,
-    providers::{providers::BlockchainProvider, ProviderFactory},
-    utils::db::open_db_read_only,
+    providers::{
+        providers::{BlockchainProvider, StaticFileProvider},
+        ProviderFactory,
+    },
+    utils::open_db_read_only,
 };
-use reth_db::{mdbx::DatabaseArguments, models::client_version::ClientVersion};
+use reth_chainspec::ChainSpecBuilder;
+use reth_db::mdbx::DatabaseArguments;
+use reth_db_api::models::ClientVersion;
+
 // Bringing up the RPC
 use reth::rpc::builder::{
-    RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig,
+    EthApiBuild, RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig,
 };
 // Configuring the network parts, ideally also wouldn't need to think about this.
 use myrpc_ext::{MyRpcExt, MyRpcExtApiServer};
-use reth::{
-    blockchain_tree::noop::NoopBlockchainTree, providers::test_utils::TestCanonStateSubscriptions,
-    tasks::TokioTaskExecutor,
-};
+use reth::{blockchain_tree::noop::NoopBlockchainTree, tasks::TokioTaskExecutor};
 use reth_node_ethereum::EthEvmConfig;
-use std::{path::Path, sync::Arc};
+use reth_provider::test_utils::TestCanonStateSubscriptions;
 
 // Custom rpc extension
 pub mod myrpc_ext;
@@ -44,7 +48,11 @@ async fn main() -> eyre::Result<()> {
         DatabaseArguments::new(ClientVersion::default()),
     )?);
     let spec = Arc::new(ChainSpecBuilder::mainnet().build());
-    let factory = ProviderFactory::new(db.clone(), spec.clone(), db_path.join("static_files"))?;
+    let factory = ProviderFactory::new(
+        db.clone(),
+        spec.clone(),
+        StaticFileProvider::read_only(db_path.join("static_files"))?,
+    );
 
     // 2. Setup the blockchain provider using only the database provider and a noop for the tree to
     //    satisfy trait bounds. Tree is not used in this example since we are only operating on the
@@ -62,7 +70,7 @@ async fn main() -> eyre::Result<()> {
 
     // Pick which namespaces to expose.
     let config = TransportRpcModuleConfig::default().with_http([RethRpcModule::Eth]);
-    let mut server = rpc_builder.build(config);
+    let mut server = rpc_builder.build(config, EthApiBuild::build);
 
     // Add a custom rpc namespace
     let custom_rpc = MyRpcExt { provider };

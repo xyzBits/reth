@@ -2,20 +2,20 @@ use crate::{
     providers::{state::macros::delegate_provider_impls, StaticFileProvider},
     AccountReader, BlockHashReader, ProviderError, StateProvider, StateRootProvider,
 };
-use reth_db::{
+use reth_db::{tables, BlockNumberList};
+use reth_db_api::{
     cursor::{DbCursorRO, DbDupCursorRO},
     models::{storage_sharded_key::StorageShardedKey, ShardedKey},
     table::Table,
-    tables,
     transaction::DbTx,
-    BlockNumberList,
 };
-use reth_interfaces::provider::ProviderResult;
 use reth_primitives::{
-    constants::EPOCH_SLOTS, trie::AccountProof, Account, Address, BlockNumber, Bytecode,
-    StaticFileSegment, StorageKey, StorageValue, B256,
+    constants::EPOCH_SLOTS, Account, Address, BlockNumber, Bytecode, StaticFileSegment, StorageKey,
+    StorageValue, B256,
 };
-use reth_trie::{updates::TrieUpdates, HashedPostState};
+use reth_storage_api::StateProofProvider;
+use reth_storage_errors::provider::ProviderResult;
+use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState};
 use revm::db::BundleState;
 use std::fmt::Debug;
 
@@ -25,11 +25,11 @@ use std::fmt::Debug;
 /// It means that all changes made in the provided block number are not included.
 ///
 /// Historical state provider reads the following tables:
-/// - [tables::AccountsHistory]
-/// - [tables::Bytecodes]
-/// - [tables::StoragesHistory]
-/// - [tables::AccountChangeSets]
-/// - [tables::StorageChangeSets]
+/// - [`tables::AccountsHistory`]
+/// - [`tables::Bytecodes`]
+/// - [`tables::StoragesHistory`]
+/// - [`tables::AccountChangeSets`]
+/// - [`tables::StorageChangeSets`]
 #[derive(Debug)]
 pub struct HistoricalStateProviderRef<'b, TX: DbTx> {
     /// Transaction
@@ -51,7 +51,7 @@ pub enum HistoryInfo {
 }
 
 impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
-    /// Create new StateProvider for historical block number
+    /// Create new `StateProvider` for historical block number
     pub fn new(
         tx: &'b TX,
         block_number: BlockNumber,
@@ -60,9 +60,9 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
         Self { tx, block_number, lowest_available_blocks: Default::default(), static_file_provider }
     }
 
-    /// Create new StateProvider for historical block number and lowest block numbers at which
+    /// Create new `StateProvider` for historical block number and lowest block numbers at which
     /// account & storage histories are available.
-    pub fn new_with_lowest_available_blocks(
+    pub const fn new_with_lowest_available_blocks(
         tx: &'b TX,
         block_number: BlockNumber,
         lowest_available_blocks: LowestAvailableBlocks,
@@ -71,7 +71,7 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
         Self { tx, block_number, lowest_available_blocks, static_file_provider }
     }
 
-    /// Lookup an account in the AccountsHistory table
+    /// Lookup an account in the `AccountsHistory` table
     pub fn account_history_lookup(&self, address: Address) -> ProviderResult<HistoryInfo> {
         if !self.lowest_available_blocks.is_account_history_available(self.block_number) {
             return Err(ProviderError::StateAtBlockPruned(self.block_number))
@@ -86,7 +86,7 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
         )
     }
 
-    /// Lookup a storage key in the StoragesHistory table
+    /// Lookup a storage key in the `StoragesHistory` table
     pub fn storage_history_lookup(
         &self,
         address: Address,
@@ -272,6 +272,22 @@ impl<'b, TX: DbTx> StateRootProvider for HistoricalStateProviderRef<'b, TX> {
     }
 }
 
+impl<'b, TX: DbTx> StateProofProvider for HistoricalStateProviderRef<'b, TX> {
+    /// Get account and storage proofs.
+    fn proof(
+        &self,
+        state: &BundleState,
+        address: Address,
+        slots: &[B256],
+    ) -> ProviderResult<AccountProof> {
+        let mut revert_state = self.revert_state()?;
+        revert_state.extend(HashedPostState::from_bundle_state(&state.state));
+        revert_state
+            .account_proof(self.tx, address, slots)
+            .map_err(|err| ProviderError::Database(err.into()))
+    }
+}
+
 impl<'b, TX: DbTx> StateProvider for HistoricalStateProviderRef<'b, TX> {
     /// Get storage.
     fn storage(
@@ -307,15 +323,10 @@ impl<'b, TX: DbTx> StateProvider for HistoricalStateProviderRef<'b, TX> {
     fn bytecode_by_hash(&self, code_hash: B256) -> ProviderResult<Option<Bytecode>> {
         self.tx.get::<tables::Bytecodes>(code_hash).map_err(Into::into)
     }
-
-    /// Get account and storage proofs.
-    fn proof(&self, _address: Address, _keys: &[B256]) -> ProviderResult<AccountProof> {
-        Err(ProviderError::StateRootNotAvailableForHistoricalBlock)
-    }
 }
 
 /// State provider for a given block number.
-/// For more detailed description, see [HistoricalStateProviderRef].
+/// For more detailed description, see [`HistoricalStateProviderRef`].
 #[derive(Debug)]
 pub struct HistoricalStateProvider<TX: DbTx> {
     /// Database transaction
@@ -329,7 +340,7 @@ pub struct HistoricalStateProvider<TX: DbTx> {
 }
 
 impl<TX: DbTx> HistoricalStateProvider<TX> {
-    /// Create new StateProvider for historical block number
+    /// Create new `StateProvider` for historical block number
     pub fn new(
         tx: TX,
         block_number: BlockNumber,
@@ -339,7 +350,7 @@ impl<TX: DbTx> HistoricalStateProvider<TX> {
     }
 
     /// Set the lowest block number at which the account history is available.
-    pub fn with_lowest_available_account_history_block_number(
+    pub const fn with_lowest_available_account_history_block_number(
         mut self,
         block_number: BlockNumber,
     ) -> Self {
@@ -348,7 +359,7 @@ impl<TX: DbTx> HistoricalStateProvider<TX> {
     }
 
     /// Set the lowest block number at which the storage history is available.
-    pub fn with_lowest_available_storage_history_block_number(
+    pub const fn with_lowest_available_storage_history_block_number(
         mut self,
         block_number: BlockNumber,
     ) -> Self {
@@ -376,12 +387,12 @@ delegate_provider_impls!(HistoricalStateProvider<TX> where [TX: DbTx]);
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LowestAvailableBlocks {
     /// Lowest block number at which the account history is available. It may not be available if
-    /// [reth_primitives::PruneSegment::AccountHistory] was pruned.
-    /// [Option::None] means all history is available.
+    /// [`reth_prune_types::PruneSegment::AccountHistory`] was pruned.
+    /// [`Option::None`] means all history is available.
     pub account_history_block_number: Option<BlockNumber>,
     /// Lowest block number at which the storage history is available. It may not be available if
-    /// [reth_primitives::PruneSegment::StorageHistory] was pruned.
-    /// [Option::None] means all history is available.
+    /// [`reth_prune_types::PruneSegment::StorageHistory`] was pruned.
+    /// [`Option::None`] means all history is available.
     pub storage_history_block_number: Option<BlockNumber>,
 }
 
@@ -407,22 +418,21 @@ mod tests {
         AccountReader, HistoricalStateProvider, HistoricalStateProviderRef, StateProvider,
         StaticFileProviderFactory,
     };
-    use reth_db::{
+    use reth_db::{tables, BlockNumberList};
+    use reth_db_api::{
         models::{storage_sharded_key::StorageShardedKey, AccountBeforeTx, ShardedKey},
-        tables,
         transaction::{DbTx, DbTxMut},
-        BlockNumberList,
     };
-    use reth_interfaces::provider::ProviderError;
     use reth_primitives::{address, b256, Account, Address, StorageEntry, B256, U256};
+    use reth_storage_errors::provider::ProviderError;
 
     const ADDRESS: Address = address!("0000000000000000000000000000000000000001");
     const HIGHER_ADDRESS: Address = address!("0000000000000000000000000000000000000005");
     const STORAGE: B256 = b256!("0000000000000000000000000000000000000000000000000000000000000001");
 
-    fn assert_state_provider<T: StateProvider>() {}
+    const fn assert_state_provider<T: StateProvider>() {}
     #[allow(dead_code)]
-    fn assert_historical_state_provider<T: DbTx>() {
+    const fn assert_historical_state_provider<T: DbTx>() {
         assert_state_provider::<HistoricalStateProvider<T>>();
     }
 

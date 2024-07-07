@@ -1,27 +1,24 @@
 //! Builder support for rpc components.
 
-use futures::TryFutureExt;
-use reth_network::NetworkHandle;
-use reth_node_api::FullNodeComponents;
-use reth_node_core::{
-    cli::config::RethRpcConfig,
-    node_config::NodeConfig,
-    rpc::{
-        api::EngineApiServer,
-        builder::{
-            auth::{AuthRpcModule, AuthServerHandle},
-            RethModuleRegistry, RpcModuleBuilder, RpcServerHandle, TransportRpcModules,
-        },
-    },
-};
-use reth_payload_builder::PayloadBuilderHandle;
-use reth_rpc_layer::JwtSecret;
-use reth_tasks::TaskExecutor;
-use reth_tracing::tracing::{debug, info};
 use std::{
     fmt,
     ops::{Deref, DerefMut},
 };
+
+use futures::TryFutureExt;
+use reth_network::NetworkHandle;
+use reth_node_api::FullNodeComponents;
+use reth_node_core::{node_config::NodeConfig, rpc::api::EngineApiServer};
+use reth_payload_builder::PayloadBuilderHandle;
+use reth_rpc::eth::EthApi;
+use reth_rpc_builder::{
+    auth::{AuthRpcModule, AuthServerHandle},
+    config::RethRpcServerConfig,
+    EthApiBuild, RpcModuleBuilder, RpcRegistryInner, RpcServerHandle, TransportRpcModules,
+};
+use reth_rpc_layer::JwtSecret;
+use reth_tasks::TaskExecutor;
+use reth_tracing::tracing::{debug, info};
 
 /// Contains the handles to the spawned RPC servers.
 ///
@@ -41,7 +38,7 @@ pub(crate) struct RpcHooks<Node: FullNodeComponents> {
 }
 
 impl<Node: FullNodeComponents> RpcHooks<Node> {
-    /// Creates a new, empty [RpcHooks] instance for the given node type.
+    /// Creates a new, empty [`RpcHooks`] instance for the given node type.
     pub(crate) fn new() -> Self {
         Self { on_rpc_started: Box::<()>::default(), extend_rpc_modules: Box::<()>::default() }
     }
@@ -150,27 +147,28 @@ impl<Node: FullNodeComponents> ExtendRpcModules<Node> for () {
     }
 }
 
-/// Helper wrapper type to encapsulate the [RethModuleRegistry] over components trait.
+/// Helper wrapper type to encapsulate the [`RpcRegistryInner`] over components trait.
 #[derive(Debug)]
+#[allow(clippy::type_complexity)]
 pub struct RpcRegistry<Node: FullNodeComponents> {
-    pub(crate) registry: RethModuleRegistry<
+    pub(crate) registry: RpcRegistryInner<
         Node::Provider,
         Node::Pool,
         NetworkHandle,
         TaskExecutor,
         Node::Provider,
-        Node::Evm,
+        EthApi<Node::Provider, Node::Pool, NetworkHandle, Node::Evm>,
     >,
 }
 
 impl<Node: FullNodeComponents> Deref for RpcRegistry<Node> {
-    type Target = RethModuleRegistry<
+    type Target = RpcRegistryInner<
         Node::Provider,
         Node::Pool,
         NetworkHandle,
         TaskExecutor,
         Node::Provider,
-        Node::Evm,
+        EthApi<Node::Provider, Node::Pool, NetworkHandle, Node::Evm>,
     >;
 
     fn deref(&self) -> &Self::Target {
@@ -190,11 +188,13 @@ impl<Node: FullNodeComponents> Clone for RpcRegistry<Node> {
     }
 }
 
-/// Helper container to encapsulate [RethModuleRegistry], [TransportRpcModules] and [AuthRpcModule].
+/// Helper container to encapsulate [`RpcRegistryInner`], [`TransportRpcModules`] and
+/// [`AuthRpcModule`].
 ///
 /// This can be used to access installed modules, or create commonly used handlers like
-/// [reth_rpc::EthApi], and ultimately merge additional rpc handler into the configured transport
-/// modules [TransportRpcModules] as well as configured authenticated methods [AuthRpcModule].
+/// [`reth_rpc::eth::EthApi`], and ultimately merge additional rpc handler into the configured
+/// transport modules [`TransportRpcModules`] as well as configured authenticated methods
+/// [`AuthRpcModule`].
 #[allow(missing_debug_implementations)]
 pub struct RpcContext<'a, Node: FullNodeComponents> {
     /// The node components.
@@ -205,12 +205,12 @@ pub struct RpcContext<'a, Node: FullNodeComponents> {
 
     /// A Helper type the holds instances of the configured modules.
     ///
-    /// This provides easy access to rpc handlers, such as [RethModuleRegistry::eth_api].
+    /// This provides easy access to rpc handlers, such as [`RpcRegistryInner::eth_api`].
     pub registry: &'a mut RpcRegistry<Node>,
     /// Holds installed modules per transport type.
     ///
     /// This can be used to merge additional modules into the configured transports (http, ipc,
-    /// ws). See [TransportRpcModules::merge_configured]
+    /// ws). See [`TransportRpcModules::merge_configured`]
     pub modules: &'a mut TransportRpcModules,
     /// Holds jwt authenticated rpc module.
     ///
@@ -220,12 +220,12 @@ pub struct RpcContext<'a, Node: FullNodeComponents> {
 
 impl<'a, Node: FullNodeComponents> RpcContext<'a, Node> {
     /// Returns the config of the node.
-    pub fn config(&self) -> &NodeConfig {
+    pub const fn config(&self) -> &NodeConfig {
         self.config
     }
 
     /// Returns a reference to the configured node.
-    pub fn node(&self) -> &Node {
+    pub const fn node(&self) -> &Node {
         &self.node
     }
 
@@ -275,7 +275,7 @@ where
         .with_events(node.provider().clone())
         .with_executor(node.task_executor().clone())
         .with_evm_config(node.evm_config().clone())
-        .build_with_auth_server(module_config, engine_api);
+        .build_with_auth_server(module_config, engine_api, EthApiBuild::build);
 
     let mut registry = RpcRegistry { registry };
     let ctx = RpcContext {
@@ -290,8 +290,8 @@ where
 
     let server_config = config.rpc.rpc_server_config();
     let launch_rpc = modules.clone().start_server(server_config).map_ok(|handle| {
-        if let Some(url) = handle.ipc_endpoint() {
-            info!(target: "reth::cli", url=%url, "RPC IPC server started");
+        if let Some(path) = handle.ipc_endpoint() {
+            info!(target: "reth::cli", %path, "RPC IPC server started");
         }
         if let Some(addr) = handle.http_local_addr() {
             info!(target: "reth::cli", url=%addr, "RPC HTTP server started");

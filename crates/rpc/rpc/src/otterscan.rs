@@ -1,20 +1,19 @@
 use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
-use revm_inspectors::transfer::{TransferInspector, TransferKind};
-use revm_primitives::ExecutionResult;
-
 use reth_primitives::{Address, BlockId, BlockNumberOrTag, TxHash, B256};
 use reth_rpc_api::{EthApiServer, OtterscanServer};
+use reth_rpc_eth_api::helpers::TraceExt;
+use reth_rpc_server_types::result::internal_rpc_err;
 use reth_rpc_types::{
     trace::otterscan::{
         BlockDetails, ContractCreator, InternalOperation, OperationType, OtsBlockTransactions,
         OtsReceipt, OtsTransactionReceipt, TraceEntry, TransactionsWithReceipts,
     },
-    BlockTransactions, Transaction,
+    BlockTransactions, Header, Transaction,
 };
-
-use crate::{eth::EthTransactions, result::internal_rpc_err};
+use revm_inspectors::transfer::{TransferInspector, TransferKind};
+use revm_primitives::ExecutionResult;
 
 const API_LEVEL: u64 = 8;
 
@@ -26,7 +25,7 @@ pub struct OtterscanApi<Eth> {
 
 impl<Eth> OtterscanApi<Eth> {
     /// Creates a new instance of `Otterscan`.
-    pub fn new(eth: Eth) -> Self {
+    pub const fn new(eth: Eth) -> Self {
         Self { eth }
     }
 }
@@ -34,8 +33,13 @@ impl<Eth> OtterscanApi<Eth> {
 #[async_trait]
 impl<Eth> OtterscanServer for OtterscanApi<Eth>
 where
-    Eth: EthApiServer + EthTransactions,
+    Eth: EthApiServer + TraceExt + 'static,
 {
+    /// Handler for `{ots,erigon}_getHeaderByNumber`
+    async fn get_header_by_number(&self, block_number: u64) -> RpcResult<Option<Header>> {
+        self.eth.header_by_number(BlockNumberOrTag::Number(block_number)).await
+    }
+
     /// Handler for `ots_hasCode`
     async fn has_code(&self, address: Address, block_number: Option<BlockId>) -> RpcResult<bool> {
         self.eth.get_code(address, block_number).await.map(|code| !code.is_empty())
@@ -95,11 +99,8 @@ where
     }
 
     /// Handler for `ots_getBlockDetails`
-    async fn get_block_details(
-        &self,
-        block_number: BlockNumberOrTag,
-    ) -> RpcResult<Option<BlockDetails>> {
-        let block = self.eth.block_by_number(block_number, true).await?;
+    async fn get_block_details(&self, block_number: u64) -> RpcResult<Option<BlockDetails>> {
+        let block = self.eth.block_by_number(BlockNumberOrTag::Number(block_number), true).await?;
         Ok(block.map(Into::into))
     }
 
@@ -112,11 +113,12 @@ where
     /// Handler for `getBlockTransactions`
     async fn get_block_transactions(
         &self,
-        block_number: BlockNumberOrTag,
+        block_number: u64,
         page_number: usize,
         page_size: usize,
     ) -> RpcResult<OtsBlockTransactions> {
         // retrieve full block and its receipts
+        let block_number = BlockNumberOrTag::Number(block_number);
         let block = self.eth.block_by_number(block_number, true);
         let receipts = self.eth.block_receipts(BlockId::Number(block_number));
         let (block, receipts) = futures::try_join!(block, receipts)?;
@@ -129,7 +131,7 @@ where
         if tx_len != receipts.len() {
             return Err(internal_rpc_err(
                 "the number of transactions does not match the number of receipts",
-            ));
+            ))
         }
 
         // make sure the block is full
@@ -158,7 +160,12 @@ where
             .drain(page_start..page_end)
             .map(|receipt| {
                 let receipt = receipt.inner.map_inner(|receipt| OtsReceipt {
-                    status: receipt.inner.receipt.status,
+                    status: receipt
+                        .inner
+                        .receipt
+                        .status
+                        .as_eip658()
+                        .expect("ETH API returned pre-EIP-658 status"),
                     cumulative_gas_used: receipt.inner.receipt.cumulative_gas_used as u64,
                     logs: None,
                     logs_bloom: None,
@@ -175,7 +182,7 @@ where
     async fn search_transactions_before(
         &self,
         _address: Address,
-        _block_number: BlockNumberOrTag,
+        _block_number: u64,
         _page_size: usize,
     ) -> RpcResult<TransactionsWithReceipts> {
         Err(internal_rpc_err("unimplemented"))
@@ -185,7 +192,7 @@ where
     async fn search_transactions_after(
         &self,
         _address: Address,
-        _block_number: BlockNumberOrTag,
+        _block_number: u64,
         _page_size: usize,
     ) -> RpcResult<TransactionsWithReceipts> {
         Err(internal_rpc_err("unimplemented"))
