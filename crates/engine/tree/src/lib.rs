@@ -26,7 +26,7 @@ pub mod download;
 pub mod engine;
 /// Metrics support.
 pub mod metrics;
-/// The background writer task for batch db writes.
+/// The background writer service, coordinating write operations on static files and the database.
 pub mod persistence;
 /// Support for interacting with the blockchain tree.
 pub mod tree;

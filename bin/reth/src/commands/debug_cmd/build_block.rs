@@ -37,6 +37,8 @@ use reth_transaction_pool::{
     blobstore::InMemoryBlobStore, BlobStore, EthPooledTransaction, PoolConfig, TransactionOrigin,
     TransactionPool, TransactionValidationTaskExecutor,
 };
+use reth_trie::StateRoot;
+use reth_trie_db::DatabaseStateRoot;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 use tracing::*;
 
@@ -248,7 +250,6 @@ impl Command {
 
         #[cfg(feature = "optimism")]
         let payload_builder = reth_node_optimism::OptimismPayloadBuilder::new(
-            provider_factory.chain_spec(),
             reth_node_optimism::OptimismEvmConfig::default(),
         )
         .compute_pending_block();
@@ -284,9 +285,10 @@ impl Command {
                 debug!(target: "reth::cli", ?execution_outcome, "Executed block");
 
                 let hashed_post_state = execution_outcome.hash_state_slow();
-                let (state_root, trie_updates) = execution_outcome
-                    .hash_state_slow()
-                    .state_root_with_updates(provider_factory.provider()?.tx_ref())?;
+                let (state_root, trie_updates) = StateRoot::overlay_root_with_updates(
+                    provider_factory.provider()?.tx_ref(),
+                    hashed_post_state.clone(),
+                )?;
 
                 if state_root != block_with_senders.state_root {
                     eyre::bail!(
@@ -301,7 +303,7 @@ impl Command {
                 provider_rw.append_blocks_with_state(
                     Vec::from([block_with_senders]),
                     execution_outcome,
-                    hashed_post_state,
+                    hashed_post_state.into_sorted(),
                     trie_updates,
                 )?;
                 info!(target: "reth::cli", "Successfully appended built block");

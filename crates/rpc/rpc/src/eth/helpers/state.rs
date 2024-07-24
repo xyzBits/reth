@@ -1,6 +1,6 @@
 //! Contains RPC handler implementations specific to state.
 
-use reth_provider::StateProviderFactory;
+use reth_provider::{ChainSpecProvider, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 
 use reth_rpc_eth_api::helpers::{EthState, LoadState, SpawnBlocking};
@@ -19,11 +19,11 @@ where
 
 impl<Provider, Pool, Network, EvmConfig> LoadState for EthApi<Provider, Pool, Network, EvmConfig>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + ChainSpecProvider,
     Pool: TransactionPool,
 {
     #[inline]
-    fn provider(&self) -> impl StateProviderFactory {
+    fn provider(&self) -> impl StateProviderFactory + ChainSpecProvider {
         self.inner.provider()
     }
 
@@ -40,8 +40,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
+    use super::*;
     use reth_evm_ethereum::EthEvmConfig;
     use reth_primitives::{
         constants::ETHEREUM_BLOCK_GAS_LIMIT, Address, StorageKey, StorageValue, U256,
@@ -51,11 +50,10 @@ mod tests {
     use reth_rpc_eth_types::{
         EthStateCache, FeeHistoryCache, FeeHistoryCacheConfig, GasPriceOracle,
     };
-    use reth_rpc_server_types::constants::DEFAULT_ETH_PROOF_WINDOW;
+    use reth_rpc_server_types::constants::{DEFAULT_ETH_PROOF_WINDOW, DEFAULT_PROOF_PERMITS};
     use reth_tasks::pool::BlockingTaskPool;
     use reth_transaction_pool::test_utils::testing_pool;
-
-    use super::*;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_storage() {
@@ -76,6 +74,7 @@ mod tests {
             FeeHistoryCache::new(cache, FeeHistoryCacheConfig::default()),
             evm_config,
             None,
+            DEFAULT_PROOF_PERMITS,
         );
         let address = Address::random();
         let storage = eth_api.storage_at(address, U256::ZERO.into(), None).await.unwrap();
@@ -102,6 +101,7 @@ mod tests {
             FeeHistoryCache::new(cache, FeeHistoryCacheConfig::default()),
             evm_config,
             None,
+            DEFAULT_PROOF_PERMITS,
         );
 
         let storage_key: U256 = storage_key.into();

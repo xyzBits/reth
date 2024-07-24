@@ -14,7 +14,6 @@ use reth_rpc_api::TraceApiServer;
 use reth_rpc_eth_api::helpers::{Call, TraceExt};
 use reth_rpc_eth_types::{
     error::{EthApiError, EthResult},
-    revm_utils::prepare_call_env,
     utils::recover_raw_transaction,
 };
 use reth_rpc_types::{
@@ -158,7 +157,7 @@ where
                 let mut calls = calls.into_iter().peekable();
 
                 while let Some((call, trace_types)) = calls.next() {
-                    let env = prepare_call_env(
+                    let env = this.eth_api().prepare_call_env(
                         cfg.clone(),
                         block_env.clone(),
                         call,
@@ -252,7 +251,7 @@ where
         filter: TraceFilter,
     ) -> EthResult<Vec<LocalizedTransactionTrace>> {
         let matcher = filter.matcher();
-        let TraceFilter { from_block, to_block, .. } = filter;
+        let TraceFilter { from_block, to_block, after, count, .. } = filter;
         let start = from_block.unwrap_or(0);
         let end = if let Some(to_block) = to_block {
             to_block
@@ -341,6 +340,20 @@ where
                 break
             }
         }
+
+        // apply after and count to traces if specified, this allows for a pagination style.
+        // only consider traces after
+        if let Some(after) = after.map(|a| a as usize).filter(|a| *a < all_traces.len()) {
+            all_traces = all_traces.split_off(after);
+        }
+
+        // at most, return count of traces
+        if let Some(count) = count {
+            let count = count as usize;
+            if count < all_traces.len() {
+                all_traces.truncate(count);
+            }
+        };
 
         Ok(all_traces)
     }

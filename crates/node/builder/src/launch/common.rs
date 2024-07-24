@@ -329,7 +329,7 @@ impl<R> LaunchContextWith<Attached<WithConfigs, R>> {
     /// Returns an initialized [`PrunerBuilder`] based on the configured [`PruneConfig`]
     pub fn pruner_builder(&self) -> PrunerBuilder {
         PrunerBuilder::new(self.prune_config().unwrap_or_default())
-            .prune_delete_limit(self.chain_spec().prune_delete_limit)
+            .delete_limit(self.chain_spec().prune_delete_limit)
             .timeout(PrunerBuilder::DEFAULT_TIMEOUT)
     }
 
@@ -370,8 +370,6 @@ where
 
         let has_receipt_pruning =
             self.toml_config().prune.as_ref().map_or(false, |a| a.has_receipts_pruning());
-
-        info!(target: "reth::cli", "Verifying storage consistency.");
 
         // Check for consistency between database and static files. If it fails, it unwinds to
         // the first block that's consistent between database and static files.
@@ -454,8 +452,10 @@ where
         self.right().static_file_provider()
     }
 
+    /// This launches the prometheus endpoint.
+    ///
     /// Convenience function to [`Self::start_prometheus_endpoint`]
-    pub async fn with_prometheus(self) -> eyre::Result<Self> {
+    pub async fn with_prometheus_server(self) -> eyre::Result<Self> {
         self.start_prometheus_endpoint().await?;
         Ok(self)
     }
@@ -486,7 +486,12 @@ where
 
     /// Creates a new `WithMeteredProvider` container and attaches it to the
     /// launch context.
-    pub fn with_metrics(self) -> LaunchContextWith<Attached<WithConfigs, WithMeteredProvider<DB>>> {
+    ///
+    /// This spawns a metrics task that listens for metrics related events and updates metrics for
+    /// prometheus.
+    pub fn with_metrics_task(
+        self,
+    ) -> LaunchContextWith<Attached<WithConfigs, WithMeteredProvider<DB>>> {
         let (metrics_sender, metrics_receiver) = unbounded_channel();
 
         let with_metrics =

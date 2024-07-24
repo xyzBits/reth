@@ -2,8 +2,7 @@
 
 use crate::metrics::version_metrics::VersionInfo;
 use eyre::WrapErr;
-use futures::{future::FusedFuture, FutureExt};
-use http::Response;
+use http::{header::CONTENT_TYPE, HeaderValue, Response};
 use metrics::describe_gauge;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use metrics_util::layers::{PrefixLayer, Stack};
@@ -65,14 +64,18 @@ async fn start_endpoint<F: Hook + 'static>(
     let listener =
         tokio::net::TcpListener::bind(listen_addr).await.wrap_err("Could not bind to address")?;
 
-    task_executor.spawn_with_graceful_shutdown_signal(|signal| async move {
-        let mut shutdown = signal.ignore_guard().fuse();
+    task_executor.spawn_with_graceful_shutdown_signal(|mut signal| async move {
         loop {
-            let io = match listener.accept().await {
-                Ok((stream, _remote_addr)) => stream,
-                Err(err) => {
-                    tracing::error!(%err, "failed to accept connection");
-                    continue;
+            let io = tokio::select! {
+                _ = &mut signal => break,
+                io = listener.accept() => {
+                    match io {
+                        Ok((stream, _remote_addr)) => stream,
+                        Err(err) => {
+                            tracing::error!(%err, "failed to accept connection");
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -81,18 +84,20 @@ async fn start_endpoint<F: Hook + 'static>(
             let service = tower::service_fn(move |_| {
                 (hook)();
                 let metrics = handle.render();
-                async move { Ok::<_, Infallible>(Response::new(metrics)) }
+                let mut response = Response::new(metrics);
+                response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                async move { Ok::<_, Infallible>(response) }
             });
 
-            if let Err(error) =
-                jsonrpsee::server::serve_with_graceful_shutdown(io, service, &mut shutdown).await
-            {
-                tracing::debug!(%error, "failed to serve request")
-            }
-
-            if shutdown.is_terminated() {
-                break;
-            }
+            let mut shutdown = signal.clone().ignore_guard();
+            tokio::task::spawn(async move {
+                if let Err(error) =
+                    jsonrpsee::server::serve_with_graceful_shutdown(io, service, &mut shutdown)
+                        .await
+                {
+                    tracing::debug!(%error, "failed to serve request")
+                }
+            });
         }
     });
 

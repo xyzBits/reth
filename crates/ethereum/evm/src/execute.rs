@@ -4,6 +4,7 @@ use crate::{
     dao_fork::{DAO_HARDFORK_BENEFICIARY, DAO_HARDKFORK_ACCOUNTS},
     EthEvmConfig,
 };
+use core::fmt::Display;
 use reth_chainspec::{ChainSpec, EthereumHardforks, MAINNET};
 use reth_ethereum_consensus::validate_block_post_execution;
 use reth_evm::{
@@ -11,7 +12,10 @@ use reth_evm::{
         BatchExecutor, BlockExecutionError, BlockExecutionInput, BlockExecutionOutput,
         BlockExecutorProvider, BlockValidationError, Executor, ProviderError,
     },
-    system_calls::{apply_beacon_root_contract_call, apply_withdrawal_requests_contract_call},
+    system_calls::{
+        apply_beacon_root_contract_call, apply_consolidation_requests_contract_call,
+        apply_withdrawal_requests_contract_call,
+    },
     ConfigureEvm,
 };
 use reth_execution_types::ExecutionOutcome;
@@ -30,8 +34,11 @@ use revm_primitives::{
     BlockEnv, CfgEnvWithHandlerCfg, EVMError, EnvWithHandlerCfg, ResultAndState,
 };
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "std")]
-use std::{fmt::Display, sync::Arc, vec, vec::Vec};
+use std::sync::Arc;
+
 /// Provides executors to execute regular ethereum blocks
 #[derive(Debug, Clone)]
 pub struct EthExecutorProvider<EvmConfig = EthEvmConfig> {
@@ -142,7 +149,7 @@ where
     ) -> Result<EthExecuteOutput, BlockExecutionError>
     where
         DB: Database,
-        DB::Error: Into<ProviderError> + std::fmt::Display,
+        DB::Error: Into<ProviderError> + Display,
     {
         // apply pre execution changes
         apply_beacon_root_contract_call(
@@ -223,7 +230,11 @@ where
             let withdrawal_requests =
                 apply_withdrawal_requests_contract_call(&self.evm_config, &mut evm)?;
 
-            [deposit_requests, withdrawal_requests].concat()
+            // Collect all EIP-7251 requests
+            let consolidation_requests =
+                apply_consolidation_requests_contract_call(&self.evm_config, &mut evm)?;
+
+            [deposit_requests, withdrawal_requests, consolidation_requests].concat()
         } else {
             vec![]
         };
@@ -356,7 +367,7 @@ where
 impl<EvmConfig, DB> Executor<DB> for EthBlockExecutor<EvmConfig, DB>
 where
     EvmConfig: ConfigureEvm,
-    DB: Database<Error: Into<ProviderError> + std::fmt::Display>,
+    DB: Database<Error: Into<ProviderError> + Display>,
 {
     type Input<'a> = BlockExecutionInput<'a, BlockWithSenders>;
     type Output = BlockExecutionOutput<Receipt>;

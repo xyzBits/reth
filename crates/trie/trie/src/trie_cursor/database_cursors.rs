@@ -30,7 +30,7 @@ impl<'a, TX: DbTx> TrieCursorFactory for &'a TX {
 
 /// A cursor over the account trie.
 #[derive(Debug)]
-pub struct DatabaseAccountTrieCursor<C>(C);
+pub struct DatabaseAccountTrieCursor<C>(pub(crate) C);
 
 impl<C> DatabaseAccountTrieCursor<C> {
     /// Create a new account trie cursor.
@@ -48,7 +48,7 @@ where
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        Ok(self.0.seek_exact(StoredNibbles(key))?.map(|value| (value.0 .0, value.1 .0)))
+        Ok(self.0.seek_exact(StoredNibbles(key))?.map(|value| (value.0 .0, value.1)))
     }
 
     /// Seeks a key in the account trie that matches or is greater than the provided key.
@@ -56,7 +56,12 @@ where
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        Ok(self.0.seek(StoredNibbles(key))?.map(|value| (value.0 .0, value.1 .0)))
+        Ok(self.0.seek(StoredNibbles(key))?.map(|value| (value.0 .0, value.1)))
+    }
+
+    /// Move the cursor to the next entry and return it.
+    fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        Ok(self.0.next()?.map(|value| (value.0 .0, value.1)))
     }
 
     /// Retrieves the current key in the cursor.
@@ -83,7 +88,7 @@ impl<C> DatabaseStorageTrieCursor<C> {
 
 impl<C> TrieCursor for DatabaseStorageTrieCursor<C>
 where
-    C: DbDupCursorRO<tables::StoragesTrie> + DbCursorRO<tables::StoragesTrie> + Send + Sync,
+    C: DbCursorRO<tables::StoragesTrie> + DbDupCursorRO<tables::StoragesTrie> + Send + Sync,
 {
     /// Seeks an exact match for the given key in the storage trie.
     fn seek_exact(
@@ -108,6 +113,11 @@ where
             .map(|value| (value.nibbles.0, value.node)))
     }
 
+    /// Move the cursor to the next entry and return it.
+    fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        Ok(self.cursor.next_dup()?.map(|(_, v)| (v.nibbles.0, v.node)))
+    }
+
     /// Retrieves the current value in the storage trie cursor.
     fn current(&mut self) -> Result<Option<Nibbles>, DatabaseError> {
         Ok(self.cursor.current()?.map(|(_, v)| v.nibbles.0))
@@ -117,7 +127,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{StorageTrieEntry, StoredBranchNode};
+    use crate::StorageTrieEntry;
     use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
     use reth_primitives::hex_literal::hex;
     use reth_provider::test_utils::create_test_provider_factory;
@@ -139,13 +149,13 @@ mod tests {
             cursor
                 .upsert(
                     key.into(),
-                    StoredBranchNode(BranchNodeCompact::new(
+                    BranchNodeCompact::new(
                         0b0000_0010_0000_0001,
                         0b0000_0010_0000_0001,
                         0,
                         Vec::default(),
                         None,
-                    )),
+                    ),
                 )
                 .unwrap();
         }

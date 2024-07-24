@@ -23,7 +23,8 @@ pub struct InvalidHeaderCache {
 }
 
 impl InvalidHeaderCache {
-    pub(crate) fn new(max_length: u32) -> Self {
+    /// Invalid header cache constructor.
+    pub fn new(max_length: u32) -> Self {
         Self { headers: LruMap::new(ByLength::new(max_length)), metrics: Default::default() }
     }
 
@@ -66,7 +67,7 @@ impl InvalidHeaderCache {
     }
 
     /// Inserts an invalid ancestor into the map.
-    pub(crate) fn insert(&mut self, invalid_ancestor: SealedHeader) {
+    pub fn insert(&mut self, invalid_ancestor: SealedHeader) {
         if self.get(&invalid_ancestor.hash()).is_none() {
             let hash = invalid_ancestor.hash();
             let header = invalid_ancestor.unseal();

@@ -1,6 +1,6 @@
 use crate::{
-    walker::TrieWalker, BranchNodeCompact, HashBuilder, Nibbles, StorageTrieEntry,
-    StoredBranchNode, StoredNibbles, StoredNibblesSubKey,
+    walker::TrieWalker, BranchNodeCompact, HashBuilder, Nibbles, StorageTrieEntry, StoredNibbles,
+    StoredNibblesSubKey,
 };
 use reth_db::tables;
 use reth_db_api::{
@@ -119,7 +119,7 @@ impl TrieUpdates {
                 Some(node) => {
                     if !nibbles.0.is_empty() {
                         num_entries += 1;
-                        account_trie_cursor.upsert(nibbles, StoredBranchNode(node))?;
+                        account_trie_cursor.upsert(nibbles, node)?;
                     }
                 }
                 None => {
@@ -154,6 +154,14 @@ pub struct StorageTrieUpdates {
     pub(crate) storage_nodes: HashMap<Nibbles, BranchNodeCompact>,
     /// Collection of removed storage trie nodes.
     pub(crate) removed_nodes: HashSet<Nibbles>,
+}
+
+#[cfg(feature = "test-utils")]
+impl StorageTrieUpdates {
+    /// Creates a new storage trie updates that are not marked as deleted.
+    pub fn new(updates: HashMap<Nibbles, BranchNodeCompact>) -> Self {
+        Self { storage_nodes: updates, ..Default::default() }
+    }
 }
 
 impl StorageTrieUpdates {

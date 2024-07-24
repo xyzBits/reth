@@ -34,8 +34,6 @@ pub enum BackfillAction {
 /// The events that can be emitted on backfill sync.
 #[derive(Debug)]
 pub enum BackfillEvent {
-    /// Backfill sync idle.
-    Idle,
     /// Backfill sync started.
     Started(PipelineTarget),
     /// Backfill sync finished.
@@ -168,7 +166,7 @@ where
         }
 
         // make sure we poll the pipeline if it's active, and return any ready pipeline events
-        if !self.is_pipeline_idle() {
+        if self.is_pipeline_active() {
             // advance the pipeline
             if let Poll::Ready(event) = self.poll_pipeline(cx) {
                 return Poll::Ready(event)
@@ -212,7 +210,7 @@ mod tests {
     use reth_chainspec::{ChainSpecBuilder, MAINNET};
     use reth_db::{mdbx::DatabaseEnv, test_utils::TempDatabase};
     use reth_network_p2p::test_utils::TestFullBlockClient;
-    use reth_primitives::{constants::ETHEREUM_BLOCK_GAS_LIMIT, BlockNumber, Header, B256};
+    use reth_primitives::{BlockNumber, Header, B256};
     use reth_stages::ExecOutput;
     use reth_stages_api::StageCheckpoint;
     use reth_tasks::TokioTaskExecutor;
@@ -239,13 +237,13 @@ mod tests {
                     checkpoint: StageCheckpoint::new(BlockNumber::from(pipeline_done_after)),
                     done: true,
                 })]))
-                .build(chain_spec);
+                .build(chain_spec.clone());
 
             let pipeline_sync = PipelineSync::new(pipeline, Box::<TokioTaskExecutor>::default());
             let client = TestFullBlockClient::default();
             let header = Header {
                 base_fee_per_gas: Some(7),
-                gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
+                gas_limit: chain_spec.max_gas_limit,
                 ..Default::default()
             }
             .seal_slow();

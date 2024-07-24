@@ -532,6 +532,18 @@ impl StaticFileProvider {
         provider: &DatabaseProvider<TX>,
         has_receipt_pruning: bool,
     ) -> ProviderResult<Option<PipelineTarget>> {
+        // OVM chain contains duplicate transactions, so is inconsistent by default since reth db
+        // not designed for duplicate transactions (see <https://github.com/paradigmxyz/reth/blob/v1.0.3/crates/optimism/primitives/src/bedrock_import.rs>). Undefined behaviour for queries
+        // to OVM chain is also in op-erigon.
+        if provider.chain_spec().is_optimism_mainnet() {
+            info!(target: "reth::cli",
+                "Skipping storage verification for OP mainnet, expected inconsistency in OVM chain"
+            );
+            return Ok(None);
+        }
+
+        info!(target: "reth::cli", "Verifying storage consistency.");
+
         let mut unwind_target: Option<BlockNumber> = None;
         let mut update_unwind_target = |new_target: BlockNumber| {
             if let Some(target) = unwind_target.as_mut() {
@@ -646,8 +658,13 @@ impl StaticFileProvider {
     /// * its highest block should match the stage checkpoint block number if it's equal or higher
     ///   than the corresponding database table last entry.
     ///   * If the checkpoint block is higher, then request a pipeline unwind to the static file
-    ///     block.
-    ///   * If the checkpoint block is lower, then heal by removing rows from the static file.
+    ///     block. This is expressed by returning [`Some`] with the requested pipeline unwind
+    ///     target.
+    ///   * If the checkpoint block is lower, then heal by removing rows from the static file. In
+    ///     this case, the rows will be removed and [`None`] will be returned.
+    ///
+    /// * If the database tables overlap with static files and have contiguous keys, or the
+    ///   checkpoint block matches the highest static files block, then [`None`] will be returned.
     fn ensure_invariants<TX: DbTx, T: Table<Key = u64>>(
         &self,
         provider: &DatabaseProvider<TX>,
@@ -736,11 +753,15 @@ impl StaticFileProvider {
     }
 
     /// Gets the highest static file block if it exists for a static file segment.
+    ///
+    /// If there is nothing on disk for the given segment, this will return [`None`].
     pub fn get_highest_static_file_block(&self, segment: StaticFileSegment) -> Option<BlockNumber> {
         self.static_files_max_block.read().get(&segment).copied()
     }
 
     /// Gets the highest static file transaction.
+    ///
+    /// If there is nothing on disk for the given segment, this will return [`None`].
     pub fn get_highest_static_file_tx(&self, segment: StaticFileSegment) -> Option<TxNumber> {
         self.static_files_tx_index
             .read()
