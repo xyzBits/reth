@@ -5,11 +5,8 @@ use std::{
     sync::Arc,
 };
 
-mod loader;
-pub use loader::PrefixSetLoader;
-
 /// Collection of mutable prefix sets.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct TriePrefixSetsMut {
     /// A set of account prefixes that have changed.
     pub account_prefix_set: PrefixSetMut,
@@ -21,6 +18,15 @@ pub struct TriePrefixSetsMut {
 }
 
 impl TriePrefixSetsMut {
+    /// Extends prefix sets with contents of another prefix set.
+    pub fn extend(&mut self, other: Self) {
+        self.account_prefix_set.extend(other.account_prefix_set.keys);
+        for (hashed_address, prefix_set) in other.storage_prefix_sets {
+            self.storage_prefix_sets.entry(hashed_address).or_default().extend(prefix_set.keys);
+        }
+        self.destroyed_accounts.extend(other.destroyed_accounts);
+    }
+
     /// Returns a `TriePrefixSets` with the same elements as these sets.
     ///
     /// If not yet sorted, the elements will be sorted and deduplicated.
@@ -75,7 +81,7 @@ pub struct TriePrefixSets {
 /// assert!(prefix_set.contains(&[0xa, 0xb]));
 /// assert!(prefix_set.contains(&[0xa, 0xb, 0xc]));
 /// ```
-#[derive(Debug, Default, Clone)]
+#[derive(Clone, Default, Debug)]
 pub struct PrefixSetMut {
     keys: Vec<Nibbles>,
     sorted: bool,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::TryFutureExt;
-use reth_network::NetworkHandle;
+use reth_chainspec::ChainSpec;
 use reth_node_api::{BuilderProvider, FullNodeComponents};
 use reth_node_core::{
     node_config::NodeConfig,
@@ -161,7 +161,7 @@ pub struct RpcRegistry<Node: FullNodeComponents, EthApi> {
     pub(crate) registry: RpcRegistryInner<
         Node::Provider,
         Node::Pool,
-        NetworkHandle,
+        Node::Network,
         TaskExecutor,
         Node::Provider,
         EthApi,
@@ -172,7 +172,7 @@ impl<Node: FullNodeComponents, EthApi> Deref for RpcRegistry<Node, EthApi> {
     type Target = RpcRegistryInner<
         Node::Provider,
         Node::Pool,
-        NetworkHandle,
+        Node::Network,
         TaskExecutor,
         Node::Provider,
         EthApi,
@@ -241,7 +241,7 @@ impl<'a, Node: FullNodeComponents, EthApi> RpcContext<'a, Node, EthApi> {
     }
 
     /// Returns the handle to the network
-    pub fn network(&self) -> &NetworkHandle {
+    pub fn network(&self) -> &Node::Network {
         self.node.network()
     }
 
@@ -261,7 +261,7 @@ pub async fn launch_rpc_servers<Node, Engine, EthApi>(
 ) -> eyre::Result<(RethRpcServerHandles, RpcRegistry<Node, EthApi>)>
 where
     EthApi: EthApiBuilderProvider<Node> + FullEthApiServer,
-    Node: FullNodeComponents + Clone,
+    Node: FullNodeComponents<ChainSpec = ChainSpec> + Clone,
     Engine: EngineApiServer<Node::Engine>,
 {
     let auth_config = config.rpc.auth_server_config(jwt_secret)?;

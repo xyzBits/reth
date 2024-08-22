@@ -7,8 +7,8 @@ use reth_db_api::{
 };
 use reth_primitives::{BlockNumber, GotExpected, SealedHeader, B256};
 use reth_provider::{
-    writer::StorageWriter, DatabaseProviderRW, HeaderProvider, ProviderError,
-    StageCheckpointReader, StageCheckpointWriter, StatsReader,
+    DatabaseProviderRW, HeaderProvider, ProviderError, StageCheckpointReader,
+    StageCheckpointWriter, StatsReader, TrieWriter,
 };
 use reth_stages_api::{
     BlockErrorKind, EntitiesCheckpoint, ExecInput, ExecOutput, MerkleCheckpoint, Stage,
@@ -218,8 +218,7 @@ impl<DB: Database> Stage<DB> for MerkleStage {
                 })?;
             match progress {
                 StateRootProgress::Progress(state, hashed_entries_walked, updates) => {
-                    let writer = StorageWriter::new(Some(provider), None);
-                    writer.write_trie_updates(&updates)?;
+                    provider.write_trie_updates(&updates)?;
 
                     let checkpoint = MerkleCheckpoint::new(
                         to_block,
@@ -239,8 +238,7 @@ impl<DB: Database> Stage<DB> for MerkleStage {
                     })
                 }
                 StateRootProgress::Complete(root, hashed_entries_walked, updates) => {
-                    let writer = StorageWriter::new(Some(provider), None);
-                    writer.write_trie_updates(&updates)?;
+                    provider.write_trie_updates(&updates)?;
 
                     entities_checkpoint.processed += hashed_entries_walked as u64;
 
@@ -255,8 +253,8 @@ impl<DB: Database> Stage<DB> for MerkleStage {
                         error!(target: "sync::stages::merkle", %e, ?current_block_number, ?to_block, "Incremental state root failed! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
                         StageError::Fatal(Box::new(e))
                     })?;
-            let writer = StorageWriter::new(Some(provider), None);
-            writer.write_trie_updates(&updates)?;
+
+            provider.write_trie_updates(&updates)?;
 
             let total_hashed_entries = (provider.count_entries::<tables::HashedAccounts>()? +
                 provider.count_entries::<tables::HashedStorages>()?)
@@ -329,8 +327,7 @@ impl<DB: Database> Stage<DB> for MerkleStage {
             validate_state_root(block_root, target.seal_slow(), input.unwind_to)?;
 
             // Validation passed, apply unwind changes to the database.
-            let writer = StorageWriter::new(Some(provider), None);
-            writer.write_trie_updates(&updates)?;
+            provider.write_trie_updates(&updates)?;
 
             // TODO(alexey): update entities checkpoint
         } else {
@@ -504,6 +501,7 @@ mod tests {
                     0..=stage_progress - 1,
                     B256::ZERO,
                     0..1,
+                    None,
                 ));
                 self.db.insert_blocks(preblocks.iter(), StorageKind::Static)?;
             }
@@ -523,6 +521,7 @@ mod tests {
                 preblocks.last().map(|b| b.hash()),
                 Some(0),
                 None,
+                None,
             );
             let mut header = header.unseal();
 
@@ -537,7 +536,7 @@ mod tests {
 
             let head_hash = sealed_head.hash();
             let mut blocks = vec![sealed_head];
-            blocks.extend(random_block_range(&mut rng, start..=end, head_hash, 0..3));
+            blocks.extend(random_block_range(&mut rng, start..=end, head_hash, 0..3, None));
             let last_block = blocks.last().cloned().unwrap();
             self.db.insert_blocks(blocks.iter(), StorageKind::Static)?;
 

@@ -1,5 +1,6 @@
 //! Loads and formats OP receipt RPC response.   
 
+use reth_node_api::FullNodeComponents;
 use reth_primitives::{Receipt, TransactionMeta, TransactionSigned};
 use reth_rpc_eth_api::{
     helpers::{EthApiSpec, LoadReceipt, LoadTransaction},
@@ -8,15 +9,17 @@ use reth_rpc_eth_api::{
 use reth_rpc_eth_types::{EthApiError, EthStateCache, ReceiptBuilder};
 use reth_rpc_types::{AnyTransactionReceipt, OptimismTransactionReceiptFields};
 
-use crate::{OpEthApi, OptimismTxMeta};
+use crate::{OpEthApi, OpEthApiError, OptimismTxMeta};
 
-impl<Eth> LoadReceipt for OpEthApi<Eth>
+impl<N> LoadReceipt for OpEthApi<N>
 where
-    Eth: LoadReceipt + EthApiSpec + LoadTransaction,
+    Self: EthApiSpec + LoadTransaction,
+    Self::Error: From<OpEthApiError>,
+    N: FullNodeComponents,
 {
     #[inline]
     fn cache(&self) -> &EthStateCache {
-        LoadReceipt::cache(&self.inner)
+        self.inner.cache()
     }
 
     async fn build_transaction_receipt(
@@ -58,7 +61,9 @@ pub fn op_receipt_fields(
     } else if let Some(l1_block_info) = optimism_tx_meta.l1_block_info {
         op_fields.l1_fee = optimism_tx_meta.l1_fee;
         op_fields.l1_gas_used = optimism_tx_meta.l1_data_gas.map(|dg| {
-            dg + l1_block_info.l1_fee_overhead.unwrap_or_default().saturating_to::<u128>()
+            dg.saturating_add(
+                l1_block_info.l1_fee_overhead.unwrap_or_default().saturating_to::<u128>(),
+            )
         });
         op_fields.l1_fee_scalar = Some(f64::from(l1_block_info.l1_base_fee_scalar) / 1_000_000.0);
         op_fields.l1_gas_price = Some(l1_block_info.l1_base_fee.saturating_to());

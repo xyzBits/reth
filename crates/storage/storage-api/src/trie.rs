@@ -1,7 +1,11 @@
-use reth_primitives::{Address, B256};
+use reth_primitives::{Address, Bytes, B256};
 use reth_storage_errors::provider::ProviderResult;
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState};
+use reth_trie::{
+    prefix_set::TriePrefixSetsMut, updates::TrieUpdates, AccountProof, HashedPostState,
+    HashedStorage,
+};
 use revm::db::BundleState;
+use std::collections::HashMap;
 
 /// A type that can compute the state root of a given post state.
 #[auto_impl::auto_impl(&, Box, Arc)]
@@ -20,6 +24,16 @@ pub trait StateRootProvider: Send + Sync {
     /// Returns the state root of the `HashedPostState` on top of the current state.
     fn hashed_state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256>;
 
+    /// Returns the state root of the `HashedPostState` on top of the current state but re-uses the
+    /// intermediate nodes to speed up the computation. It's up to the caller to construct the
+    /// prefix sets and inform the provider of the trie paths that have changes.
+    fn hashed_state_root_from_nodes(
+        &self,
+        nodes: TrieUpdates,
+        hashed_state: HashedPostState,
+        prefix_sets: TriePrefixSetsMut,
+    ) -> ProviderResult<B256>;
+
     /// Returns the state root of the BundleState on top of the current state with trie
     /// updates to be committed to the database.
     fn state_root_with_updates(
@@ -35,6 +49,23 @@ pub trait StateRootProvider: Send + Sync {
         &self,
         hashed_state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)>;
+
+    /// Returns state root and trie updates.
+    /// See [`StateRootProvider::hashed_state_root_from_nodes`] for more info.
+    fn hashed_state_root_from_nodes_with_updates(
+        &self,
+        nodes: TrieUpdates,
+        hashed_state: HashedPostState,
+        prefix_sets: TriePrefixSetsMut,
+    ) -> ProviderResult<(B256, TrieUpdates)>;
+
+    /// Returns the storage root of the `HashedStorage` for target address on top of the current
+    /// state.
+    fn hashed_storage_root(
+        &self,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<B256>;
 }
 
 /// A type that can generate state proof on top of a given post state.
@@ -60,4 +91,11 @@ pub trait StateProofProvider: Send + Sync {
         address: Address,
         slots: &[B256],
     ) -> ProviderResult<AccountProof>;
+
+    /// Get trie witness for provided state.
+    fn witness(
+        &self,
+        overlay: HashedPostState,
+        target: HashedPostState,
+    ) -> ProviderResult<HashMap<B256, Bytes>>;
 }
