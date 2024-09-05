@@ -11,7 +11,7 @@ use reth_blockchain_tree_api::{
 };
 use reth_consensus::{Consensus, ConsensusError, PostExecutionInput};
 use reth_db_api::database::Database;
-use reth_evm::execute::{BlockExecutionOutput, BlockExecutorProvider, Executor};
+use reth_evm::execute::{BlockExecutorProvider, Executor};
 use reth_execution_errors::BlockExecutionError;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_primitives::{
@@ -22,7 +22,7 @@ use reth_provider::{
     FullExecutionDataProvider, ProviderError, StateRootProvider,
 };
 use reth_revm::database::StateProviderDatabase;
-use reth_trie::updates::TrieUpdates;
+use reth_trie::{updates::TrieUpdates, HashedPostState};
 use reth_trie_parallel::parallel_root::ParallelStateRoot;
 use std::{
     collections::BTreeMap,
@@ -98,7 +98,7 @@ impl AppendableChain {
             block_validation_kind,
         )?;
 
-        Ok(Self { chain: Chain::new(vec![block], bundle_state, trie_updates) })
+        Ok(Self::new(Chain::new(vec![block], bundle_state, trie_updates)))
     }
 
     /// Create a new chain that forks off of an existing sidechain.
@@ -155,7 +155,7 @@ impl AppendableChain {
         execution_outcome.set_first_block(block.number);
 
         // If all is okay, return new chain back. Present chain is not modified.
-        Ok(Self { chain: Chain::from_block(block, execution_outcome, None) })
+        Ok(Self::new(Chain::from_block(block, execution_outcome, None)))
     }
 
     /// Validate and execute the given block that _extends the canonical chain_, validating its
@@ -210,13 +210,12 @@ impl AppendableChain {
         let block = block.unseal();
 
         let state = executor.execute((&block, U256::MAX).into())?;
-        let BlockExecutionOutput { state, receipts, requests, .. } = state;
-        externals
-            .consensus
-            .validate_block_post_execution(&block, PostExecutionInput::new(&receipts, &requests))?;
+        externals.consensus.validate_block_post_execution(
+            &block,
+            PostExecutionInput::new(&state.receipts, &state.requests),
+        )?;
 
-        let initial_execution_outcome =
-            ExecutionOutcome::new(state, receipts.into(), block.number, vec![requests.into()]);
+        let initial_execution_outcome = ExecutionOutcome::from((state, block.number));
 
         // check state root if the block extends the canonical chain __and__ if state root
         // validation was requested.
@@ -233,7 +232,10 @@ impl AppendableChain {
                     .map(|(root, updates)| (root, Some(updates)))
                     .map_err(ProviderError::from)?
             } else {
-                (provider.state_root(initial_execution_outcome.state())?, None)
+                let hashed_state =
+                    HashedPostState::from_bundle_state(&initial_execution_outcome.state().state);
+                let state_root = provider.state_root(hashed_state)?;
+                (state_root, None)
             };
             if block.state_root != state_root {
                 return Err(ConsensusError::BodyStateRootDiff(

@@ -160,10 +160,17 @@ pub fn insert_state<'a, 'b, DB: Database>(
 
     for (address, account) in alloc {
         let bytecode_hash = if let Some(code) = &account.code {
-            let bytecode = Bytecode::new_raw(code.clone());
-            let hash = bytecode.hash_slow();
-            contracts.insert(hash, bytecode);
-            Some(hash)
+            match Bytecode::new_raw_checked(code.clone()) {
+                Ok(bytecode) => {
+                    let hash = bytecode.hash_slow();
+                    contracts.insert(hash, bytecode);
+                    Some(hash)
+                }
+                Err(err) => {
+                    error!(%address, %err, "Failed to decode genesis bytecode.");
+                    return Err(DatabaseError::Other(err.to_string()).into());
+                }
+            }
         } else {
             None
         };
@@ -336,7 +343,12 @@ pub fn init_from_state_dump<DB: Database>(
 
     // compute and compare state root. this advances the stage checkpoints.
     let computed_state_root = compute_state_root(&provider_rw)?;
-    if computed_state_root != expected_state_root {
+    if computed_state_root == expected_state_root {
+        info!(target: "reth::cli",
+            ?computed_state_root,
+            "Computed state root matches state root in state dump"
+        );
+    } else {
         error!(target: "reth::cli",
             ?computed_state_root,
             ?expected_state_root,
@@ -344,11 +356,6 @@ pub fn init_from_state_dump<DB: Database>(
         );
 
         Err(InitDatabaseError::StateRootMismatch { expected_state_root, computed_state_root })?
-    } else {
-        info!(target: "reth::cli",
-            ?computed_state_root,
-            "Computed state root matches state root in state dump"
-        );
     }
 
     // insert sync stages for stages that require state

@@ -4,7 +4,7 @@ use crate::{
     CanonStateSubscriptions, ChainSpecProvider, ChangeSetReader, DatabaseProviderFactory,
     DatabaseProviderRO, EvmEnvProvider, FinalizedBlockReader, HeaderProvider, ProviderError,
     ProviderFactory, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
-    RequestsProvider, StageCheckpointReader, StateProviderBox, StateProviderFactory,
+    RequestsProvider, StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
     StaticFileProviderFactory, TransactionVariant, TransactionsProvider, WithdrawalsProvider,
 };
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -18,6 +18,7 @@ use reth_db_api::{
     models::{AccountBeforeTx, StoredBlockBodyIndices},
 };
 use reth_evm::ConfigureEvmEnv;
+use reth_execution_types::ExecutionOutcome;
 use reth_primitives::{
     Account, Address, Block, BlockHash, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumber,
     BlockNumberOrTag, BlockWithSenders, EthereumHardforks, Header, Receipt, SealedBlock,
@@ -126,6 +127,53 @@ where
         (start, end)
     }
 
+    /// Fetches a range of data from both in-memory state and storage.
+    ///
+    /// - `fetch_db_range`: Retrieves a range of items from the database.
+    /// - `map_block_state_item`: Maps a block number to an item in memory. Stops fetching if `None`
+    ///   is returned.
+    fn fetch_db_mem_range<T, F, G, P>(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+        fetch_db_range: F,
+        map_block_state_item: G,
+        mut predicate: P,
+    ) -> ProviderResult<Vec<T>>
+    where
+        F: FnOnce(RangeInclusive<BlockNumber>, &mut P) -> ProviderResult<Vec<T>>,
+        G: Fn(BlockNumber, &mut P) -> Option<T>,
+        P: FnMut(&T) -> bool,
+    {
+        let (start, end) = self.convert_range_bounds(range, || {
+            self.canonical_in_memory_state.get_canonical_block_number()
+        });
+        let mut range = start..=end;
+        let mut items = Vec::with_capacity((end - start + 1) as usize);
+
+        // First, fetch the items from the database
+        let mut db_items = fetch_db_range(range.clone(), &mut predicate)?;
+
+        if !db_items.is_empty() {
+            items.append(&mut db_items);
+
+            // Advance the range iterator by the number of items fetched from the database
+            range.nth(items.len() - 1);
+        }
+
+        // Fetch the remaining items from the in-memory state
+        for num in range {
+            // TODO: there might be an update between loop iterations, we
+            // need to handle that situation.
+            if let Some(item) = map_block_state_item(num, &mut predicate) {
+                items.push(item);
+            } else {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
     /// This uses a given [`BlockState`] to initialize a state provider for that block.
     fn block_state_provider(
         &self,
@@ -165,7 +213,7 @@ where
             let Some(body_index) = provider.block_body_indices(block_number)? else {
                 return Ok(None)
             };
-            let tx_index = id - body_index.last_tx_num();
+            let tx_index = body_index.last_tx_num() - id;
             Ok(Some((None, tx_index as usize)))
         } else {
             // Otherwise, iterate through in-memory blocks and find the transaction with the
@@ -285,32 +333,16 @@ where
     }
 
     fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> ProviderResult<Vec<Header>> {
-        let (start, end) = self.convert_range_bounds(range, || {
-            self.canonical_in_memory_state.get_canonical_block_number()
-        });
-        let mut range = start..=end;
-        let mut headers = Vec::with_capacity((end - start + 1) as usize);
-
-        // First, fetch the headers from the database
-        let mut db_headers = self.database.headers_range(range.clone())?;
-
-        // Advance the range iterator by the number of headers fetched from the database
-        range.nth(db_headers.len() - 1);
-
-        headers.append(&mut db_headers);
-
-        // Fetch the remaining headers from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                headers.push(block_state.block().block().header.header().clone());
-            } else {
-                break
-            }
-        }
-
-        Ok(headers)
+        self.fetch_db_mem_range(
+            range,
+            |range, _| self.database.headers_range(range),
+            |num, _| {
+                self.canonical_in_memory_state
+                    .state_by_number(num)
+                    .map(|block_state| block_state.block().block().header.header().clone())
+            },
+            |_| true,
+        )
     }
 
     fn sealed_header(&self, number: BlockNumber) -> ProviderResult<Option<SealedHeader>> {
@@ -325,69 +357,34 @@ where
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<SealedHeader>> {
-        let (start, end) = self.convert_range_bounds(range, || {
-            self.canonical_in_memory_state.get_canonical_block_number()
-        });
-        let mut range = start..=end;
-        let mut sealed_headers = Vec::with_capacity((end - start + 1) as usize);
-
-        // First, fetch the headers from the database
-        let mut db_headers = self.database.sealed_headers_range(range.clone())?;
-
-        // Advance the range iterator by the number of headers fetched from the database
-        range.nth(db_headers.len() - 1);
-
-        sealed_headers.append(&mut db_headers);
-
-        // Fetch the remaining headers from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                sealed_headers.push(block_state.block().block().header.clone());
-            } else {
-                break
-            }
-        }
-
-        Ok(sealed_headers)
+        self.fetch_db_mem_range(
+            range,
+            |range, _| self.database.sealed_headers_range(range),
+            |num, _| {
+                self.canonical_in_memory_state
+                    .state_by_number(num)
+                    .map(|block_state| block_state.block().block().header.clone())
+            },
+            |_| true,
+        )
     }
 
     fn sealed_headers_while(
         &self,
         range: impl RangeBounds<BlockNumber>,
-        mut predicate: impl FnMut(&SealedHeader) -> bool,
+        predicate: impl FnMut(&SealedHeader) -> bool,
     ) -> ProviderResult<Vec<SealedHeader>> {
-        let (start, end) = self.convert_range_bounds(range, || {
-            self.canonical_in_memory_state.get_canonical_block_number()
-        });
-        let mut range = start..=end;
-        let mut sealed_headers = Vec::with_capacity((end - start + 1) as usize);
-
-        // First, fetch the headers from the database
-        let mut db_headers = self.database.sealed_headers_while(range.clone(), &mut predicate)?;
-
-        // Advance the range iterator by the number of headers fetched from the database
-        range.nth(db_headers.len() - 1);
-
-        sealed_headers.append(&mut db_headers);
-
-        // Fetch the remaining headers from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                let header = block_state.block().block().header.clone();
-                if !predicate(&header) {
-                    break
-                }
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                sealed_headers.push(header);
-            } else {
-                break
-            }
-        }
-
-        Ok(sealed_headers)
+        self.fetch_db_mem_range(
+            range,
+            |range, predicate| self.database.sealed_headers_while(range, predicate),
+            |num, predicate| {
+                self.canonical_in_memory_state
+                    .state_by_number(num)
+                    .map(|block_state| block_state.block().block().header.clone())
+                    .filter(|header| predicate(header))
+            },
+            predicate,
+        )
     }
 }
 
@@ -408,30 +405,16 @@ where
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        let mut range = start..=end;
-
-        let mut hashes = Vec::with_capacity((end - start + 1) as usize);
-
-        // First, fetch the hashes from the database
-        let mut db_hashes = self.database.canonical_hashes_range(start, end)?;
-
-        // Advance the range iterator by the number of blocks fetched from the database
-        range.nth(db_hashes.len() - 1);
-
-        hashes.append(&mut db_hashes);
-
-        // Fetch the remaining blocks from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                hashes.push(block_state.hash());
-            } else {
-                break
-            }
-        }
-
-        Ok(hashes)
+        self.fetch_db_mem_range(
+            start..=end,
+            |range, _| self.database.canonical_hashes_range(*range.start(), *range.end()),
+            |num, _| {
+                self.canonical_in_memory_state
+                    .state_by_number(num)
+                    .map(|block_state| block_state.hash())
+            },
+            |_| true,
+        )
     }
 }
 
@@ -629,89 +612,53 @@ where
         self.database.sealed_block_with_senders(id, transaction_kind)
     }
 
-    fn block_range(&self, mut range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
-        let capacity = (range.end() - range.start() + 1) as usize;
-        let mut blocks = Vec::with_capacity(capacity);
-
-        // First, fetch the blocks from the database
-        let mut database_blocks = self.database.block_range(range.clone())?;
-        blocks.append(&mut database_blocks);
-
-        // Advance the range iterator by the number of blocks fetched from the database
-        range.nth(blocks.len() - 1);
-
-        // Fetch the remaining blocks from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                blocks.push(block_state.block().block().clone().unseal());
-            } else {
-                break
-            }
-        }
-
-        Ok(blocks)
+    fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
+        self.fetch_db_mem_range(
+            range,
+            |range, _| self.database.block_range(range),
+            |num, _| {
+                self.canonical_in_memory_state
+                    .state_by_number(num)
+                    .map(|block_state| block_state.block().block().clone().unseal())
+            },
+            |_| true,
+        )
     }
 
     fn block_with_senders_range(
         &self,
-        mut range: RangeInclusive<BlockNumber>,
+        range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<BlockWithSenders>> {
-        let capacity = (range.end() - range.start() + 1) as usize;
-        let mut blocks = Vec::with_capacity(capacity);
-
-        // First, fetch the blocks from the database
-        let mut database_blocks = self.database.block_with_senders_range(range.clone())?;
-        blocks.append(&mut database_blocks);
-
-        // Advance the range iterator by the number of blocks fetched from the database
-        range.nth(blocks.len() - 1);
-
-        // Fetch the remaining blocks from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                let block = block_state.block().block().clone();
-                let senders = block_state.block().senders().clone();
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                blocks.push(BlockWithSenders { block: block.unseal(), senders });
-            } else {
-                break
-            }
-        }
-
-        Ok(blocks)
+        self.fetch_db_mem_range(
+            range,
+            |range, _| self.database.block_with_senders_range(range),
+            |num, _| {
+                self.canonical_in_memory_state.state_by_number(num).map(|block_state| {
+                    let block = block_state.block().block().clone();
+                    let senders = block_state.block().senders().clone();
+                    BlockWithSenders { block: block.unseal(), senders }
+                })
+            },
+            |_| true,
+        )
     }
 
     fn sealed_block_with_senders_range(
         &self,
-        mut range: RangeInclusive<BlockNumber>,
+        range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<SealedBlockWithSenders>> {
-        let capacity = (range.end() - range.start() + 1) as usize;
-        let mut blocks = Vec::with_capacity(capacity);
-
-        // First, fetch the blocks from the database
-        let mut database_blocks = self.database.sealed_block_with_senders_range(range.clone())?;
-        blocks.append(&mut database_blocks);
-
-        // Advance the range iterator by the number of blocks fetched from the database
-        range.nth(blocks.len() - 1);
-
-        // Fetch the remaining blocks from the in-memory state
-        for num in range {
-            if let Some(block_state) = self.canonical_in_memory_state.state_by_number(num) {
-                let block = block_state.block().block().clone();
-                let senders = block_state.block().senders().clone();
-                // TODO: there might be an update between loop iterations, we
-                // need to handle that situation.
-                blocks.push(SealedBlockWithSenders { block, senders });
-            } else {
-                break
-            }
-        }
-
-        Ok(blocks)
+        self.fetch_db_mem_range(
+            range,
+            |range, _| self.database.sealed_block_with_senders_range(range),
+            |num, _| {
+                self.canonical_in_memory_state.state_by_number(num).map(|block_state| {
+                    let block = block_state.block().block().clone();
+                    let senders = block_state.block().senders().clone();
+                    SealedBlockWithSenders { block, senders }
+                })
+            },
+            |_| true,
+        )
     }
 }
 
@@ -1487,10 +1434,34 @@ where
     }
 }
 
+impl<DB> StateReader for BlockchainProvider2<DB>
+where
+    DB: Database + Sync + Send,
+{
+    fn get_state(&self, block: BlockNumber) -> ProviderResult<Option<ExecutionOutcome>> {
+        if let Some(state) = self.canonical_in_memory_state.state_by_number(block) {
+            let state = state.block().execution_outcome().clone();
+            Ok(Some(state))
+        } else {
+            self.database.provider()?.get_state(block..=block)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{ops::Range, sync::Arc, time::Instant};
+    use std::{
+        ops::{Range, RangeBounds},
+        sync::Arc,
+        time::Instant,
+    };
 
+    use crate::{
+        providers::BlockchainProvider2,
+        test_utils::{create_test_provider_factory, create_test_provider_factory_with_chain_spec},
+        writer::UnifiedStorageWriter,
+        BlockWriter, CanonChainTracker, StaticFileProviderFactory, StaticFileWriter,
+    };
     use itertools::Itertools;
     use rand::Rng;
     use reth_chain_state::{
@@ -1500,38 +1471,62 @@ mod tests {
     use reth_chainspec::{
         ChainSpec, ChainSpecBuilder, ChainSpecProvider, EthereumHardfork, MAINNET,
     };
-    use reth_db::{models::AccountBeforeTx, test_utils::TempDatabase, DatabaseEnv};
+    use reth_db::{
+        models::{AccountBeforeTx, StoredBlockBodyIndices},
+        test_utils::TempDatabase,
+        DatabaseEnv,
+    };
     use reth_execution_types::{Chain, ExecutionOutcome};
     use reth_primitives::{
-        BlockHashOrNumber, BlockNumHash, BlockNumberOrTag, Receipt, SealedBlock, StaticFileSegment,
-        B256,
+        BlockHashOrNumber, BlockNumHash, BlockNumberOrTag, BlockWithSenders, Receipt, SealedBlock,
+        SealedBlockWithSenders, StaticFileSegment, TransactionMeta, TransactionSignedNoHash,
+        Withdrawals, B256,
     };
     use reth_storage_api::{
         BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt, BlockSource,
-        ChangeSetReader, HeaderProvider, ReceiptProviderIdExt, RequestsProvider,
+        ChangeSetReader, HeaderProvider, ReceiptProvider, ReceiptProviderIdExt, RequestsProvider,
+        TransactionVariant, TransactionsProvider, WithdrawalsProvider,
     };
     use reth_testing_utils::generators::{
         self, random_block, random_block_range, random_changeset_range, random_eoa_accounts,
-        random_receipt,
+        random_receipt, BlockParams, BlockRangeParams,
     };
     use revm::db::BundleState;
-
-    use crate::{
-        providers::BlockchainProvider2,
-        test_utils::{create_test_provider_factory, create_test_provider_factory_with_chain_spec},
-        BlockWriter, CanonChainTracker, StaticFileWriter,
-    };
+    use std::ops::Bound;
 
     const TEST_BLOCKS_COUNT: usize = 5;
+
+    const TEST_TRANSACTIONS_COUNT: u8 = 4;
 
     fn random_blocks(
         rng: &mut impl Rng,
         database_blocks: usize,
         in_memory_blocks: usize,
         requests_count: Option<Range<u8>>,
+        withdrawals_count: Option<Range<u8>>,
+        tx_count: impl RangeBounds<u8>,
     ) -> (Vec<SealedBlock>, Vec<SealedBlock>) {
         let block_range = (database_blocks + in_memory_blocks - 1) as u64;
-        let blocks = random_block_range(rng, 0..=block_range, B256::ZERO, 0..1, requests_count);
+
+        let tx_start = match tx_count.start_bound() {
+            Bound::Included(&n) | Bound::Excluded(&n) => n,
+            Bound::Unbounded => u8::MIN,
+        };
+        let tx_end = match tx_count.end_bound() {
+            Bound::Included(&n) | Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => u8::MAX,
+        };
+
+        let blocks = random_block_range(
+            rng,
+            0..=block_range,
+            BlockRangeParams {
+                parent: Some(B256::ZERO),
+                tx_count: tx_start..tx_end,
+                requests_count,
+                withdrawals_count,
+            },
+        );
         let (database_blocks, in_memory_blocks) = blocks.split_at(database_blocks);
         (database_blocks.to_vec(), in_memory_blocks.to_vec())
     }
@@ -1542,15 +1537,22 @@ mod tests {
         chain_spec: Arc<ChainSpec>,
         database_blocks: usize,
         in_memory_blocks: usize,
-        requests_count: Option<Range<u8>>,
+        block_range_params: BlockRangeParams,
     ) -> eyre::Result<(
         BlockchainProvider2<Arc<TempDatabase<DatabaseEnv>>>,
         Vec<SealedBlock>,
         Vec<SealedBlock>,
         Vec<Vec<Receipt>>,
     )> {
-        let (database_blocks, in_memory_blocks) =
-            random_blocks(rng, database_blocks, in_memory_blocks, requests_count);
+        let (database_blocks, in_memory_blocks) = random_blocks(
+            rng,
+            database_blocks,
+            in_memory_blocks,
+            block_range_params.requests_count,
+            block_range_params.withdrawals_count,
+            block_range_params.tx_count,
+        );
+
         let receipts: Vec<Vec<_>> = database_blocks
             .iter()
             .chain(in_memory_blocks.iter())
@@ -1561,21 +1563,26 @@ mod tests {
         let factory = create_test_provider_factory_with_chain_spec(chain_spec);
         let provider_rw = factory.provider_rw()?;
 
-        // Insert blocks and receipts into the database
+        // Insert blocks into the database
         for block in &database_blocks {
             provider_rw.insert_historical_block(
                 block.clone().seal_with_senders().expect("failed to seal block with senders"),
             )?;
-
-            // Insert the receipts into the database using the writer from the provider_rw
-            let mut writer =
-                provider_rw.static_file_provider().latest_writer(StaticFileSegment::Receipts)?;
-            let block_number = block.number as usize;
-            for receipt in receipts.get(block_number).unwrap() {
-                writer.append_receipt(block.number, receipt)?;
-            }
         }
-        provider_rw.commit()?;
+
+        // Insert receipts into the static files
+        UnifiedStorageWriter::new(
+            &provider_rw,
+            Some(factory.static_file_provider().latest_writer(StaticFileSegment::Receipts)?),
+        )
+        .append_receipts_from_blocks(
+            // The initial block number is required
+            database_blocks.first().map(|b| b.number).unwrap_or_default(),
+            receipts.iter().map(|vec| vec.clone().into_iter().map(Some).collect::<Vec<_>>()),
+        )?;
+
+        // Commit to both storages: database and static files
+        UnifiedStorageWriter::commit(provider_rw, factory.static_file_provider())?;
 
         let provider = BlockchainProvider2::new(factory)?;
 
@@ -1613,7 +1620,7 @@ mod tests {
         provider.set_safe(safe_block.header.clone());
         provider.set_finalized(finalized_block.header.clone());
 
-        Ok((provider, database_blocks.to_vec(), in_memory_blocks.to_vec(), receipts))
+        Ok((provider, database_blocks.clone(), in_memory_blocks.clone(), receipts))
     }
 
     #[allow(clippy::type_complexity)]
@@ -1621,7 +1628,7 @@ mod tests {
         rng: &mut impl Rng,
         database_blocks: usize,
         in_memory_blocks: usize,
-        requests_count: Option<Range<u8>>,
+        block_range_params: BlockRangeParams,
     ) -> eyre::Result<(
         BlockchainProvider2<Arc<TempDatabase<DatabaseEnv>>>,
         Vec<SealedBlock>,
@@ -1633,7 +1640,7 @@ mod tests {
             MAINNET.clone(),
             database_blocks,
             in_memory_blocks,
-            requests_count,
+            block_range_params,
         )
     }
 
@@ -1644,7 +1651,11 @@ mod tests {
         let factory = create_test_provider_factory();
 
         // Generate 10 random blocks and split into database and in-memory blocks
-        let blocks = random_block_range(&mut rng, 0..=10, B256::ZERO, 0..1, None);
+        let blocks = random_block_range(
+            &mut rng,
+            0..=10,
+            BlockRangeParams { parent: Some(B256::ZERO), tx_count: 0..1, ..Default::default() },
+        );
         let (database_blocks, in_memory_blocks) = blocks.split_at(5);
 
         // Insert first 5 blocks into the database
@@ -1738,7 +1749,11 @@ mod tests {
         let factory = create_test_provider_factory();
 
         // Generate 10 random blocks and split into database and in-memory blocks
-        let blocks = random_block_range(&mut rng, 0..=10, B256::ZERO, 0..1, None);
+        let blocks = random_block_range(
+            &mut rng,
+            0..=10,
+            BlockRangeParams { parent: Some(B256::ZERO), tx_count: 0..1, ..Default::default() },
+        );
         let (database_blocks, in_memory_blocks) = blocks.split_at(5);
 
         // Insert first 5 blocks into the database
@@ -1802,12 +1817,20 @@ mod tests {
     #[test]
     fn test_block_reader_pending_block() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, _, _, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         // Generate a random block
         let mut rng = generators::rng();
-        let block = random_block(&mut rng, 0, Some(B256::ZERO), None, None, None);
+        let block = random_block(
+            &mut rng,
+            0,
+            BlockParams { parent: Some(B256::ZERO), ..Default::default() },
+        );
 
         // Set the block as pending
         provider.canonical_in_memory_state.set_pending_block(ExecutedBlock {
@@ -1838,8 +1861,12 @@ mod tests {
     fn test_block_reader_ommers() -> eyre::Result<()> {
         // Create a new provider
         let mut rng = generators::rng();
-        let (provider, _, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let first_in_mem_block = in_memory_blocks.first().unwrap();
 
@@ -1868,10 +1895,777 @@ mod tests {
     }
 
     #[test]
+    fn test_block_body_indices() -> eyre::Result<()> {
+        // Create a new provider
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        let first_in_mem_block = in_memory_blocks.first().unwrap();
+
+        // Insert the first block into the in-memory state
+        let in_memory_block_senders =
+            first_in_mem_block.senders().expect("failed to recover senders");
+        let chain = NewCanonicalChain::Commit {
+            new: vec![ExecutedBlock::new(
+                Arc::new(first_in_mem_block.clone()),
+                Arc::new(in_memory_block_senders),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )],
+        };
+        provider.canonical_in_memory_state.update_chain(chain);
+
+        let first_db_block = database_blocks.first().unwrap().clone();
+        let first_in_mem_block = in_memory_blocks.first().unwrap().clone();
+
+        // First database block body indices should be found
+        assert_eq!(
+            provider.block_body_indices(first_db_block.number)?.unwrap(),
+            StoredBlockBodyIndices { first_tx_num: 0, tx_count: 4 }
+        );
+
+        // First in-memory block body indices should be found with the first tx after the database
+        // blocks
+        assert_eq!(
+            provider.block_body_indices(first_in_mem_block.number)?.unwrap(),
+            StoredBlockBodyIndices { first_tx_num: 20, tx_count: 4 }
+        );
+
+        // A random block number should return None as the block is not found
+        let mut rng = rand::thread_rng();
+        let random_block_number: u64 = rng.gen();
+        assert_eq!(provider.block_body_indices(random_block_number)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_by_hash_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first in-memory block
+        let first_in_mem_block = in_memory_blocks.first().unwrap();
+        let block_hash = first_in_mem_block.hash();
+
+        // Get the block with senders by hash and check if it matches the first in-memory block
+        let block_with_senders = provider
+            .block_with_senders(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)?
+            .unwrap();
+        assert_eq!(block_with_senders.block.seal(block_hash), first_in_mem_block.clone());
+        assert_eq!(block_with_senders.senders, first_in_mem_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_by_number_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first in-memory block
+        let first_in_mem_block = in_memory_blocks.first().unwrap();
+        let block_number = first_in_mem_block.number;
+
+        // Get the block with senders by number and check if it matches the first in-memory block
+        let block_with_senders = provider
+            .block_with_senders(
+                BlockHashOrNumber::Number(block_number),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(
+            block_with_senders.block.seal(first_in_mem_block.hash()),
+            first_in_mem_block.clone()
+        );
+        assert_eq!(block_with_senders.senders, first_in_mem_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_by_hash_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first database block
+        let first_db_block = database_blocks.first().unwrap();
+        let block_hash = first_db_block.hash();
+
+        // Get the block with senders by hash and check if it matches the first database block
+        let block_with_senders = provider
+            .block_with_senders(BlockHashOrNumber::Hash(block_hash), TransactionVariant::WithHash)?
+            .unwrap();
+        assert_eq!(block_with_senders.block.seal(block_hash), first_db_block.clone());
+        assert_eq!(block_with_senders.senders, first_db_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_by_number_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first database block
+        let first_db_block = database_blocks.first().unwrap();
+        let block_number = first_db_block.number;
+
+        // Get the block with senders by number and check if it matches the first database block
+        let block_with_senders = provider
+            .block_with_senders(
+                BlockHashOrNumber::Number(block_number),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(block_with_senders.block.seal(first_db_block.hash()), first_db_block.clone());
+        assert_eq!(block_with_senders.senders, first_db_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_non_existent_block() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Generate a random hash (non-existent block)
+        let non_existent_hash = B256::random();
+        let result = provider.block_with_senders(
+            BlockHashOrNumber::Hash(non_existent_hash),
+            TransactionVariant::WithHash,
+        )?;
+        // The block should not be found
+        assert!(result.is_none());
+
+        // Generate a random number (non-existent block)
+        let non_existent_number = 9999;
+        let result = provider.block_with_senders(
+            BlockHashOrNumber::Number(non_existent_number),
+            TransactionVariant::WithHash,
+        )?;
+        // The block should not be found
+        assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_by_hash_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first in-memory block
+        let first_in_mem_block = in_memory_blocks.first().unwrap();
+        let block_hash = first_in_mem_block.hash();
+
+        // Get the sealed block with senders by hash and check if it matches the first in-memory
+        // block
+        let sealed_block_with_senders = provider
+            .sealed_block_with_senders(
+                BlockHashOrNumber::Hash(block_hash),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(sealed_block_with_senders.block, first_in_mem_block.clone());
+        assert_eq!(sealed_block_with_senders.senders, first_in_mem_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_by_number_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first in-memory block
+        let first_in_mem_block = in_memory_blocks.first().unwrap();
+        let block_number = first_in_mem_block.number;
+
+        // Get the sealed block with senders by number and check if it matches the first in-memory
+        let sealed_block_with_senders = provider
+            .sealed_block_with_senders(
+                BlockHashOrNumber::Number(block_number),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(sealed_block_with_senders.block, first_in_mem_block.clone());
+        assert_eq!(sealed_block_with_senders.senders, first_in_mem_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_by_hash_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first database block
+        let first_db_block = database_blocks.first().unwrap();
+        let block_hash = first_db_block.hash();
+
+        // Get the sealed block with senders by hash and check if it matches the first database
+        // block
+        let sealed_block_with_senders = provider
+            .sealed_block_with_senders(
+                BlockHashOrNumber::Hash(block_hash),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(sealed_block_with_senders.block, first_db_block.clone());
+        assert_eq!(sealed_block_with_senders.senders, first_db_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_by_number_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the first database block
+        let first_db_block = database_blocks.first().unwrap();
+        let block_number = first_db_block.number;
+
+        // Get the sealed block with senders by number and check if it matches the first database
+        // block
+        let sealed_block_with_senders = provider
+            .sealed_block_with_senders(
+                BlockHashOrNumber::Number(block_number),
+                TransactionVariant::WithHash,
+            )?
+            .unwrap();
+        assert_eq!(sealed_block_with_senders.block, first_db_block.clone());
+        assert_eq!(sealed_block_with_senders.senders, first_db_block.senders().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_non_existent_block() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Generate a random hash (non-existent block)
+        let non_existent_hash = B256::random();
+        let result = provider.sealed_block_with_senders(
+            BlockHashOrNumber::Hash(non_existent_hash),
+            TransactionVariant::WithHash,
+        )?;
+        // The block should not be found
+        assert!(result.is_none());
+
+        // Generate a random number (non-existent block)
+        let non_existent_number = 9999;
+        let result = provider.sealed_block_with_senders(
+            BlockHashOrNumber::Number(non_existent_number),
+            TransactionVariant::WithHash,
+        )?;
+        // The block should not be found
+        assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_range_in_memory_only() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of in-memory blocks
+        let start_block_number = in_memory_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks = provider.block_range(range)?;
+
+        // Check if the retrieved blocks match the in-memory blocks
+        assert_eq!(blocks.len(), in_memory_blocks.len());
+        // Check if the blocks are equal
+        for (retrieved_block, expected_block) in blocks.iter().zip(in_memory_blocks.iter()) {
+            assert_eq!(retrieved_block, &expected_block.clone().unseal());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_range_in_database_only() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            0, // No blocks in memory
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of database blocks
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = database_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks = provider.block_range(range)?;
+
+        // Check if the retrieved blocks match the database blocks
+        assert_eq!(blocks.len(), database_blocks.len());
+        // Check if the blocks are equal
+        for (retrieved_block, expected_block) in blocks.iter().zip(database_blocks.iter()) {
+            assert_eq!(retrieved_block, &expected_block.clone().unseal());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_range_across_memory_and_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let mid_point = TEST_BLOCKS_COUNT / 2;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            mid_point,
+            TEST_BLOCKS_COUNT - mid_point,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of blocks across memory and database
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks = provider.block_range(range)?;
+
+        // Check if the retrieved blocks match the database and in-memory blocks
+        assert_eq!(blocks.len(), TEST_BLOCKS_COUNT);
+        let all_expected_blocks =
+            database_blocks.iter().chain(in_memory_blocks.iter()).collect::<Vec<_>>();
+        // Check if the blocks are equal
+        for (retrieved_block, expected_block) in blocks.iter().zip(all_expected_blocks.iter()) {
+            assert_eq!(retrieved_block.clone(), (*expected_block).clone().unseal());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_range_non_existent_range() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Generate a non-existent range
+        let non_existent_range = 9999..=10000;
+        let blocks = provider.block_range(non_existent_range)?;
+
+        // The range is non-existent, so the blocks should be empty
+        assert!(blocks.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_range_partial_overlap() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let mid_point = TEST_BLOCKS_COUNT / 2;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            mid_point,
+            mid_point,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of blocks across memory and database
+        let start_block_number = database_blocks.last().unwrap().number;
+        let end_block_number = in_memory_blocks.first().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks = provider.block_range(range)?;
+
+        assert_eq!(blocks.len(), 2); // Only one block from each side of the overlap
+        assert_eq!(blocks[0], database_blocks.last().unwrap().clone().unseal());
+        assert_eq!(blocks[1], in_memory_blocks.first().unwrap().clone().unseal());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_range_across_memory_and_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let mid_point = TEST_BLOCKS_COUNT / 2;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            mid_point,
+            TEST_BLOCKS_COUNT - mid_point,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of blocks across memory and database
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks_with_senders = provider.block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the database and in-memory blocks
+        assert_eq!(blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let all_expected_blocks_with_senders = database_blocks
+            .iter()
+            .chain(in_memory_blocks.iter())
+            .map(|sealed_block| BlockWithSenders {
+                block: sealed_block.clone().unseal(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_block_with_senders, expected_block_with_senders) in
+            blocks_with_senders.iter().zip(all_expected_blocks_with_senders.iter())
+        {
+            assert_eq!(retrieved_block_with_senders.block, expected_block_with_senders.block);
+            assert_eq!(retrieved_block_with_senders.senders, expected_block_with_senders.senders);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_range_only_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of in-memory blocks
+        let start_block_number = in_memory_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks_with_senders = provider.block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the in-memory blocks
+        assert_eq!(blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let expected_blocks_with_senders = in_memory_blocks
+            .iter()
+            .map(|sealed_block| BlockWithSenders {
+                block: sealed_block.clone().unseal(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_block_with_senders, expected_block_with_senders) in
+            blocks_with_senders.iter().zip(expected_blocks_with_senders.iter())
+        {
+            assert_eq!(retrieved_block_with_senders.block, expected_block_with_senders.block);
+            assert_eq!(retrieved_block_with_senders.senders, expected_block_with_senders.senders);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_range_only_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            0,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of database blocks
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = database_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let blocks_with_senders = provider.block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the database blocks
+        assert_eq!(blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let expected_blocks_with_senders = database_blocks
+            .iter()
+            .map(|sealed_block| BlockWithSenders {
+                block: sealed_block.clone().unseal(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_block_with_senders, expected_block_with_senders) in
+            blocks_with_senders.iter().zip(expected_blocks_with_senders.iter())
+        {
+            assert_eq!(retrieved_block_with_senders.block, expected_block_with_senders.block);
+            assert_eq!(retrieved_block_with_senders.senders, expected_block_with_senders.senders);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_with_senders_range_non_existent_range() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Assuming this range does not exist
+        let start_block_number = 1000;
+        let end_block_number = 2000;
+
+        let range = start_block_number..=end_block_number;
+        let blocks_with_senders = provider.block_with_senders_range(range)?;
+
+        // The range is non-existent, so the blocks should be empty
+        assert!(blocks_with_senders.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_range_across_memory_and_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let mid_point = TEST_BLOCKS_COUNT / 2;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            mid_point,
+            TEST_BLOCKS_COUNT - mid_point,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of blocks across memory and database
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let sealed_blocks_with_senders = provider.sealed_block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the database and in-memory blocks
+        assert_eq!(sealed_blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let all_expected_sealed_blocks_with_senders = database_blocks
+            .iter()
+            .chain(in_memory_blocks.iter())
+            .map(|sealed_block| SealedBlockWithSenders {
+                block: sealed_block.clone(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_sealed_block_with_senders, expected_sealed_block_with_senders) in
+            sealed_blocks_with_senders.iter().zip(all_expected_sealed_blocks_with_senders.iter())
+        {
+            assert_eq!(
+                retrieved_sealed_block_with_senders.block,
+                expected_sealed_block_with_senders.block
+            );
+            assert_eq!(
+                retrieved_sealed_block_with_senders.senders,
+                expected_sealed_block_with_senders.senders
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_range_only_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of in-memory blocks
+        let start_block_number = in_memory_blocks.first().unwrap().number;
+        let end_block_number = in_memory_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let sealed_blocks_with_senders = provider.sealed_block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the in-memory blocks
+        assert_eq!(sealed_blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let expected_sealed_blocks_with_senders = in_memory_blocks
+            .iter()
+            .map(|sealed_block| SealedBlockWithSenders {
+                block: sealed_block.clone(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_sealed_block_with_senders, expected_sealed_block_with_senders) in
+            sealed_blocks_with_senders.iter().zip(expected_sealed_blocks_with_senders.iter())
+        {
+            assert_eq!(
+                retrieved_sealed_block_with_senders.block,
+                expected_sealed_block_with_senders.block
+            );
+            assert_eq!(
+                retrieved_sealed_block_with_senders.senders,
+                expected_sealed_block_with_senders.senders
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_range_only_in_database() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            0,
+            BlockRangeParams::default(),
+        )?;
+
+        // Get the range of database blocks
+        let start_block_number = database_blocks.first().unwrap().number;
+        let end_block_number = database_blocks.last().unwrap().number;
+
+        let range = start_block_number..=end_block_number;
+        let sealed_blocks_with_senders = provider.sealed_block_with_senders_range(range)?;
+
+        // Check if the retrieved blocks match the database blocks
+        assert_eq!(sealed_blocks_with_senders.len(), TEST_BLOCKS_COUNT);
+
+        let expected_sealed_blocks_with_senders = database_blocks
+            .iter()
+            .map(|sealed_block| SealedBlockWithSenders {
+                block: sealed_block.clone(),
+                senders: sealed_block.senders().unwrap(),
+            })
+            .collect::<Vec<_>>();
+
+        // Check if the blocks are equal
+        for (retrieved_sealed_block_with_senders, expected_sealed_block_with_senders) in
+            sealed_blocks_with_senders.iter().zip(expected_sealed_blocks_with_senders.iter())
+        {
+            assert_eq!(
+                retrieved_sealed_block_with_senders.block,
+                expected_sealed_block_with_senders.block
+            );
+            assert_eq!(
+                retrieved_sealed_block_with_senders.senders,
+                expected_sealed_block_with_senders.senders
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sealed_block_with_senders_range_non_existent_range() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+
+        // Assuming this range does not exist
+        let start_block_number = 1000;
+        let end_block_number = 2000;
+
+        let range = start_block_number..=end_block_number;
+        let sealed_blocks_with_senders = provider.sealed_block_with_senders_range(range)?;
+
+        // The range is non-existent, so the blocks should be empty
+        assert!(sealed_blocks_with_senders.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_block_hash_reader() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
@@ -1894,8 +2688,12 @@ mod tests {
     #[test]
     fn test_header_provider() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
@@ -2001,10 +2799,67 @@ mod tests {
     }
 
     #[test]
+    fn test_withdrawals_provider() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().shanghai_activated().build());
+        let (provider, database_blocks, in_memory_blocks, _) =
+            provider_with_chain_spec_and_random_blocks(
+                &mut rng,
+                chain_spec.clone(),
+                TEST_BLOCKS_COUNT,
+                TEST_BLOCKS_COUNT,
+                BlockRangeParams { withdrawals_count: Some(1..3), ..Default::default() },
+            )?;
+        let blocks = [database_blocks, in_memory_blocks].concat();
+
+        let shainghai_timestamp =
+            chain_spec.hardforks.fork(EthereumHardfork::Shanghai).as_timestamp().unwrap();
+
+        assert_eq!(
+            provider
+                .withdrawals_by_block(
+                    reth_primitives::BlockHashOrNumber::Number(15),
+                    shainghai_timestamp
+                )
+                .expect("could not call withdrawals by block"),
+            Some(Withdrawals::new(vec![])),
+            "Expected withdrawals_by_block to return empty list if block does not exist"
+        );
+
+        for block in blocks.clone() {
+            assert_eq!(
+                provider
+                    .withdrawals_by_block(
+                        reth_primitives::BlockHashOrNumber::Number(block.number),
+                        shainghai_timestamp
+                    )?
+                    .unwrap(),
+                block.withdrawals.unwrap(),
+                "Expected withdrawals_by_block to return correct withdrawals"
+            );
+        }
+
+        let canonical_block_num = provider.best_block_number().unwrap();
+        let canonical_block = blocks.get(canonical_block_num as usize).unwrap();
+
+        assert_eq!(
+            Some(provider.latest_withdrawal()?.unwrap()),
+            canonical_block.withdrawals.clone().unwrap().pop(),
+            "Expected latest withdrawal to be equal to last withdrawal entry in canonical block"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_block_num_reader() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         assert_eq!(provider.best_block_number()?, in_memory_blocks.last().unwrap().number);
         assert_eq!(provider.last_block_number()?, database_blocks.last().unwrap().number);
@@ -2020,14 +2875,19 @@ mod tests {
     #[test]
     fn test_block_reader_id_ext_block_by_id() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
 
         let block_number = database_block.number;
         let block_hash = database_block.header.hash();
+
         assert_eq!(
             provider.block_by_id(block_number.into()).unwrap(),
             Some(database_block.clone().unseal())
@@ -2051,8 +2911,12 @@ mod tests {
     #[test]
     fn test_block_reader_id_ext_header_by_number_or_tag() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
 
@@ -2104,8 +2968,12 @@ mod tests {
     #[test]
     fn test_block_reader_id_ext_header_by_id() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
@@ -2158,8 +3026,12 @@ mod tests {
     #[test]
     fn test_block_reader_id_ext_ommers_by_id() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
@@ -2192,10 +3064,45 @@ mod tests {
     }
 
     #[test]
+    fn test_receipt_provider() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, receipts) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams { tx_count: 1..3, ..Default::default() },
+        )?;
+
+        let blocks = [database_blocks, in_memory_blocks].concat();
+
+        for block in blocks {
+            let block_number = block.number as usize;
+            for (txn_number, _) in block.body.iter().enumerate() {
+                let txn_hash = block.body.get(txn_number).unwrap().hash();
+                let txn_id = provider.transaction_id(txn_hash)?.unwrap();
+                assert_eq!(
+                    provider.receipt(txn_id)?.unwrap(),
+                    receipts.get(block_number).unwrap().clone().get(txn_number).unwrap().clone()
+                );
+                assert_eq!(
+                    provider.receipt_by_hash(txn_hash)?.unwrap(),
+                    receipts.get(block_number).unwrap().clone().get(txn_number).unwrap().clone()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_receipt_provider_id_ext_receipts_by_block_id() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, receipts) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, receipts) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams { tx_count: 1..3, ..Default::default() },
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
         let in_memory_block = in_memory_blocks.last().unwrap().clone();
@@ -2203,12 +3110,18 @@ mod tests {
         let block_number = database_block.number;
         let block_hash = database_block.header.hash();
 
+        assert!(!receipts.get(database_block.number as usize).unwrap().is_empty());
+        assert!(!provider
+            .receipts_by_number_or_tag(database_block.number.into())?
+            .unwrap()
+            .is_empty());
+
         assert_eq!(
-            provider.receipts_by_block_id(block_number.into())?.unwrap_or_default(),
+            provider.receipts_by_block_id(block_number.into())?.unwrap(),
             receipts.get(block_number as usize).unwrap().clone()
         );
         assert_eq!(
-            provider.receipts_by_block_id(block_hash.into())?.unwrap_or_default(),
+            provider.receipts_by_block_id(block_hash.into())?.unwrap(),
             receipts.get(block_number as usize).unwrap().clone()
         );
 
@@ -2216,11 +3129,11 @@ mod tests {
         let block_hash = in_memory_block.header.hash();
 
         assert_eq!(
-            provider.receipts_by_block_id(block_number.into())?.unwrap_or_default(),
+            provider.receipts_by_block_id(block_number.into())?.unwrap(),
             receipts.get(block_number as usize).unwrap().clone()
         );
         assert_eq!(
-            provider.receipts_by_block_id(block_hash.into())?.unwrap_or_default(),
+            provider.receipts_by_block_id(block_hash.into())?.unwrap(),
             receipts.get(block_number as usize).unwrap().clone()
         );
 
@@ -2230,8 +3143,12 @@ mod tests {
     #[test]
     fn test_receipt_provider_id_ext_receipts_by_block_number_or_tag() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, receipts) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, database_blocks, in_memory_blocks, receipts) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams { tx_count: 1..3, ..Default::default() },
+        )?;
 
         let database_block = database_blocks.first().unwrap().clone();
 
@@ -2240,20 +3157,26 @@ mod tests {
         let safe_block = in_memory_blocks.get(in_memory_block_count - 2).unwrap().clone();
         let finalized_block = in_memory_blocks.get(in_memory_block_count - 3).unwrap().clone();
 
+        assert!(!receipts.get(database_block.number as usize).unwrap().is_empty());
+        assert!(!provider
+            .receipts_by_number_or_tag(database_block.number.into())?
+            .unwrap()
+            .is_empty());
+
         assert_eq!(
-            provider.receipts_by_number_or_tag(database_block.number.into())?.unwrap_or_default(),
+            provider.receipts_by_number_or_tag(database_block.number.into())?.unwrap(),
             receipts.get(database_block.number as usize).unwrap().clone()
         );
         assert_eq!(
-            provider.receipts_by_number_or_tag(BlockNumberOrTag::Latest)?.unwrap_or_default(),
+            provider.receipts_by_number_or_tag(BlockNumberOrTag::Latest)?.unwrap(),
             receipts.get(canonical_block.number as usize).unwrap().clone()
         );
         assert_eq!(
-            provider.receipts_by_number_or_tag(BlockNumberOrTag::Safe)?.unwrap_or_default(),
+            provider.receipts_by_number_or_tag(BlockNumberOrTag::Safe)?.unwrap(),
             receipts.get(safe_block.number as usize).unwrap().clone()
         );
         assert_eq!(
-            provider.receipts_by_number_or_tag(BlockNumberOrTag::Finalized)?.unwrap_or_default(),
+            provider.receipts_by_number_or_tag(BlockNumberOrTag::Finalized)?.unwrap(),
             receipts.get(finalized_block.number as usize).unwrap().clone()
         );
 
@@ -2265,7 +3188,7 @@ mod tests {
         let mut rng = generators::rng();
 
         let (database_blocks, in_memory_blocks) =
-            random_blocks(&mut rng, TEST_BLOCKS_COUNT, 1, None);
+            random_blocks(&mut rng, TEST_BLOCKS_COUNT, 1, None, None, 0..1);
 
         let first_database_block = database_blocks.first().map(|block| block.number).unwrap();
         let last_database_block = database_blocks.last().map(|block| block.number).unwrap();
@@ -2386,7 +3309,7 @@ mod tests {
                 chain_spec.clone(),
                 TEST_BLOCKS_COUNT,
                 TEST_BLOCKS_COUNT,
-                Some(1..2),
+                BlockRangeParams { requests_count: Some(1..2), ..Default::default() },
             )?;
 
         let database_block = database_blocks.first().unwrap().clone();
@@ -2410,8 +3333,12 @@ mod tests {
     #[test]
     fn test_canon_state_tracker() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, _, _, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, _, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         let before = Instant::now();
         provider.on_forkchoice_update_received(&Default::default());
@@ -2436,8 +3363,12 @@ mod tests {
     fn test_block_id_reader() -> eyre::Result<()> {
         // Create a new provider
         let mut rng = generators::rng();
-        let (provider, _, in_memory_blocks, _) =
-            provider_with_random_blocks(&mut rng, TEST_BLOCKS_COUNT, TEST_BLOCKS_COUNT, None)?;
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
 
         // Set the pending block in memory
         let pending_block = in_memory_blocks.last().unwrap();
@@ -2473,6 +3404,659 @@ mod tests {
         assert_eq!(
             provider.finalized_block_num_hash()?,
             Some(BlockNumHash { number: finalized_block.number, hash: finalized_block.hash() })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_id() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // Database
+        // Choose a random transaction from the database blocks
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Ensure the transaction ID can be found in the database
+        let result = provider.transaction_id(tx_hash)?;
+        assert_eq!(result, Some(0));
+
+        // In memory
+        // Choose a random transaction from the in-memory blocks
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Ensure the transaction ID can be found in the in-memory state
+        let result = provider.transaction_id(tx_hash)?;
+        assert!(result.is_some(), "Transaction ID should be found in the in-memory state");
+
+        // Check that the transaction ID is greater than the last database transaction ID
+        let last_db_tx_id = provider.database.last_block_number()?;
+        let last_db_tx_id =
+            provider.database.block_body_indices(last_db_tx_id)?.unwrap().last_tx_num();
+
+        assert!(
+            result.unwrap() > last_db_tx_id,
+            "In-memory transaction ID should be greater than the last database transaction ID"
+        );
+        assert_eq!(result, Some(last_db_tx_id + 1));
+
+        // Generate a random hash not present in any transaction
+        let random_tx_hash = B256::random();
+
+        // Ensure the transaction ID is not found
+        let result = provider.transaction_id(random_tx_hash)?;
+        assert!(result.is_none(), "Transaction ID should not be found");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_by_id() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction ID from in-memory blocks
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Ensure the transaction can be retrieved by its ID
+        let result = provider.transaction_by_id(tx_id)?;
+        assert_eq!(
+            result.unwrap(),
+            *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+
+        // Database
+        // Choose a random transaction ID from the database blocks
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Ensure the transaction can be retrieved by its ID
+        let result = provider.transaction_by_id(tx_id)?;
+        assert!(result.is_some(), "Transaction should be found in the database");
+        assert_eq!(
+            result.unwrap(),
+            *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+
+        // Generate a random transaction ID not present in any block
+        let random_tx_id = 999999;
+
+        // Ensure the transaction is not found
+        let result = provider.transaction_by_id(random_tx_id)?;
+        assert!(result.is_none(), "Transaction should not be found");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_by_id_no_hash() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction ID from in-memory blocks
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Ensure the transaction can be retrieved by its ID without hash
+        let result = provider.transaction_by_id_no_hash(tx_id)?;
+        let expected_tx: TransactionSignedNoHash = tx.clone().into();
+        assert_eq!(
+            result.unwrap(),
+            expected_tx,
+            "The retrieved transaction without hash should match the expected transaction"
+        );
+
+        // Database
+        // Choose a random transaction ID from the database blocks
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Ensure the transaction can be retrieved by its ID without hash
+        let result = provider.transaction_by_id_no_hash(tx_id)?;
+        let expected_tx: TransactionSignedNoHash = tx.clone().into();
+        assert_eq!(
+            result.unwrap(),
+            expected_tx,
+            "The retrieved transaction without hash should match the expected transaction"
+        );
+
+        // Generate a random transaction ID not present in any block
+        let random_tx_id = 7656898;
+
+        // Ensure the transaction is not found without hash
+        let result = provider.transaction_by_id_no_hash(random_tx_id)?;
+        assert!(result.is_none(), "Transaction should not be found without hash");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_by_hash() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction hash from the in-memory blocks
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Ensure the transaction can be retrieved by its hash from the in-memory state
+        let result = provider.transaction_by_hash(tx_hash)?;
+        assert_eq!(
+            result.unwrap(),
+            *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+
+        // Database
+        // Choose a random transaction hash from the database blocks
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Ensure the transaction can be retrieved by its hash from the database
+        let result = provider.transaction_by_hash(tx_hash)?;
+        assert_eq!(
+            result.unwrap(),
+            *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+
+        // Generate a random hash not present in any transaction
+        let random_tx_hash = B256::random();
+
+        // Ensure the transaction is not found by the random hash
+        let result = provider.transaction_by_hash(random_tx_hash)?;
+        assert!(result.is_none(), "Transaction should not be found");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_by_hash_with_meta() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction from the in-memory block
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Create the expected metadata for this transaction
+        let meta = TransactionMeta {
+            tx_hash,
+            index: 0,
+            block_hash: in_memory_blocks[0].header.hash(),
+            block_number: in_memory_blocks[0].header.number,
+            base_fee: in_memory_blocks[0].header.base_fee_per_gas,
+            excess_blob_gas: None,
+            timestamp: in_memory_blocks[0].header.timestamp,
+        };
+
+        // Ensure the transaction and its metadata can be retrieved from the in-memory state
+        let result = provider.transaction_by_hash_with_meta(tx_hash)?;
+        let (retrieved_tx, retrieved_meta) = result.unwrap();
+        assert_eq!(
+            retrieved_tx, *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+        assert_eq!(
+            retrieved_meta, meta,
+            "The retrieved metadata should match the expected metadata"
+        );
+
+        // Database
+        // Choose a random transaction from the database blocks
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Create the expected metadata for this transaction
+        let meta = TransactionMeta {
+            tx_hash,
+            index: 0,
+            block_hash: database_blocks[0].header.hash(),
+            block_number: database_blocks[0].header.number,
+            base_fee: database_blocks[0].header.base_fee_per_gas,
+            excess_blob_gas: None,
+            timestamp: database_blocks[0].header.timestamp,
+        };
+
+        // Ensure the transaction and its metadata can be retrieved from the database
+        let result = provider.transaction_by_hash_with_meta(tx_hash)?;
+        let (retrieved_tx, retrieved_meta) = result.unwrap();
+        assert_eq!(
+            retrieved_tx, *tx,
+            "The retrieved transaction should match the expected transaction"
+        );
+        assert_eq!(
+            retrieved_meta, meta,
+            "The retrieved metadata should match the expected metadata"
+        );
+
+        // Generate a random hash not present in any transaction
+        let random_tx_hash = B256::random();
+
+        // Ensure the transaction with metadata is not found by the random hash
+        let result = provider.transaction_by_hash_with_meta(random_tx_hash)?;
+        assert!(result.is_none(), "Transaction with metadata should not be found");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_block() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction ID from in-memory blocks
+        let tx = &in_memory_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Retrieve the block number for this transaction
+        let result = provider.transaction_block(tx_id)?;
+        let block_number = result.unwrap();
+
+        // Ensure the block number matches the expected block number
+        assert_eq!(
+            block_number, in_memory_blocks[0].header.number,
+            "The block number should match the in-memory block number"
+        );
+
+        // Database
+        // Choose a random transaction from the database block
+        let tx = &database_blocks[0].body[0];
+        let tx_hash = tx.hash();
+
+        // Fetch the transaction ID
+        let tx_id = provider.transaction_id(tx_hash)?.unwrap();
+
+        // Retrieve the block number for this transaction
+        let result = provider.transaction_block(tx_id)?;
+        assert!(
+            result.is_none(),
+            "`block_state_by_tx_id` should be None if the block is in database"
+        );
+
+        // Ensure that invalid transaction ID returns None
+        let result = provider.transaction_block(67675657)?;
+
+        assert!(result.is_none(), "Block number should not be found for an invalid transaction ID");
+
+        Ok(())
+    }
+
+    #[test]
+    fn transactions_found_by_block_hash() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random block hash from in-memory blocks
+        let block_hash = in_memory_blocks[0].header.hash();
+
+        // Retrieve the transactions for this block using the block hash
+        let result = provider.transactions_by_block(BlockHashOrNumber::Hash(block_hash))?;
+        let transactions = result.unwrap();
+
+        // Ensure the transactions match the expected transactions in the block
+        assert_eq!(
+            transactions, in_memory_blocks[0].body,
+            "The transactions should match the in-memory block transactions"
+        );
+
+        // Database
+        // Choose a random block hash from the database blocks
+        let block_hash = database_blocks[0].header.hash();
+
+        // Retrieve the transactions for this block using the block hash
+        let result = provider.transactions_by_block(BlockHashOrNumber::Hash(block_hash))?;
+        let transactions = result.unwrap();
+
+        // Ensure the transactions match the expected transactions in the block
+        assert_eq!(
+            transactions, database_blocks[0].body,
+            "The transactions should match the database block transactions"
+        );
+
+        // Generate a random block hash that does not exist
+        let random_block_hash = B256::random();
+
+        // Try to retrieve transactions for a non-existent block hash
+        let result = provider.transactions_by_block(BlockHashOrNumber::Hash(random_block_hash))?;
+
+        // Ensure no transactions are found
+        assert!(result.is_none(), "No transactions should be found for a non-existent block hash");
+
+        Ok(())
+    }
+
+    #[test]
+    fn transactions_found_by_block_number() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random block number from in-memory blocks
+        let block_number = in_memory_blocks[0].header.number;
+
+        // Retrieve the transactions for this block using the block number
+        let result = provider.transactions_by_block(BlockHashOrNumber::Number(block_number))?;
+        let transactions = result.unwrap();
+
+        // Ensure the transactions match the expected transactions in the block
+        assert_eq!(
+            transactions, in_memory_blocks[0].body,
+            "The transactions should match the in-memory block transactions"
+        );
+
+        // Database
+        // Choose a random block number from the database blocks
+        let block_number = database_blocks[0].header.number;
+
+        // Retrieve the transactions for this block using the block number
+        let result = provider.transactions_by_block(BlockHashOrNumber::Number(block_number))?;
+        let transactions = result.unwrap();
+
+        // Ensure the transactions match the expected transactions in the block
+        assert_eq!(
+            transactions, database_blocks[0].body,
+            "The transactions should match the database block transactions"
+        );
+
+        // Generate a block number that is out of range (non-existent)
+        let non_existent_block_number = u64::MAX;
+
+        // Try to retrieve transactions for a non-existent block number
+        let result =
+            provider.transactions_by_block(BlockHashOrNumber::Number(non_existent_block_number))?;
+
+        // Ensure no transactions are found
+        assert!(
+            result.is_none(),
+            "No transactions should be found for a non-existent block number"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn transactions_found_entirely_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Define a block range entirely within in-memory blocks
+        let start_block = in_memory_blocks[0].header.number;
+        let end_block = in_memory_blocks[1].header.number;
+
+        // Retrieve the transactions for this block range
+        let result = provider.transactions_by_block_range(start_block..=end_block)?;
+
+        // Ensure the transactions match the expected transactions in the in-memory blocks
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], in_memory_blocks[0].body);
+        assert_eq!(result[1], in_memory_blocks[1].body);
+
+        // Database
+        // Define a block range entirely within database blocks
+        let start_block = database_blocks[0].header.number;
+        let end_block = database_blocks[1].header.number;
+
+        // Retrieve the transactions for this block range
+        let result = provider.transactions_by_block_range(start_block..=end_block)?;
+
+        // Ensure the transactions match the expected transactions in the database blocks
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], database_blocks[0].body);
+        assert_eq!(result[1], database_blocks[1].body);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transactions_by_tx_range() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            0,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // Define a valid transaction range within the database
+        let start_tx_num = 0;
+        let end_tx_num = 1;
+
+        // Retrieve the transactions for this transaction number range
+        let result = provider.transactions_by_tx_range(start_tx_num..=end_tx_num)?;
+
+        // Ensure the transactions match the expected transactions in the database
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], database_blocks[0].body[0].clone().into());
+        assert_eq!(result[1], database_blocks[0].body[1].clone().into());
+
+        // Define an empty range that should return no transactions
+        let start_tx_num = u64::MAX;
+        let end_tx_num = u64::MAX;
+
+        // Retrieve the transactions for this range
+        let result = provider.transactions_by_tx_range(start_tx_num..end_tx_num)?;
+
+        // Ensure no transactions are returned
+        assert!(
+            result.is_empty(),
+            "No transactions should be found for an empty transaction range"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_senders_by_tx_range() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, _, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            0,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // Define a valid transaction range within the database
+        let start_tx_num = 0;
+        let end_tx_num = 1;
+
+        // Retrieve the senders for this transaction number range
+        let result = provider.senders_by_tx_range(start_tx_num..=end_tx_num)?;
+
+        // Ensure the sender addresses match the expected addresses in the database
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            database_blocks[0].senders().unwrap()[0],
+            "The sender address should match the expected sender address"
+        );
+        assert_eq!(
+            result[1],
+            database_blocks[0].senders().unwrap()[1],
+            "The sender address should match the expected sender address"
+        );
+
+        // Define an empty range that should return no sender addresses
+        let start_tx_num = u64::MAX;
+        let end_tx_num = u64::MAX;
+
+        // Retrieve the senders for this range
+        let result = provider.senders_by_tx_range(start_tx_num..end_tx_num)?;
+
+        // Ensure no sender addresses are returned
+        assert!(
+            result.is_empty(),
+            "No sender addresses should be found for an empty transaction range"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_sender_found_in_memory() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams {
+                tx_count: TEST_TRANSACTIONS_COUNT..TEST_TRANSACTIONS_COUNT,
+                ..Default::default()
+            },
+        )?;
+
+        // In memory
+        // Choose a random transaction from the in-memory block
+        let tx = &in_memory_blocks[0].body[0];
+
+        // Retrieve the transaction ID
+        let tx_id = provider.transaction_id(tx.hash())?.unwrap();
+
+        // Retrieve the sender address for this transaction
+        let result = provider.transaction_sender(tx_id)?;
+
+        // Ensure the sender address matches the expected sender address
+        let expected_sender = tx.recover_signer().unwrap();
+        assert_eq!(
+            result,
+            Some(expected_sender),
+            "The sender address should match the expected sender address"
+        );
+
+        // Database
+        // Choose a random transaction from the database block
+        let tx = &database_blocks[0].body[0];
+
+        // Retrieve the transaction ID
+        let tx_id = provider.transaction_id(tx.hash())?.unwrap();
+
+        // Retrieve the sender address for this transaction
+        let result = provider.transaction_sender(tx_id)?;
+
+        // Ensure the sender address matches the expected sender address
+        let expected_sender = tx.recover_signer().unwrap();
+        assert_eq!(
+            result,
+            Some(expected_sender),
+            "The sender address should match the expected sender address"
+        );
+
+        // Generate a random transaction ID that does not exist
+        let invalid_tx_id = u64::MAX;
+
+        // Attempt to retrieve the sender address for this invalid transaction ID
+        let result = provider.transaction_sender(invalid_tx_id)?;
+
+        // Ensure no sender address is found
+        assert!(
+            result.is_none(),
+            "No sender address should be found for an invalid transaction ID"
         );
 
         Ok(())

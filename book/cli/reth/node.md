@@ -213,6 +213,11 @@ Networking:
 
           [default: 131072]
 
+      --max-tx-pending-fetch <COUNT>
+          Max capacity of cache of hashes for transactions pending fetch.
+
+          [default: 25600]
+
 RPC:
       --http
           Enable the HTTP-RPC server
@@ -230,7 +235,7 @@ RPC:
       --http.api <HTTP_API>
           Rpc Modules to be configured for the HTTP server
 
-          [possible values: admin, debug, eth, net, trace, txpool, web3, rpc, reth, ots, eth-call-bundle]
+          [possible values: admin, debug, eth, net, trace, txpool, web3, rpc, reth, ots]
 
       --http.corsdomain <HTTP_CORSDOMAIN>
           Http Corsdomain to allow request from
@@ -254,7 +259,7 @@ RPC:
       --ws.api <WS_API>
           Rpc Modules to be configured for the WS server
 
-          [possible values: admin, debug, eth, net, trace, txpool, web3, rpc, reth, ots, eth-call-bundle]
+          [possible values: admin, debug, eth, net, trace, txpool, web3, rpc, reth, ots]
 
       --ipcdisable
           Disable the IPC-RPC server
@@ -522,8 +527,18 @@ Debug:
       --debug.reorg-frequency <REORG_FREQUENCY>
           If provided, the chain will be reorged at specified frequency
 
+      --debug.reorg-depth <REORG_DEPTH>
+          The reorg depth for chain reorgs
+
       --debug.engine-api-store <PATH>
           The path to store engine API messages at. If specified, all of the intercepted engine API messages will be written to specified location
+
+      --debug.invalid-block-hook <INVALID_BLOCK_HOOK>
+          Determines which type of bad block hook to install
+
+          Example: `witness,prestate`
+
+          [possible values: witness, pre-state, opcode]
 
 Database:
       --db.log-level <LOG_LEVEL>
