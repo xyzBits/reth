@@ -8,7 +8,10 @@ use reth::{
     args::{DiscoveryArgs, NetworkArgs, RpcServerArgs},
     builder::{NodeBuilder, NodeConfig, NodeHandle},
     network::PeersHandleProvider,
-    rpc::api::eth::{helpers::AddDevSigners, FullEthApiServer},
+    rpc::{
+        api::eth::{helpers::AddDevSigners, FullEthApiServer},
+        types::AnyTransactionReceipt,
+    },
     tasks::TaskManager,
 };
 use reth_chainspec::ChainSpec;
@@ -62,6 +65,7 @@ where
         EthApi: FullEthApiServer<
             NetworkTypes: Network<
                 TransactionResponse = reth_rpc_types::WithOtherFields<reth_rpc_types::Transaction>,
+                ReceiptResponse = AnyTransactionReceipt,
             >,
         > + AddDevSigners
                     + EthApiBuilderProvider<Adapter<N>>,
@@ -117,8 +121,10 @@ where
 // Type aliases
 
 type TmpDB = Arc<TempDatabase<DatabaseEnv>>;
-type TmpNodeAdapter<N> =
-    FullNodeTypesAdapter<NodeTypesWithDBAdapter<N, TmpDB>, BlockchainProvider<TmpDB>>;
+type TmpNodeAdapter<N> = FullNodeTypesAdapter<
+    NodeTypesWithDBAdapter<N, TmpDB>,
+    BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>,
+>;
 
 type Adapter<N> = NodeAdapter<
     RethFullAdapter<TmpDB, N>,

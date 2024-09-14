@@ -30,7 +30,10 @@ use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
     node_config::NodeConfig,
     primitives::Head,
-    rpc::eth::{helpers::AddDevSigners, FullEthApiServer},
+    rpc::{
+        eth::{helpers::AddDevSigners, FullEthApiServer},
+        types::AnyTransactionReceipt,
+    },
 };
 use reth_primitives::revm_primitives::EnvKzgSettings;
 use reth_provider::{providers::BlockchainProvider, ChainSpecProvider, FullProvider};
@@ -49,8 +52,10 @@ use crate::{
 
 /// The adapter type for a reth node with the builtin provider type
 // Note: we need to hardcode this because custom components might depend on it in associated types.
-pub type RethFullAdapter<DB, Types> =
-    FullNodeTypesAdapter<NodeTypesWithDBAdapter<Types, DB>, BlockchainProvider<DB>>;
+pub type RethFullAdapter<DB, Types> = FullNodeTypesAdapter<
+    NodeTypesWithDBAdapter<Types, DB>,
+    BlockchainProvider<NodeTypesWithDBAdapter<Types, DB>>,
+>;
 
 #[allow(clippy::doc_markdown)]
 #[cfg_attr(doc, aquamarine::aquamarine)]
@@ -339,6 +344,7 @@ where
                         + FullEthApiServer<
                             NetworkTypes: alloy_network::Network<
                                 TransactionResponse = WithOtherFields<reth_rpc_types::Transaction>,
+                                ReceiptResponse = AnyTransactionReceipt,
                             >,
                         >
                         + AddDevSigners
@@ -489,6 +495,7 @@ where
                     + FullEthApiServer<
             NetworkTypes: alloy_network::Network<
                 TransactionResponse = WithOtherFields<reth_rpc_types::Transaction>,
+                ReceiptResponse = AnyTransactionReceipt,
             >,
         > + AddDevSigners,
     >,

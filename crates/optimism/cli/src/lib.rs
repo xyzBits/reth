@@ -46,6 +46,7 @@ use reth_node_core::{
     args::LogArgs,
     version::{LONG_VERSION, SHORT_VERSION},
 };
+use reth_node_optimism::OptimismNode;
 use reth_tracing::FileWorkerGuard;
 use tracing::info;
 
@@ -54,10 +55,13 @@ use tracing::info;
 /// This is the entrypoint to the executable.
 #[derive(Debug, Parser)]
 #[command(author, version = SHORT_VERSION, long_version = LONG_VERSION, about = "Reth", long_about = None)]
-pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
+pub struct Cli<
+    Spec: ChainSpecParser<ChainSpec = ChainSpec> = OpChainSpecParser,
+    Ext: clap::Args + fmt::Debug = NoArgs,
+> {
     /// The command to run
     #[command(subcommand)]
-    command: Commands<Ext>,
+    command: Commands<Spec, Ext>,
 
     /// The chain this node is running.
     ///
@@ -65,12 +69,12 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(
         long,
         value_name = "CHAIN_OR_PATH",
-        long_help = OpChainSpecParser::help_messge(),
-        default_value = OpChainSpecParser::SUPPORTED_CHAINS[0],
-        value_parser = OpChainSpecParser::parser(),
+        long_help = Spec::help_message(),
+        default_value = Spec::SUPPORTED_CHAINS[0],
+        value_parser = Spec::parser(),
         global = true,
     )]
-    chain: Arc<ChainSpec>,
+    chain: Arc<Spec::ChainSpec>,
 
     /// Add a new instance of a node.
     ///
@@ -108,7 +112,11 @@ impl Cli {
     }
 }
 
-impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
+impl<Spec, Ext> Cli<Spec, Ext>
+where
+    Spec: ChainSpecParser<ChainSpec = ChainSpec>,
+    Ext: clap::Args + fmt::Debug,
+{
     /// Execute the configured cli command.
     ///
     /// This accepts a closure that is used to launch the node via the
@@ -130,20 +138,31 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
             Commands::Node(command) => {
                 runner.run_command_until_exit(|ctx| command.execute(ctx, launcher))
             }
-            Commands::Init(command) => runner.run_blocking_until_ctrl_c(command.execute()),
-            Commands::InitState(command) => runner.run_blocking_until_ctrl_c(command.execute()),
-            Commands::ImportOp(command) => runner.run_blocking_until_ctrl_c(command.execute()),
+            Commands::Init(command) => {
+                runner.run_blocking_until_ctrl_c(command.execute::<OptimismNode>())
+            }
+            Commands::InitState(command) => {
+                runner.run_blocking_until_ctrl_c(command.execute::<OptimismNode>())
+            }
+            Commands::ImportOp(command) => {
+                runner.run_blocking_until_ctrl_c(command.execute::<OptimismNode>())
+            }
             Commands::ImportReceiptsOp(command) => {
-                runner.run_blocking_until_ctrl_c(command.execute())
+                runner.run_blocking_until_ctrl_c(command.execute::<OptimismNode>())
             }
             Commands::DumpGenesis(command) => runner.run_blocking_until_ctrl_c(command.execute()),
-            Commands::Db(command) => runner.run_blocking_until_ctrl_c(command.execute()),
-            Commands::Stage(command) => runner
-                .run_command_until_exit(|ctx| command.execute(ctx, OpExecutorProvider::optimism)),
+            Commands::Db(command) => {
+                runner.run_blocking_until_ctrl_c(command.execute::<OptimismNode>())
+            }
+            Commands::Stage(command) => runner.run_command_until_exit(|ctx| {
+                command.execute::<OptimismNode, _, _>(ctx, OpExecutorProvider::optimism)
+            }),
             Commands::P2P(command) => runner.run_until_ctrl_c(command.execute()),
             Commands::Config(command) => runner.run_until_ctrl_c(command.execute()),
-            Commands::Recover(command) => runner.run_command_until_exit(|ctx| command.execute(ctx)),
-            Commands::Prune(command) => runner.run_until_ctrl_c(command.execute()),
+            Commands::Recover(command) => {
+                runner.run_command_until_exit(|ctx| command.execute::<OptimismNode>(ctx))
+            }
+            Commands::Prune(command) => runner.run_until_ctrl_c(command.execute::<OptimismNode>()),
         }
     }
 

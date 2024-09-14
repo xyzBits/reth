@@ -10,6 +10,7 @@ use reth_db_common::{
     init::{insert_genesis_header, insert_genesis_history, insert_genesis_state},
     DbTool,
 };
+use reth_node_builder::NodeTypesWithEngine;
 use reth_node_core::args::StageEnum;
 use reth_provider::{writer::UnifiedStorageWriter, StaticFileProviderFactory};
 use reth_stages::StageId;
@@ -26,8 +27,10 @@ pub struct Command<C: ChainSpecParser> {
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     /// Execute `db` command
-    pub async fn execute(self) -> eyre::Result<()> {
-        let Environment { provider_factory, .. } = self.env.init(AccessRights::RW)?;
+    pub async fn execute<N: NodeTypesWithEngine<ChainSpec = C::ChainSpec>>(
+        self,
+    ) -> eyre::Result<()> {
+        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
 
         let static_file_provider = provider_factory.static_file_provider();
 
@@ -70,7 +73,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     StageId::Headers.to_string(),
                     Default::default(),
                 )?;
-                insert_genesis_header(&provider_rw, &static_file_provider, self.env.chain)?;
+                insert_genesis_header(&provider_rw, &static_file_provider, &self.env.chain)?;
             }
             StageEnum::Bodies => {
                 tx.clear::<tables::BlockBodyIndices>()?;
@@ -83,7 +86,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     StageId::Bodies.to_string(),
                     Default::default(),
                 )?;
-                insert_genesis_header(&provider_rw, &static_file_provider, self.env.chain)?;
+                insert_genesis_header(&provider_rw, &static_file_provider, &self.env.chain)?;
             }
             StageEnum::Senders => {
                 tx.clear::<tables::TransactionSenders>()?;
@@ -104,7 +107,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     Default::default(),
                 )?;
                 let alloc = &self.env.chain.genesis().alloc;
-                insert_genesis_state(&provider_rw, alloc.len(), alloc.iter())?;
+                insert_genesis_state(&provider_rw, alloc.iter())?;
             }
             StageEnum::AccountHashing => {
                 tx.clear::<tables::HashedAccounts>()?;
@@ -170,7 +173,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     StageId::TransactionLookup.to_string(),
                     Default::default(),
                 )?;
-                insert_genesis_header(&provider_rw, &static_file_provider, self.env.chain)?;
+                insert_genesis_header(&provider_rw, &static_file_provider, &self.env.chain)?;
             }
         }
 

@@ -12,11 +12,14 @@ use futures_util::FutureExt;
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_consensus::test_utils::TestConsensus;
-use reth_db::{test_utils::TempDatabase, DatabaseEnv};
+use reth_db::{
+    test_utils::{create_test_rw_db, create_test_static_files_dir, TempDatabase},
+    DatabaseEnv,
+};
 use reth_db_common::init::init_genesis;
 use reth_evm::test_utils::MockExecutorProvider;
 use reth_execution_types::Chain;
-use reth_exex::{ExExContext, ExExEvent, ExExNotification};
+use reth_exex::{ExExContext, ExExEvent, ExExNotification, ExExNotifications};
 use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
 use reth_node_api::{
     FullNodeTypes, FullNodeTypesAdapter, NodeTypes, NodeTypesWithDBAdapter, NodeTypesWithEngine,
@@ -36,7 +39,7 @@ use reth_node_ethereum::{
 use reth_payload_builder::noop::NoopPayloadBuilderService;
 use reth_primitives::{Head, SealedBlockWithSenders};
 use reth_provider::{
-    providers::BlockchainProvider, test_utils::create_test_provider_factory_with_chain_spec,
+    providers::{BlockchainProvider, StaticFileProvider},
     BlockReader, ProviderFactory,
 };
 use reth_tasks::TaskManager;
@@ -73,16 +76,16 @@ pub struct TestExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for TestExecutorBuilder
 where
-    Node: FullNodeTypes,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec>>,
 {
     type EVM = EthEvmConfig;
     type Executor = MockExecutorProvider;
 
     async fn build_evm(
         self,
-        _ctx: &BuilderContext<Node>,
+        ctx: &BuilderContext<Node>,
     ) -> eyre::Result<(Self::EVM, Self::Executor)> {
-        let evm_config = EthEvmConfig::default();
+        let evm_config = EthEvmConfig::new(ctx.chain_spec());
         let executor = MockExecutorProvider::default();
 
         Ok((evm_config, executor))
@@ -151,7 +154,10 @@ pub type TmpDB = Arc<TempDatabase<DatabaseEnv>>;
 pub type Adapter = NodeAdapter<
     RethFullAdapter<TmpDB, TestNode>,
     <<TestNode as Node<
-        FullNodeTypesAdapter<NodeTypesWithDBAdapter<TestNode, TmpDB>, BlockchainProvider<TmpDB>>,
+        FullNodeTypesAdapter<
+            NodeTypesWithDBAdapter<TestNode, TmpDB>,
+            BlockchainProvider<NodeTypesWithDBAdapter<TestNode, TmpDB>>,
+        >,
     >>::ComponentsBuilder as NodeComponentsBuilder<RethFullAdapter<TmpDB, TestNode>>>::Components,
 >;
 /// An [`ExExContext`] using the [`Adapter`] type.
@@ -163,7 +169,7 @@ pub struct TestExExHandle {
     /// Genesis block that was inserted into the storage
     pub genesis: SealedBlockWithSenders,
     /// Provider Factory for accessing the emphemeral storage of the host node
-    pub provider_factory: ProviderFactory<TmpDB>,
+    pub provider_factory: ProviderFactory<NodeTypesWithDBAdapter<TestNode, TmpDB>>,
     /// Channel for receiving events from the Execution Extension
     pub events_rx: UnboundedReceiver<ExExEvent>,
     /// Channel for sending notifications to the Execution Extension
@@ -232,12 +238,19 @@ pub async fn test_exex_context_with_chain_spec(
     chain_spec: Arc<ChainSpec>,
 ) -> eyre::Result<(ExExContext<Adapter>, TestExExHandle)> {
     let transaction_pool = testing_pool();
-    let evm_config = EthEvmConfig::default();
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
     let executor = MockExecutorProvider::default();
     let consensus = Arc::new(TestConsensus::default());
 
-    let provider_factory = create_test_provider_factory_with_chain_spec(chain_spec);
-    let genesis_hash = init_genesis(provider_factory.clone())?;
+    let (static_dir, _) = create_test_static_files_dir();
+    let db = create_test_rw_db();
+    let provider_factory = ProviderFactory::new(
+        db,
+        chain_spec,
+        StaticFileProvider::read_write(static_dir.into_path()).expect("static file provider"),
+    );
+
+    let genesis_hash = init_genesis(&provider_factory)?;
     let provider =
         BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
 
@@ -283,13 +296,14 @@ pub async fn test_exex_context_with_chain_spec(
 
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (notifications_tx, notifications_rx) = tokio::sync::mpsc::channel(1);
+    let notifications = ExExNotifications::new(components.clone(), notifications_rx);
 
     let ctx = ExExContext {
         head,
         config: NodeConfig::test(),
         reth_config: reth_config::Config::default(),
         events: events_tx,
-        notifications: notifications_rx,
+        notifications,
         components,
     };
 
