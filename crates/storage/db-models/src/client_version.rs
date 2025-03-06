@@ -1,12 +1,12 @@
 //! Client version model.
 
-use reth_codecs::{add_arbitrary_tests, Compact};
+use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
 /// Client version that accessed the database.
 #[derive(Clone, Eq, PartialEq, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
-#[add_arbitrary_tests(compact)]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
 pub struct ClientVersion {
     /// Client version
     pub version: String,
@@ -23,25 +23,22 @@ impl ClientVersion {
     }
 }
 
-impl Compact for ClientVersion {
+#[cfg(feature = "reth-codec")]
+impl reth_codecs::Compact for ClientVersion {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
     {
-        self.version.as_bytes().to_compact(buf);
-        self.git_sha.as_bytes().to_compact(buf);
-        self.build_timestamp.as_bytes().to_compact(buf)
+        self.version.to_compact(buf);
+        self.git_sha.to_compact(buf);
+        self.build_timestamp.to_compact(buf)
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let (version, buf) = Vec::<u8>::from_compact(buf, len);
-        let (git_sha, buf) = Vec::<u8>::from_compact(buf, len);
-        let (build_timestamp, buf) = Vec::<u8>::from_compact(buf, len);
-        let client_version = Self {
-            version: unsafe { String::from_utf8_unchecked(version) },
-            git_sha: unsafe { String::from_utf8_unchecked(git_sha) },
-            build_timestamp: unsafe { String::from_utf8_unchecked(build_timestamp) },
-        };
+        let (version, buf) = String::from_compact(buf, len);
+        let (git_sha, buf) = String::from_compact(buf, len);
+        let (build_timestamp, buf) = String::from_compact(buf, len);
+        let client_version = Self { version, git_sha, build_timestamp };
         (client_version, buf)
     }
 }

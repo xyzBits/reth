@@ -1,40 +1,36 @@
-use alloy_primitives::U256;
-use reth_primitives::Request;
-use revm::db::BundleState;
+use alloc::vec::Vec;
+use alloy_eips::eip7685::Requests;
+use revm_database::BundleState;
 
-/// A helper type for ethereum block inputs that consists of a block and the total difficulty.
-#[derive(Debug)]
-pub struct BlockExecutionInput<'a, Block> {
-    /// The block to execute.
-    pub block: &'a Block,
-    /// The total difficulty of the block.
-    pub total_difficulty: U256,
-}
-
-impl<'a, Block> BlockExecutionInput<'a, Block> {
-    /// Creates a new input.
-    pub const fn new(block: &'a Block, total_difficulty: U256) -> Self {
-        Self { block, total_difficulty }
-    }
-}
-
-impl<'a, Block> From<(&'a Block, U256)> for BlockExecutionInput<'a, Block> {
-    fn from((block, total_difficulty): (&'a Block, U256)) -> Self {
-        Self::new(block, total_difficulty)
-    }
-}
-
-/// The output of an ethereum block.
-///
-/// Contains the state changes, transaction receipts, and total gas used in the block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockExecutionOutput<T> {
-    /// The changed state of the block after execution.
-    pub state: BundleState,
+/// The result of executing a block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockExecutionResult<T> {
     /// All the receipts of the transactions in the block.
     pub receipts: Vec<T>,
-    /// All the EIP-7685 requests of the transactions in the block.
-    pub requests: Vec<Request>,
+    /// All the EIP-7685 requests in the block.
+    pub requests: Requests,
     /// The total gas used by the block.
     pub gas_used: u64,
+}
+
+/// [`BlockExecutionResult`] combined with state.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    derive_more::AsRef,
+    derive_more::AsMut,
+    derive_more::Deref,
+    derive_more::DerefMut,
+)]
+pub struct BlockExecutionOutput<T> {
+    /// All the receipts of the transactions in the block.
+    #[as_ref]
+    #[as_mut]
+    #[deref]
+    #[deref_mut]
+    pub result: BlockExecutionResult<T>,
+    /// The changed state of the block after execution.
+    pub state: BundleState,
 }

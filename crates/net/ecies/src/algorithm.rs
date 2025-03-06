@@ -421,7 +421,7 @@ impl ECIES {
 
         let mut sig_bytes = [0u8; 65];
         sig_bytes[..64].copy_from_slice(&sig);
-        sig_bytes[64] = rec_id.to_i32() as u8;
+        sig_bytes[64] = i32::from(rec_id) as u8;
 
         let id = pk2id(&self.public_key);
 
@@ -479,7 +479,7 @@ impl ECIES {
         let sigdata = data.get_next::<[u8; 65]>()?.ok_or(ECIESErrorImpl::InvalidAuthData)?;
         let signature = RecoverableSignature::from_compact(
             &sigdata[..64],
-            RecoveryId::from_i32(sigdata[64] as i32)?,
+            RecoveryId::try_from(sigdata[64] as i32)?,
         )?;
         let remote_id = data.get_next()?.ok_or(ECIESErrorImpl::InvalidAuthData)?;
         self.remote_id = Some(remote_id);
@@ -650,6 +650,8 @@ impl ECIES {
         out.extend_from_slice(tag.as_slice());
     }
 
+    /// Reads the `RLPx` header from the slice, setting up the MAC and AES, returning the body
+    /// size contained in the header.
     pub fn read_header(&mut self, data: &mut [u8]) -> Result<usize, ECIESError> {
         // If the data is not large enough to fit the header and mac bytes, return an error
         //
@@ -677,7 +679,7 @@ impl ECIES {
 
         self.body_size = Some(body_size);
 
-        Ok(self.body_size.unwrap())
+        Ok(body_size)
     }
 
     pub const fn header_len() -> usize {
@@ -686,7 +688,7 @@ impl ECIES {
 
     pub fn body_len(&self) -> usize {
         let len = self.body_size.unwrap();
-        (if len % 16 == 0 { len } else { (len / 16 + 1) * 16 }) + 16
+        Self::align_16(len) + 16
     }
 
     #[cfg(test)]
@@ -697,7 +699,7 @@ impl ECIES {
     }
 
     pub fn write_body(&mut self, out: &mut BytesMut, data: &[u8]) {
-        let len = if data.len() % 16 == 0 { data.len() } else { (data.len() / 16 + 1) * 16 };
+        let len = Self::align_16(data.len());
         let old_len = out.len();
         out.resize(old_len + len, 0);
 
@@ -729,6 +731,14 @@ impl ECIES {
         let ret = body;
         self.ingress_aes.as_mut().unwrap().apply_keystream(ret);
         Ok(split_at_mut(ret, size)?.0)
+    }
+
+    /// Returns `num` aligned to 16.
+    ///
+    /// `<https://stackoverflow.com/questions/14561402/how-is-this-size-alignment-working>`
+    #[inline]
+    const fn align_16(num: usize) -> usize {
+        (num + (16 - 1)) & !(16 - 1)
     }
 }
 
@@ -965,6 +975,5 @@ mod tests {
                 &mut dest,
             );
         }
-        std::hint::black_box(());
     }
 }

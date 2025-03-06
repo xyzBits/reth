@@ -13,37 +13,61 @@ workspace = true
 
 [dependencies]
 # reth
-reth-codecs.workspace = true
-reth-primitives = { workspace = true, features = ["reth-codec"] }
+reth-codecs = { workspace = true, optional = true }
+reth-primitives-traits = { workspace = true, features = ["serde"] }
 
 # ethereum
 alloy-primitives.workspace = true
+alloy-eips.workspace = true
 
 # codecs
-modular-bitfield.workspace = true
+modular-bitfield = { workspace = true, optional = true }
 serde = { workspace = true, default-features = false }
 
 # misc
-bytes.workspace = true
+bytes = { workspace = true, optional = true }
 
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }
-proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
 # reth
-reth-primitives = { workspace = true, features = ["arbitrary"] }
+reth-primitives-traits = { workspace = true, features = ["arbitrary"] }
 reth-codecs.workspace = true
 
+bytes.workspace = true
+modular-bitfield.workspace = true
 arbitrary = { workspace = true, features = ["derive"] }
-proptest-arbitrary-interop.workspace = true
+
 proptest.workspace = true
+proptest-arbitrary-interop.workspace = true
 test-fuzz.workspace = true
 
 [features]
-test-utils = ["arbitrary"]
+default = ["std"]
+std = [
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "reth-primitives-traits/std",
+    "bytes?/std",
+    "serde/std",
+]
+test-utils = [
+    "reth-primitives-traits/test-utils",
+    "arbitrary",
+    "reth-codecs?/test-utils",
+]
 arbitrary = [
-    "reth-primitives/arbitrary",
+    "std",
+    "reth-primitives-traits/arbitrary",
     "dep:arbitrary",
-    "dep:proptest",
+    "alloy-primitives/arbitrary",
+    "alloy-eips/arbitrary",
+    "reth-codecs?/arbitrary",
+]
+reth-codec = [
+    "dep:reth-codecs",
+    "dep:modular-bitfield",
+    "dep:bytes",
+    "reth-primitives-traits/reth-codec",
 ]

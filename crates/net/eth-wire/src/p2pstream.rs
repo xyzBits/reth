@@ -14,9 +14,10 @@ use futures::{Sink, SinkExt, StreamExt};
 use pin_project::pin_project;
 use reth_codecs::add_arbitrary_tests;
 use reth_metrics::metrics::counter;
-use reth_primitives::GotExpected;
+use reth_primitives_traits::GotExpected;
 use std::{
     collections::VecDeque,
+    future::Future,
     io,
     pin::Pin,
     task::{ready, Context, Poll},
@@ -41,7 +42,7 @@ const MAX_P2P_MESSAGE_ID: u8 = P2PMessageID::Pong as u8;
 
 /// [`HANDSHAKE_TIMEOUT`] determines the amount of time to wait before determining that a `p2p`
 /// handshake has timed out.
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// [`PING_TIMEOUT`] determines the amount of time to wait before determining that a `p2p` ping has
 /// timed out.
@@ -194,8 +195,11 @@ impl<S> CanDisconnect<Bytes> for P2PStream<S>
 where
     S: Sink<Bytes, Error = io::Error> + Unpin + Send + Sync,
 {
-    async fn disconnect(&mut self, reason: DisconnectReason) -> Result<(), P2PStreamError> {
-        self.disconnect(reason).await
+    fn disconnect(
+        &mut self,
+        reason: DisconnectReason,
+    ) -> Pin<Box<dyn Future<Output = Result<(), P2PStreamError>> + Send + '_>> {
+        Box::pin(async move { self.disconnect(reason).await })
     }
 }
 
@@ -614,25 +618,24 @@ where
     /// Returns `Poll::Ready(Ok(()))` when no buffered items remain.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut this = self.project();
-        loop {
-            match ready!(this.inner.as_mut().poll_flush(cx)) {
-                Err(err) => {
-                    trace!(target: "net::p2p",
-                        %err,
-                        "error flushing p2p stream"
-                    );
-                    return Poll::Ready(Err(err.into()))
-                }
-                Ok(()) => {
+        let poll_res = loop {
+            match this.inner.as_mut().poll_ready(cx) {
+                Poll::Pending => break Poll::Pending,
+                Poll::Ready(Err(err)) => break Poll::Ready(Err(err.into())),
+                Poll::Ready(Ok(())) => {
                     let Some(message) = this.outgoing_messages.pop_front() else {
-                        return Poll::Ready(Ok(()))
+                        break Poll::Ready(Ok(()))
                     };
                     if let Err(err) = this.inner.as_mut().start_send(message) {
-                        return Poll::Ready(Err(err.into()))
+                        break Poll::Ready(Err(err.into()))
                     }
                 }
             }
-        }
+        };
+
+        ready!(this.inner.as_mut().poll_flush(cx))?;
+
+        poll_res
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

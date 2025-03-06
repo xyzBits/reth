@@ -1,8 +1,7 @@
 use super::{collect_history_indices, load_history_indices};
 use alloy_primitives::Address;
 use reth_config::config::{EtlConfig, IndexHistoryConfig};
-use reth_db::tables;
-use reth_db_api::{models::ShardedKey, table::Decode, transaction::DbTxMut};
+use reth_db_api::{models::ShardedKey, table::Decode, tables, transaction::DbTxMut};
 use reth_provider::{DBProvider, HistoryWriter, PruneCheckpointReader, PruneCheckpointWriter};
 use reth_prune_types::{PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment};
 use reth_stages_api::{
@@ -134,7 +133,7 @@ where
         let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
-        provider.unwind_account_history_indices(range)?;
+        provider.unwind_account_history_indices_range(range)?;
 
         // from HistoryIndex higher than that number.
         Ok(UnwindOutput { checkpoint: StageCheckpoint::new(unwind_progress) })
@@ -150,7 +149,6 @@ mod tests {
     };
     use alloy_primitives::{address, BlockNumber, B256};
     use itertools::Itertools;
-    use reth_db::BlockNumberList;
     use reth_db_api::{
         cursor::DbCursorRO,
         models::{
@@ -158,6 +156,7 @@ mod tests {
             StoredBlockBodyIndices,
         },
         transaction::DbTx,
+        BlockNumberList,
     };
     use reth_provider::{providers::StaticFileWriter, DatabaseProviderFactory};
     use reth_testing_utils::generators::{

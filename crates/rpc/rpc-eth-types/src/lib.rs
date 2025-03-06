@@ -22,10 +22,7 @@ pub mod simulate;
 pub mod transaction;
 pub mod utils;
 
-pub use builder::{
-    config::{EthConfig, EthFilterConfig},
-    ctx::EthApiBuilderCtx,
-};
+pub use builder::config::{EthConfig, EthFilterConfig};
 pub use cache::{
     config::EthStateCacheConfig, db::StateCacheDb, multi_consumer::MultiConsumerLruCache,
     EthStateCache,
@@ -37,5 +34,5 @@ pub use gas_oracle::{
 };
 pub use id_provider::EthSubscriptionIdProvider;
 pub use pending_block::{PendingBlock, PendingBlockEnv, PendingBlockEnvOrigin};
-pub use receipt::ReceiptBuilder;
+pub use receipt::EthReceiptBuilder;
 pub use transaction::TransactionSource;

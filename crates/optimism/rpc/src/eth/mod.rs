@@ -1,5 +1,6 @@
 //! OP-Reth `eth_` endpoint implementation.
 
+pub mod ext;
 pub mod receipt;
 pub mod transaction;
 
@@ -9,20 +10,18 @@ mod pending_block;
 
 pub use receipt::{OpReceiptBuilder, OpReceiptFieldsBuilder};
 
-use std::{fmt, sync::Arc};
-
 use alloy_primitives::U256;
-use derive_more::Deref;
 use op_alloy_network::Optimism;
-use reth_chainspec::EthereumHardforks;
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_network_api::NetworkInfo;
-use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypes};
-use reth_node_builder::EthApiBuilderCtx;
-use reth_primitives::Header;
+use reth_node_api::{BlockTy, FullNodeComponents, ReceiptTy};
+use reth_node_builder::rpc::EthApiBuilder;
+use reth_optimism_primitives::OpPrimitives;
 use reth_provider::{
-    BlockIdReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, HeaderProvider,
-    StageCheckpointReader, StateProviderFactory,
+    BlockNumReader, BlockReader, BlockReaderIdExt, CanonStateSubscriptions, ChainSpecProvider,
+    ProviderBlock, ProviderHeader, ProviderReceipt, ProviderTx, StageCheckpointReader,
+    StateProviderFactory,
 };
 use reth_rpc::eth::{core::EthApiInner, DevSigner};
 use reth_rpc_eth_api::{
@@ -30,24 +29,29 @@ use reth_rpc_eth_api::{
         AddDevSigners, EthApiSpec, EthFees, EthSigner, EthState, LoadBlock, LoadFee, LoadState,
         SpawnBlocking, Trace,
     },
-    EthApiTypes,
+    EthApiTypes, FromEvmError, FullEthApiServer, RpcNodeCore, RpcNodeCoreExt,
 };
-use reth_rpc_eth_types::{EthStateCache, FeeHistoryCache, GasPriceOracle};
+use reth_rpc_eth_types::{EthConfig, EthStateCache, FeeHistoryCache, GasPriceOracle};
 use reth_tasks::{
     pool::{BlockingTaskGuard, BlockingTaskPool},
     TaskSpawner,
 };
 use reth_transaction_pool::TransactionPool;
+use std::{fmt, sync::Arc};
 
-use crate::{OpEthApiError, OpTxBuilder, SequencerClient};
+use crate::{OpEthApiError, SequencerClient};
 
 /// Adapter for [`EthApiInner`], which holds all the data required to serve core `eth_` API.
 pub type EthApiNodeBackend<N> = EthApiInner<
-    <N as FullNodeTypes>::Provider,
-    <N as FullNodeComponents>::Pool,
-    <N as FullNodeComponents>::Network,
-    <N as FullNodeComponents>::Evm,
+    <N as RpcNodeCore>::Provider,
+    <N as RpcNodeCore>::Pool,
+    <N as RpcNodeCore>::Network,
+    <N as RpcNodeCore>::Evm,
 >;
+
+/// A helper trait with requirements for [`RpcNodeCore`] to be used in [`OpEthApi`].
+pub trait OpNodeCore: RpcNodeCore<Provider: BlockReader> {}
+impl<T> OpNodeCore for T where T: RpcNodeCore<Provider: BlockReader> {}
 
 /// OP-Reth `Eth` API implementation.
 ///
@@ -59,193 +63,289 @@ pub type EthApiNodeBackend<N> = EthApiInner<
 ///
 /// This type implements the [`FullEthApi`](reth_rpc_eth_api::helpers::FullEthApi) by implemented
 /// all the `Eth` helper traits and prerequisite traits.
-#[derive(Clone, Deref)]
-pub struct OpEthApi<N: FullNodeComponents> {
+#[derive(Clone)]
+pub struct OpEthApi<N: OpNodeCore> {
     /// Gateway to node's core components.
-    #[deref]
-    inner: Arc<EthApiNodeBackend<N>>,
-    /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
-    /// network.
-    sequencer_client: Option<SequencerClient>,
+    inner: Arc<OpEthApiInner<N>>,
 }
 
-impl<N: FullNodeComponents> OpEthApi<N> {
-    /// Creates a new instance for given context.
-    pub fn new(ctx: &EthApiBuilderCtx<N>, sequencer_http: Option<String>) -> Self {
-        let blocking_task_pool =
-            BlockingTaskPool::build().expect("failed to build blocking task pool");
+impl<N> OpEthApi<N>
+where
+    N: OpNodeCore<
+        Provider: BlockReaderIdExt
+                      + ChainSpecProvider
+                      + CanonStateSubscriptions<Primitives = OpPrimitives>
+                      + Clone
+                      + 'static,
+    >,
+{
+    /// Returns a reference to the [`EthApiNodeBackend`].
+    pub fn eth_api(&self) -> &EthApiNodeBackend<N> {
+        self.inner.eth_api()
+    }
 
-        let inner = EthApiInner::new(
-            ctx.provider.clone(),
-            ctx.pool.clone(),
-            ctx.network.clone(),
-            ctx.cache.clone(),
-            ctx.new_gas_price_oracle(),
-            ctx.config.rpc_gas_cap,
-            ctx.config.rpc_max_simulate_blocks,
-            ctx.config.eth_proof_window,
-            blocking_task_pool,
-            ctx.new_fee_history_cache(),
-            ctx.evm_config.clone(),
-            ctx.executor.clone(),
-            ctx.config.proof_permits,
-        );
+    /// Returns the configured sequencer client, if any.
+    pub fn sequencer_client(&self) -> Option<&SequencerClient> {
+        self.inner.sequencer_client()
+    }
 
-        Self { inner: Arc::new(inner), sequencer_client: sequencer_http.map(SequencerClient::new) }
+    /// Build a [`OpEthApi`] using [`OpEthApiBuilder`].
+    pub const fn builder() -> OpEthApiBuilder {
+        OpEthApiBuilder::new()
     }
 }
 
 impl<N> EthApiTypes for OpEthApi<N>
 where
     Self: Send + Sync,
-    N: FullNodeComponents,
+    N: OpNodeCore,
 {
     type Error = OpEthApiError;
     type NetworkTypes = Optimism;
-    type TransactionCompat = OpTxBuilder;
+    type TransactionCompat = Self;
+
+    fn tx_resp_builder(&self) -> &Self::TransactionCompat {
+        self
+    }
+}
+
+impl<N> RpcNodeCore for OpEthApi<N>
+where
+    N: OpNodeCore,
+{
+    type Primitives = OpPrimitives;
+    type Provider = N::Provider;
+    type Pool = N::Pool;
+    type Evm = <N as RpcNodeCore>::Evm;
+    type Network = <N as RpcNodeCore>::Network;
+    type PayloadBuilder = ();
+
+    #[inline]
+    fn pool(&self) -> &Self::Pool {
+        self.inner.eth_api.pool()
+    }
+
+    #[inline]
+    fn evm_config(&self) -> &Self::Evm {
+        self.inner.eth_api.evm_config()
+    }
+
+    #[inline]
+    fn network(&self) -> &Self::Network {
+        self.inner.eth_api.network()
+    }
+
+    #[inline]
+    fn payload_builder(&self) -> &Self::PayloadBuilder {
+        &()
+    }
+
+    #[inline]
+    fn provider(&self) -> &Self::Provider {
+        self.inner.eth_api.provider()
+    }
+}
+
+impl<N> RpcNodeCoreExt for OpEthApi<N>
+where
+    N: OpNodeCore,
+{
+    #[inline]
+    fn cache(&self) -> &EthStateCache<ProviderBlock<N::Provider>, ProviderReceipt<N::Provider>> {
+        self.inner.eth_api.cache()
+    }
 }
 
 impl<N> EthApiSpec for OpEthApi<N>
 where
-    Self: Send + Sync,
-    N: FullNodeComponents<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    N: OpNodeCore<
+        Provider: ChainSpecProvider<ChainSpec: EthereumHardforks>
+                      + BlockNumReader
+                      + StageCheckpointReader,
+        Network: NetworkInfo,
+    >,
 {
-    #[inline]
-    fn provider(
-        &self,
-    ) -> impl ChainSpecProvider<ChainSpec: EthereumHardforks> + BlockNumReader + StageCheckpointReader
-    {
-        self.inner.provider()
-    }
-
-    #[inline]
-    fn network(&self) -> impl NetworkInfo {
-        self.inner.network()
-    }
+    type Transaction = ProviderTx<Self::Provider>;
 
     #[inline]
     fn starting_block(&self) -> U256 {
-        self.inner.starting_block()
+        self.inner.eth_api.starting_block()
     }
 
     #[inline]
-    fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn EthSigner>>> {
-        self.inner.signers()
+    fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn EthSigner<ProviderTx<Self::Provider>>>>> {
+        self.inner.eth_api.signers()
     }
 }
 
 impl<N> SpawnBlocking for OpEthApi<N>
 where
     Self: Send + Sync + Clone + 'static,
-    N: FullNodeComponents,
+    N: OpNodeCore,
 {
     #[inline]
     fn io_task_spawner(&self) -> impl TaskSpawner {
-        self.inner.task_spawner()
+        self.inner.eth_api.task_spawner()
     }
 
     #[inline]
     fn tracing_task_pool(&self) -> &BlockingTaskPool {
-        self.inner.blocking_task_pool()
+        self.inner.eth_api.blocking_task_pool()
     }
 
     #[inline]
     fn tracing_task_guard(&self) -> &BlockingTaskGuard {
-        self.inner.blocking_task_guard()
+        self.inner.eth_api.blocking_task_guard()
     }
 }
 
 impl<N> LoadFee for OpEthApi<N>
 where
-    Self: LoadBlock,
-    N: FullNodeComponents<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    Self: LoadBlock<Provider = N::Provider>,
+    N: OpNodeCore<
+        Provider: BlockReaderIdExt
+                      + ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
+                      + StateProviderFactory,
+    >,
 {
     #[inline]
-    fn provider(
-        &self,
-    ) -> impl BlockIdReader + HeaderProvider + ChainSpecProvider<ChainSpec: EthereumHardforks> {
-        self.inner.provider()
-    }
-
-    #[inline]
-    fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
-    }
-
-    #[inline]
-    fn gas_oracle(&self) -> &GasPriceOracle<impl BlockReaderIdExt> {
-        self.inner.gas_oracle()
+    fn gas_oracle(&self) -> &GasPriceOracle<Self::Provider> {
+        self.inner.eth_api.gas_oracle()
     }
 
     #[inline]
     fn fee_history_cache(&self) -> &FeeHistoryCache {
-        self.inner.fee_history_cache()
+        self.inner.eth_api.fee_history_cache()
     }
 }
 
-impl<N> LoadState for OpEthApi<N>
-where
-    Self: Send + Sync + Clone,
-    N: FullNodeComponents<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+impl<N> LoadState for OpEthApi<N> where
+    N: OpNodeCore<
+        Provider: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
+        Pool: TransactionPool,
+    >
 {
-    #[inline]
-    fn provider(
-        &self,
-    ) -> impl StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> {
-        self.inner.provider()
-    }
-
-    #[inline]
-    fn cache(&self) -> &EthStateCache {
-        self.inner.cache()
-    }
-
-    #[inline]
-    fn pool(&self) -> impl TransactionPool {
-        self.inner.pool()
-    }
 }
 
 impl<N> EthState for OpEthApi<N>
 where
     Self: LoadState + SpawnBlocking,
-    N: FullNodeComponents,
+    N: OpNodeCore,
 {
     #[inline]
     fn max_proof_window(&self) -> u64 {
-        self.inner.eth_proof_window()
+        self.inner.eth_api.eth_proof_window()
     }
 }
 
 impl<N> EthFees for OpEthApi<N>
 where
     Self: LoadFee,
-    N: FullNodeComponents,
+    N: OpNodeCore,
 {
 }
 
 impl<N> Trace for OpEthApi<N>
 where
-    Self: LoadState,
-    N: FullNodeComponents,
+    Self: RpcNodeCore<Provider: BlockReader>
+        + LoadState<
+            Evm: ConfigureEvm<
+                Header = ProviderHeader<Self::Provider>,
+                Transaction = ProviderTx<Self::Provider>,
+            >,
+            Error: FromEvmError<Self::Evm>,
+        >,
+    N: OpNodeCore,
 {
-    #[inline]
-    fn evm_config(&self) -> &impl ConfigureEvm<Header = Header> {
-        self.inner.evm_config()
-    }
 }
 
 impl<N> AddDevSigners for OpEthApi<N>
 where
-    N: FullNodeComponents<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    N: OpNodeCore,
 {
     fn with_dev_accounts(&self) {
-        *self.signers().write() = DevSigner::random_signers(20)
+        *self.inner.eth_api.signers().write() = DevSigner::random_signers(20)
     }
 }
 
-impl<N: FullNodeComponents> fmt::Debug for OpEthApi<N> {
+impl<N: OpNodeCore> fmt::Debug for OpEthApi<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpEthApi").finish_non_exhaustive()
+    }
+}
+
+/// Container type `OpEthApi`
+#[allow(missing_debug_implementations)]
+struct OpEthApiInner<N: OpNodeCore> {
+    /// Gateway to node's core components.
+    eth_api: EthApiNodeBackend<N>,
+    /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
+    /// network.
+    sequencer_client: Option<SequencerClient>,
+}
+
+impl<N: OpNodeCore> OpEthApiInner<N> {
+    /// Returns a reference to the [`EthApiNodeBackend`].
+    const fn eth_api(&self) -> &EthApiNodeBackend<N> {
+        &self.eth_api
+    }
+
+    /// Returns the configured sequencer client, if any.
+    const fn sequencer_client(&self) -> Option<&SequencerClient> {
+        self.sequencer_client.as_ref()
+    }
+}
+
+/// Builds [`OpEthApi`] for Optimism.
+#[derive(Debug, Default)]
+pub struct OpEthApiBuilder {
+    /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
+    /// network.
+    sequencer_client: Option<SequencerClient>,
+}
+
+impl OpEthApiBuilder {
+    /// Creates a [`OpEthApiBuilder`] instance from core components.
+    pub const fn new() -> Self {
+        Self { sequencer_client: None }
+    }
+
+    /// With a [`SequencerClient`].
+    pub fn with_sequencer(mut self, sequencer_client: Option<SequencerClient>) -> Self {
+        self.sequencer_client = sequencer_client;
+        self
+    }
+}
+
+impl<N> EthApiBuilder<N> for OpEthApiBuilder
+where
+    N: FullNodeComponents,
+    OpEthApi<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
+{
+    type EthApi = OpEthApi<N>;
+
+    fn build_eth_api(
+        self,
+        core_components: &N,
+        config: EthConfig,
+        cache: EthStateCache<BlockTy<N::Types>, ReceiptTy<N::Types>>,
+    ) -> Self::EthApi {
+        let Self { sequencer_client } = self;
+        let eth_api = reth_rpc::EthApiBuilder::new(
+            core_components.provider().clone(),
+            core_components.pool().clone(),
+            core_components.network().clone(),
+            core_components.evm_config().clone(),
+        )
+        .eth_cache(cache)
+        .task_spawner(core_components.task_executor().clone())
+        .gas_cap(config.rpc_gas_cap.into())
+        .max_simulate_blocks(config.rpc_max_simulate_blocks)
+        .eth_proof_window(config.eth_proof_window)
+        .fee_history_cache_config(config.fee_history_cache)
+        .proof_permits(config.proof_permits)
+        .build_inner();
+
+        OpEthApi { inner: Arc::new(OpEthApiInner { eth_api, sequencer_client }) }
     }
 }
