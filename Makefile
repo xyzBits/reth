@@ -26,9 +26,14 @@ PROFILE ?= release
 CARGO_INSTALL_EXTRA_FLAGS ?=
 
 # The release tag of https://github.com/ethereum/tests to use for EF tests
-EF_TESTS_TAG := v12.2
+EF_TESTS_TAG := v17.0
 EF_TESTS_URL := https://github.com/ethereum/tests/archive/refs/tags/$(EF_TESTS_TAG).tar.gz
 EF_TESTS_DIR := ./testing/ef-tests/ethereum-tests
+
+# The release tag of https://github.com/ethereum/execution-spec-tests to use for EEST tests
+EEST_TESTS_TAG := v4.5.0
+EEST_TESTS_URL := https://github.com/ethereum/execution-spec-tests/releases/download/$(EEST_TESTS_TAG)/fixtures_stable.tar.gz
+EEST_TESTS_DIR := ./testing/ef-tests/execution-spec-tests
 
 # The docker image name
 DOCKER_IMAGE_NAME ?= ghcr.io/paradigmxyz/reth
@@ -42,14 +47,14 @@ help: ## Display this help.
 ##@ Build
 
 .PHONY: install
-install: ## Build and install the reth binary under `~/.cargo/bin`.
+install: ## Build and install the reth binary under `$(CARGO_HOME)/bin`.
 	cargo install --path bin/reth --bin reth --force --locked \
 		--features "$(FEATURES)" \
 		--profile "$(PROFILE)" \
 		$(CARGO_INSTALL_EXTRA_FLAGS)
 
 .PHONY: install-op
-install-op: ## Build and install the op-reth binary under `~/.cargo/bin`.
+install-op: ## Build and install the op-reth binary under `$(CARGO_HOME)/bin`.
 	cargo install --path crates/optimism/bin --bin op-reth --force --locked \
 		--features "$(FEATURES)" \
 		--profile "$(PROFILE)" \
@@ -60,37 +65,31 @@ build: ## Build the reth binary into `target` directory.
 	cargo build --bin reth --features "$(FEATURES)" --profile "$(PROFILE)"
 
 # Environment variables for reproducible builds
-# Initialize RUSTFLAGS
-RUST_BUILD_FLAGS =
-# Enable static linking to ensure reproducibility across builds
-RUST_BUILD_FLAGS += --C target-feature=+crt-static
-# Set the linker to use static libgcc to ensure reproducibility across builds
-RUST_BUILD_FLAGS += -Clink-arg=-static-libgcc
-# Remove build ID from the binary to ensure reproducibility across builds
-RUST_BUILD_FLAGS += -C link-arg=-Wl,--build-id=none
-# Remove metadata hash from symbol names to ensure reproducible builds
-RUST_BUILD_FLAGS += -C metadata=''
 # Set timestamp from last git commit for reproducible builds
 SOURCE_DATE ?= $(shell git log -1 --pretty=%ct)
-# Disable incremental compilation to avoid non-deterministic artifacts
-CARGO_INCREMENTAL_VAL = 0
-# Set C locale for consistent string handling and sorting
-LOCALE_VAL = C
-# Set UTC timezone for consistent time handling across builds
-TZ_VAL = UTC
 
-.PHONY: build-reproducible
-build-reproducible: ## Build the reth binary into `target` directory with reproducible builds. Only works for x86_64-unknown-linux-gnu currently
+# Extra RUSTFLAGS for reproducible builds. Can be overridden via the environment.
+RUSTFLAGS_REPRODUCIBLE_EXTRA ?=
+
+# `reproducible` only supports reth on x86_64-unknown-linux-gnu
+build-%-reproducible:
+	@if [ "$*" != "reth" ]; then \
+		echo "Error: Reproducible builds are only supported for reth, not $*"; \
+		exit 1; \
+	fi
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE) \
-	RUSTFLAGS="${RUST_BUILD_FLAGS} --remap-path-prefix $$(pwd)=." \
-	CARGO_INCREMENTAL=${CARGO_INCREMENTAL_VAL} \
-	LC_ALL=${LOCALE_VAL} \
-	TZ=${TZ_VAL} \
-	cargo build --bin reth --features "$(FEATURES)" --profile "release" --locked --target x86_64-unknown-linux-gnu
+	RUSTFLAGS="-C symbol-mangling-version=v0 -C strip=none -C link-arg=-Wl,--build-id=none -C metadata='' --remap-path-prefix $$(pwd)=. $(RUSTFLAGS_REPRODUCIBLE_EXTRA)" \
+	LC_ALL=C \
+	TZ=UTC \
+	JEMALLOC_OVERRIDE=/usr/lib/x86_64-linux-gnu/libjemalloc.a \
+	cargo build --bin reth --features "$(FEATURES) jemalloc-unprefixed" --profile "reproducible" --locked --target x86_64-unknown-linux-gnu
 
 .PHONY: build-debug
 build-debug: ## Build the reth binary into `target/debug` directory.
 	cargo build --bin reth --features "$(FEATURES)"
+.PHONY: build-debug-op
+build-debug-op: ## Build the op-reth binary into `target/debug` directory.
+	cargo build --bin op-reth --features "$(FEATURES)" --manifest-path crates/optimism/bin/Cargo.toml
 
 .PHONY: build-op
 build-op: ## Build the op-reth binary into `target` directory.
@@ -150,6 +149,22 @@ op-build-x86_64-apple-darwin:
 op-build-aarch64-apple-darwin:
 	$(MAKE) op-build-native-aarch64-apple-darwin
 
+build-deb-%:
+	@case "$*" in \
+		x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|riscv64gc-unknown-linux-gnu) \
+			echo "Building debian package for $*"; \
+			;; \
+		*) \
+			echo "Error: Debian packages are only supported for x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and riscv64gc-unknown-linux-gnu, not $*"; \
+			exit 1; \
+			;; \
+	esac
+	cargo install cargo-deb@3.6.0 --locked
+	cargo deb --profile $(PROFILE) --no-build --no-dbgsym --no-strip \
+		--target $* \
+		$(if $(VERSION),--deb-version "1~$(VERSION)") \
+		$(if $(VERSION),--output "target/$*/$(PROFILE)/reth-$(VERSION)-$*-$(PROFILE).deb")
+
 # Create a `.tar.gz` containing a binary for a specific target.
 define tarball_release_binary
 	cp $(CARGO_TARGET_DIR)/$(1)/$(PROFILE)/$(2) $(BIN_DIR)/$(2)
@@ -202,9 +217,30 @@ $(EF_TESTS_DIR):
 	tar -xzf ethereum-tests.tar.gz --strip-components=1 -C $(EF_TESTS_DIR)
 	rm ethereum-tests.tar.gz
 
+# Downloads and unpacks EEST tests in the `$(EEST_TESTS_DIR)` directory.
+#
+# Requires `wget` and `tar`
+$(EEST_TESTS_DIR):
+	mkdir $(EEST_TESTS_DIR)
+	wget $(EEST_TESTS_URL) -O execution-spec-tests.tar.gz
+	tar -xzf execution-spec-tests.tar.gz --strip-components=1 -C $(EEST_TESTS_DIR)
+	rm execution-spec-tests.tar.gz
+
 .PHONY: ef-tests
-ef-tests: $(EF_TESTS_DIR) ## Runs Ethereum Foundation tests.
-	cargo nextest run -p ef-tests --features ef-tests
+ef-tests: $(EF_TESTS_DIR) $(EEST_TESTS_DIR) ## Runs Legacy and EEST tests.
+	cargo nextest run -p ef-tests --release --features ef-tests
+
+##@ reth-bench
+
+.PHONY: reth-bench
+reth-bench: ## Build the reth-bench binary into the `target` directory.
+	cargo build --manifest-path bin/reth-bench/Cargo.toml --features "$(FEATURES)" --profile "$(PROFILE)"
+
+.PHONY: install-reth-bench
+install-reth-bench: ## Build and install the reth binary under `$(CARGO_HOME)/bin`.
+	cargo install --path bin/reth-bench --bin reth-bench --force --locked \
+		--features "$(FEATURES)" \
+		--profile "$(PROFILE)"
 
 ##@ Docker
 
@@ -238,7 +274,7 @@ docker-build-push-latest: ## Build and push a cross-arch Docker image tagged wit
 # `docker buildx create --use --name cross-builder`
 .PHONY: docker-build-push-nightly
 docker-build-push-nightly: ## Build and push cross-arch Docker image tagged with the latest git tag with a `-nightly` suffix, and `latest-nightly`.
-	$(call docker_build_push,$(GIT_TAG)-nightly,latest-nightly)
+	$(call docker_build_push,nightly,nightly)
 
 # Create a cross-arch Docker image with the given tags and push it
 define docker_build_push
@@ -290,7 +326,24 @@ op-docker-build-push-latest: ## Build and push a cross-arch Docker image tagged 
 # `docker buildx create --use --name cross-builder`
 .PHONY: op-docker-build-push-nightly
 op-docker-build-push-nightly: ## Build and push cross-arch Docker image tagged with the latest git tag with a `-nightly` suffix, and `latest-nightly`.
-	$(call op_docker_build_push,$(GIT_TAG)-nightly,latest-nightly)
+	$(call op_docker_build_push,nightly,nightly)
+
+# Note: This requires a buildx builder with emulation support. For example:
+#
+# `docker run --privileged --rm tonistiigi/binfmt --install amd64,arm64`
+# `docker buildx create --use --name cross-builder`
+.PHONY: docker-build-push-nightly-profiling
+docker-build-push-nightly-profiling: ## Build and push cross-arch Docker image with profiling profile tagged with nightly-profiling.
+	$(call docker_build_push,nightly-profiling,nightly-profiling)
+
+	# Note: This requires a buildx builder with emulation support. For example:
+#
+# `docker run --privileged --rm tonistiigi/binfmt --install amd64,arm64`
+# `docker buildx create --use --name cross-builder`
+.PHONY: op-docker-build-push-nightly-profiling
+op-docker-build-push-nightly-profiling: ## Build and push cross-arch Docker image tagged with the latest git tag with a `-nightly` suffix, and `latest-nightly`.
+	$(call op_docker_build_push,nightly-profiling,nightly-profiling)
+
 
 # Create a cross-arch Docker image with the given tags and push it
 define op_docker_build_push
@@ -337,13 +390,17 @@ db-tools: ## Compile MDBX debugging tools.
 	@echo "Run \"$(DB_TOOLS_DIR)/mdbx_chk\" for the MDBX db file integrity check."
 
 .PHONY: update-book-cli
-update-book-cli: build-debug ## Update book cli documentation.
+update-book-cli: build-debug build-debug-op## Update book cli documentation.
 	@echo "Updating book cli doc..."
-	@./book/cli/update.sh $(CARGO_TARGET_DIR)/debug/reth
+	@./docs/cli/update.sh $(CARGO_TARGET_DIR)/debug/reth $(CARGO_TARGET_DIR)/debug/op-reth
 
 .PHONY: profiling
 profiling: ## Builds `reth` with optimisations, but also symbols.
 	RUSTFLAGS="-C target-cpu=native" cargo build --profile profiling --features jemalloc,asm-keccak
+
+.PHONY: profiling-op
+profiling-op: ## Builds `op-reth` with optimisations, but also symbols.
+	RUSTFLAGS="-C target-cpu=native" cargo build --profile profiling --features jemalloc,asm-keccak --bin op-reth --manifest-path crates/optimism/bin/Cargo.toml
 
 .PHONY: maxperf
 maxperf: ## Builds `reth` with the most aggressive optimisations.
@@ -371,12 +428,23 @@ clippy:
 	--all-features \
 	-- -D warnings
 
-lint-codespell: ensure-codespell
-	codespell --skip "*.json" --skip "./testing/ef-tests/ethereum-tests"
+clippy-op-dev:
+	cargo +nightly clippy \
+	--bin op-reth \
+	--workspace \
+	--lib \
+	--examples \
+	--tests \
+	--benches \
+	--locked \
+	--all-features
 
-ensure-codespell:
-	@if ! command -v codespell &> /dev/null; then \
-		echo "codespell not found. Please install it by running the command `pip install codespell` or refer to the following link for more information: https://github.com/codespell-project/codespell" \
+lint-typos: ensure-typos
+	typos
+
+ensure-typos:
+	@if ! command -v typos &> /dev/null; then \
+		echo "typos not found. Please install it by running the command 'cargo install typos-cli' or refer to the following link for more information: https://github.com/crate-ci/typos"; \
 		exit 1; \
     fi
 
@@ -395,14 +463,14 @@ lint-toml: ensure-dprint
 
 ensure-dprint:
 	@if ! command -v dprint &> /dev/null; then \
-		echo "dprint not found. Please install it by running the command `cargo install --locked dprint` or refer to the following link for more information: https://github.com/dprint/dprint" \
+		echo "dprint not found. Please install it by running the command 'cargo install --locked dprint' or refer to the following link for more information: https://github.com/dprint/dprint"; \
 		exit 1; \
     fi
 
 lint:
 	make fmt && \
 	make clippy && \
-	make lint-codespell && \
+	make lint-typos && \
 	make lint-toml
 
 clippy-fix:
@@ -455,8 +523,3 @@ pr:
 	make test
 
 check-features:
-	cargo hack check \
-		--package reth-codecs \
-		--package reth-primitives-traits \
-		--package reth-primitives \
-		--feature-powerset

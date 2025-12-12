@@ -1,9 +1,10 @@
 //! Network cache support
 
+use alloy_primitives::map::DefaultHashBuilder;
 use core::hash::BuildHasher;
 use derive_more::{Deref, DerefMut};
 use itertools::Itertools;
-use schnellru::{ByLength, Limiter, RandomState, Unlimited};
+use schnellru::{ByLength, Limiter, Unlimited};
 use std::{fmt, hash::Hash};
 
 /// A minimal LRU cache based on a [`LruMap`](schnellru::LruMap) with limited capacity.
@@ -94,13 +95,11 @@ impl<T: Hash + Eq + fmt::Debug> LruCache<T> {
     }
 
     /// Returns number of elements currently in cache.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns `true` if there are currently no elements in the cache.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -135,9 +134,10 @@ where
     }
 }
 
-/// Wrapper of [`schnellru::LruMap`] that implements [`fmt::Debug`].
+/// Wrapper of [`schnellru::LruMap`] that implements [`fmt::Debug`] and with the common hash
+/// builder.
 #[derive(Deref, DerefMut, Default)]
-pub struct LruMap<K, V, L = ByLength, S = RandomState>(schnellru::LruMap<K, V, L, S>)
+pub struct LruMap<K, V, L = ByLength, S = DefaultHashBuilder>(schnellru::LruMap<K, V, L, S>)
 where
     K: Hash + PartialEq,
     L: Limiter<K, V>,
@@ -173,7 +173,7 @@ where
 {
     /// Returns a new cache with default limiter and hash builder.
     pub fn new(max_length: u32) -> Self {
-        Self(schnellru::LruMap::new(ByLength::new(max_length)))
+        Self(schnellru::LruMap::with_hasher(ByLength::new(max_length), Default::default()))
     }
 }
 
@@ -183,7 +183,7 @@ where
 {
     /// Returns a new cache with [`Unlimited`] limiter and default hash builder.
     pub fn new_unlimited() -> Self {
-        Self(schnellru::LruMap::new(Unlimited))
+        Self(schnellru::LruMap::with_hasher(Unlimited, Default::default()))
     }
 }
 
@@ -254,7 +254,7 @@ mod test {
     }
 
     #[test]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn test_debug_impl_lru_map() {
         #[derive(Debug)]
         struct Value(i8);
@@ -267,11 +267,13 @@ mod test {
         let value_2 = Value(22);
         cache.insert(key_2, value_2);
 
-        assert_eq!("LruMap { limiter: ByLength { max_length: 2 }, ret %iter: Iter: { 2: Value(22), 1: Value(11) } }", format!("{cache:?}"))
+        assert_eq!(
+            "LruMap { limiter: ByLength { max_length: 2 }, ret %iter: Iter: { 2: Value(22), 1: Value(11) } }",
+            format!("{cache:?}")
+        )
     }
 
     #[test]
-    #[allow(dead_code)]
     fn test_debug_impl_lru_cache() {
         let mut cache = LruCache::new(2);
         let key_1 = Key(1);

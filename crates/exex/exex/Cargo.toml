@@ -22,8 +22,8 @@ reth-fs-util.workspace = true
 reth-metrics.workspace = true
 reth-node-api.workspace = true
 reth-node-core.workspace = true
-reth-primitives = { workspace = true, features = ["secp256k1"] }
 reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-provider.workspace = true
 reth-prune-types.workspace = true
 reth-revm.workspace = true
@@ -54,13 +54,11 @@ tracing.workspace = true
 [dev-dependencies]
 reth-db-common.workspace = true
 reth-evm-ethereum.workspace = true
-reth-node-api.workspace = true
 reth-primitives-traits = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 
 alloy-genesis.workspace = true
-alloy-consensus.workspace = true
 
 rand.workspace = true
 secp256k1.workspace = true
@@ -69,7 +67,6 @@ tempfile.workspace = true
 [features]
 default = []
 serde = [
-    "reth-provider/serde",
     "reth-exex-types/serde",
     "reth-revm/serde",
     "alloy-consensus/serde",
@@ -80,4 +77,7 @@ serde = [
     "secp256k1/serde",
     "reth-primitives-traits/serde",
     "reth-prune-types/serde",
+    "reth-config/serde",
+    "reth-ethereum-primitives/serde",
+    "reth-chain-state/serde",
 ]

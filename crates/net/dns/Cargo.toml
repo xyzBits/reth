@@ -27,7 +27,7 @@ tokio = { workspace = true, features = ["io-util", "net", "time"] }
 tokio-stream.workspace = true
 
 # trust-dns
-hickory-resolver.workspace = true
+hickory-resolver = { workspace = true, features = ["tokio"] }
 
 # misc
 data-encoding.workspace = true
@@ -43,6 +43,7 @@ serde_with = { workspace = true, optional = true }
 reth-chainspec.workspace = true
 alloy-rlp.workspace = true
 alloy-chains.workspace = true
+secp256k1 = { workspace = true, features = ["rand"] }
 tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread"] }
 reth-tracing.workspace = true
 rand.workspace = true

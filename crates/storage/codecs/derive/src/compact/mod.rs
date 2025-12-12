@@ -82,7 +82,7 @@ pub fn get_fields(data: &Data) -> FieldList {
                 );
                 load_field(&data_fields.unnamed[0], &mut fields, false);
             }
-            syn::Fields::Unit => todo!(),
+            syn::Fields::Unit => unimplemented!("Compact does not support unit structs"),
         },
         Data::Enum(data) => {
             for variant in &data.variants {
@@ -90,7 +90,9 @@ pub fn get_fields(data: &Data) -> FieldList {
 
                 match &variant.fields {
                     syn::Fields::Named(_) => {
-                        panic!("Not allowed to have Enum Variants with multiple named fields. Make it a struct instead.")
+                        panic!(
+                            "Not allowed to have Enum Variants with multiple named fields. Make it a struct instead."
+                        )
                     }
                     syn::Fields::Unnamed(data_fields) => {
                         assert_eq!(
@@ -104,7 +106,7 @@ pub fn get_fields(data: &Data) -> FieldList {
                 }
             }
         }
-        Data::Union(_) => todo!(),
+        Data::Union(_) => unimplemented!("Compact does not support union types"),
     }
 
     fields
@@ -169,28 +171,15 @@ fn load_field_from_segments(
 ///
 /// If so, we use another impl to code/decode its data.
 fn should_use_alt_impl(ftype: &str, segment: &syn::PathSegment) -> bool {
-    if ftype == "Vec" || ftype == "Option" {
-        if let syn::PathArguments::AngleBracketed(ref args) = segment.arguments {
-            if let Some(syn::GenericArgument::Type(syn::Type::Path(arg_path))) = args.args.last() {
-                if let (Some(path), 1) =
-                    (arg_path.path.segments.first(), arg_path.path.segments.len())
-                {
-                    if [
-                        "B256",
-                        "Address",
-                        "Address",
-                        "Bloom",
-                        "TxHash",
-                        "BlockHash",
-                        "CompactPlaceholder",
-                    ]
-                    .contains(&path.ident.to_string().as_str())
-                    {
-                        return true
-                    }
-                }
-            }
-        }
+    if (ftype == "Vec" || ftype == "Option") &&
+        let syn::PathArguments::AngleBracketed(ref args) = segment.arguments &&
+        let Some(syn::GenericArgument::Type(syn::Type::Path(arg_path))) = args.args.last() &&
+        let (Some(path), 1) = (arg_path.path.segments.first(), arg_path.path.segments.len()) &&
+        ["B256", "Address", "Address", "Bloom", "TxHash", "BlockHash", "CompactPlaceholder"]
+            .iter()
+            .any(|&s| path.ident == s)
+    {
+        return true
     }
     false
 }
@@ -221,7 +210,7 @@ mod tests {
     use syn::parse2;
 
     #[test]
-    fn gen() {
+    fn compact_codec() {
         let f_struct = quote! {
              #[derive(Debug, PartialEq, Clone)]
              pub struct TestStruct {
@@ -249,17 +238,17 @@ mod tests {
             impl TestStruct {
                 #[doc = "Used bytes by [`TestStructFlags`]"]
                 pub const fn bitflag_encoded_bytes() -> usize {
-                    2u8 as usize
+                    2usize
                 }
                 #[doc = "Unused bits for new fields by [`TestStructFlags`]"]
                 pub const fn bitflag_unused_bits() -> usize {
-                    1u8 as usize
+                    1usize
                 }
             }
 
             pub use TestStruct_flags::TestStructFlags;
 
-            #[allow(non_snake_case)]
+            #[expect(non_snake_case)]
             mod TestStruct_flags {
                 use reth_codecs::__private::Buf;
                 use reth_codecs::__private::modular_bitfield;
@@ -287,21 +276,6 @@ mod tests {
                         )
                     }
                 }
-            }
-            #[cfg(test)]
-            #[allow(dead_code)]
-            #[test_fuzz::test_fuzz]
-            fn fuzz_test_test_struct(obj: TestStruct) {
-                use reth_codecs::Compact;
-                let mut buf = vec![];
-                let len = obj.clone().to_compact(&mut buf);
-                let (same_obj, buf) = TestStruct::from_compact(buf.as_ref(), len);
-                assert_eq!(obj, same_obj);
-            }
-            #[test]
-            #[allow(missing_docs)]
-            pub fn fuzz_test_struct() {
-                fuzz_test_test_struct(TestStruct::default())
             }
             impl reth_codecs::Compact for TestStruct {
                 fn to_compact<B>(&self, buf: &mut B) -> usize where B: reth_codecs::__private::bytes::BufMut + AsMut<[u8]> {

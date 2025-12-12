@@ -31,6 +31,16 @@ pub fn parse_duration_from_secs_or_ms(
     }
 }
 
+/// Helper to format a [Duration] to the format that can be parsed by
+/// [`parse_duration_from_secs_or_ms`].
+pub fn format_duration_as_secs_or_ms(duration: Duration) -> String {
+    if duration.as_millis().is_multiple_of(1000) {
+        format!("{}", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 /// Parse [`BlockHashOrNumber`]
 pub fn hash_or_num_value_parser(value: &str) -> eyre::Result<BlockHashOrNumber, eyre::Error> {
     match B256::from_str(value) {
@@ -89,6 +99,23 @@ pub fn read_json_from_file<T: serde::de::DeserializeOwned>(path: &str) -> Result
     reth_fs_util::read_json_file(Path::new(path))
 }
 
+/// Parses an ether value from a string.
+///
+/// The amount in eth like "1.05" will be interpreted in wei (1.05 * 1e18).
+/// Supports both decimal and integer inputs.
+///
+/// # Examples
+/// - "1.05" -> 1.05 ETH = 1.05 * 10^18 wei
+/// - "2" -> 2 ETH = 2 * 10^18 wei
+pub fn parse_ether_value(value: &str) -> eyre::Result<u128> {
+    let eth = value.parse::<f64>()?;
+    if eth.is_sign_negative() {
+        return Err(eyre::eyre!("Ether value cannot be negative"))
+    }
+    let wei = eth * 1e18;
+    Ok(wei as u128)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,7 +134,7 @@ mod tests {
 
     #[test]
     fn parse_socket_address_random() {
-        let port: u16 = rand::thread_rng().gen();
+        let port: u16 = rand::rng().random();
 
         for value in [format!("localhost:{port}"), format!(":{port}"), port.to_string()] {
             let socket_addr = parse_socket_address(&value)
@@ -130,5 +157,26 @@ mod tests {
         assert_eq!(seconds, Duration::from_secs(5));
 
         assert!(parse_duration_from_secs_or_ms("5ns").is_err());
+    }
+
+    #[test]
+    fn parse_ether_values() {
+        // Test basic decimal value
+        let wei = parse_ether_value("1.05").unwrap();
+        assert_eq!(wei, 1_050_000_000_000_000_000u128);
+
+        // Test integer value
+        let wei = parse_ether_value("2").unwrap();
+        assert_eq!(wei, 2_000_000_000_000_000_000u128);
+
+        // Test zero
+        let wei = parse_ether_value("0").unwrap();
+        assert_eq!(wei, 0);
+
+        // Test negative value fails
+        assert!(parse_ether_value("-1").is_err());
+
+        // Test invalid input fails
+        assert!(parse_ether_value("abc").is_err());
     }
 }

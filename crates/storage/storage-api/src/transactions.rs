@@ -9,7 +9,7 @@ use reth_storage_errors::provider::{ProviderError, ProviderResult};
 
 /// Enum to control transaction hash inclusion.
 ///
-/// This serves as a hint to the provider to include or omit exclude hashes because hashes are
+/// This serves as a hint to the provider to include or omit hashes because hashes are
 /// stored separately and are not always needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransactionVariant {
@@ -28,7 +28,7 @@ pub trait TransactionsProvider: BlockNumReader + Send + Sync {
 
     /// Get internal transaction identifier by transaction hash.
     ///
-    /// This is the inverse of [TransactionsProvider::transaction_by_id].
+    /// This is the inverse of [`TransactionsProvider::transaction_by_id`].
     /// Returns None if the transaction is not found.
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>>;
 
@@ -48,9 +48,6 @@ pub trait TransactionsProvider: BlockNumReader + Send + Sync {
         &self,
         hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>>;
-
-    /// Get transaction block number
-    fn transaction_block(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>>;
 
     /// Get transactions by block id.
     fn transactions_by_block(

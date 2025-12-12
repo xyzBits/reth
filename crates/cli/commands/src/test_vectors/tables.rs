@@ -1,5 +1,5 @@
 use alloy_consensus::Header;
-use alloy_primitives::{hex, private::getrandom::getrandom};
+use alloy_primitives::{hex, B256};
 use arbitrary::Arbitrary;
 use eyre::Result;
 use proptest::{
@@ -12,8 +12,8 @@ use reth_db_api::{
     table::{DupSort, Table, TableRow},
     tables,
 };
+use reth_ethereum_primitives::TransactionSigned;
 use reth_fs_util as fs;
-use reth_primitives::TransactionSigned;
 use std::collections::HashSet;
 use tracing::error;
 
@@ -23,13 +23,12 @@ const PER_TABLE: usize = 1000;
 /// Generates test vectors for specified `tables`. If list is empty, then generate for all tables.
 pub fn generate_vectors(mut tables: Vec<String>) -> Result<()> {
     // Prepare random seed for test (same method as used by proptest)
-    let mut seed = [0u8; 32];
-    getrandom(&mut seed)?;
+    let seed = B256::random();
     println!("Seed for table test vectors: {:?}", hex::encode_prefixed(seed));
 
     // Start the runner with the seed
     let config = ProptestConfig::default();
-    let rng = TestRng::from_seed(config.rng_algorithm, &seed);
+    let rng = TestRng::from_seed(config.rng_algorithm, &seed.0);
     let mut runner = TestRunner::new_with_rng(config, rng);
 
     fs::create_dir_all(VECTORS_FOLDER)?;
@@ -55,7 +54,7 @@ pub fn generate_vectors(mut tables: Vec<String>) -> Result<()> {
                 match table.as_str() {
                     $(
                         stringify!($table_type) => {
-                            println!("Generating test vectors for {} <{}>.", stringify!($table_or_dup), tables::$table_type$(::<$($generic),+>)?::NAME);
+                            tracing::info!(target: "reth::cli", "Generating test vectors for {} <{}>.", stringify!($table_or_dup), tables::$table_type$(::<$($generic),+>)?::NAME);
 
                             generate_vector!($table_type$(<$($generic),+>)?, $per_table, $table_or_dup);
                         },
@@ -70,7 +69,6 @@ pub fn generate_vectors(mut tables: Vec<String>) -> Result<()> {
 
     generate!([
         (CanonicalHeaders, PER_TABLE, TABLE),
-        (HeaderTerminalDifficulties, PER_TABLE, TABLE),
         (HeaderNumbers, PER_TABLE, TABLE),
         (Headers<Header>, PER_TABLE, TABLE),
         (BlockBodyIndices, PER_TABLE, TABLE),

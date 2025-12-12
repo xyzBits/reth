@@ -2,13 +2,13 @@ use crate::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
     identifier::{SenderId, TransactionId},
     pool::pending::PendingTransaction,
-    PoolTransaction, TransactionOrdering, ValidPoolTransaction,
+    PoolTransaction, Priority, TransactionOrdering, ValidPoolTransaction,
 };
 use alloy_consensus::Transaction;
 use alloy_eips::Typed2718;
 use alloy_primitives::Address;
 use core::fmt;
-use reth_primitives::InvalidTransactionError;
+use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
@@ -16,12 +16,15 @@ use std::{
 use tokio::sync::broadcast::{error::TryRecvError, Receiver};
 use tracing::debug;
 
+const MAX_NEW_TRANSACTIONS_PER_BATCH: usize = 16;
+
 /// An iterator that returns transactions that can be executed on the current state (*best*
 /// transactions).
 ///
 /// This is a wrapper around [`BestTransactions`] that also enforces a specific basefee.
 ///
-/// This iterator guarantees that all transaction it returns satisfy both the base fee and blob fee!
+/// This iterator guarantees that all transactions it returns satisfy both the base fee and blob
+/// fee!
 pub(crate) struct BestTransactionsWithFees<T: TransactionOrdering> {
     pub(crate) best: BestTransactions<T>,
     pub(crate) base_fee: u64,
@@ -29,7 +32,7 @@ pub(crate) struct BestTransactionsWithFees<T: TransactionOrdering> {
 }
 
 impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransactionsWithFees<T> {
-    fn mark_invalid(&mut self, tx: &Self::Item, kind: InvalidPoolTransactionError) {
+    fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
         BestTransactions::mark_invalid(&mut self.best, tx, kind)
     }
 
@@ -65,7 +68,7 @@ impl<T: TransactionOrdering> Iterator for BestTransactionsWithFees<T> {
             crate::traits::BestTransactions::mark_invalid(
                 self,
                 &best,
-                InvalidPoolTransactionError::Underpriced,
+                &InvalidPoolTransactionError::Underpriced,
             );
         }
     }
@@ -91,21 +94,25 @@ pub struct BestTransactions<T: TransactionOrdering> {
     /// There might be the case where a yielded transactions is invalid, this will track it.
     pub(crate) invalid: HashSet<SenderId>,
     /// Used to receive any new pending transactions that have been added to the pool after this
-    /// iterator was static fileted
+    /// iterator was static filtered
     ///
     /// These new pending transactions are inserted into this iterator's pool before yielding the
     /// next value
     pub(crate) new_transaction_receiver: Option<Receiver<PendingTransaction<T>>>,
+    /// The priority value of most recently yielded transaction.
+    ///
+    /// This is required if new pending transactions are fed in while it yields new values.
+    pub(crate) last_priority: Option<Priority<T::PriorityValue>>,
     /// Flag to control whether to skip blob transactions (EIP4844).
     pub(crate) skip_blobs: bool,
 }
 
 impl<T: TransactionOrdering> BestTransactions<T> {
-    /// Mark the transaction and it's descendants as invalid.
+    /// Mark the transaction and its descendants as invalid.
     pub(crate) fn mark_invalid(
         &mut self,
         tx: &Arc<ValidPoolTransaction<T::Transaction>>,
-        _kind: InvalidPoolTransactionError,
+        _kind: &InvalidPoolTransactionError,
     ) {
         self.invalid.insert(tx.sender_id());
     }
@@ -113,16 +120,25 @@ impl<T: TransactionOrdering> BestTransactions<T> {
     /// Returns the ancestor the given transaction, the transaction with `nonce - 1`.
     ///
     /// Note: for a transaction with nonce higher than the current on chain nonce this will always
-    /// return an ancestor since all transaction in this pool are gapless.
+    /// return an ancestor since all transactions in this pool are gapless.
     pub(crate) fn ancestor(&self, id: &TransactionId) -> Option<&PendingTransaction<T>> {
         self.all.get(&id.unchecked_ancestor()?)
     }
 
     /// Non-blocking read on the new pending transactions subscription channel
-    fn try_recv(&mut self) -> Option<PendingTransaction<T>> {
+    fn try_recv(&mut self) -> Option<IncomingTransaction<T>> {
         loop {
             match self.new_transaction_receiver.as_mut()?.try_recv() {
-                Ok(tx) => return Some(tx),
+                Ok(tx) => {
+                    if let Some(last_priority) = &self.last_priority &&
+                        &tx.priority > last_priority
+                    {
+                        // we skip transactions if we already yielded a transaction with lower
+                        // priority
+                        return Some(IncomingTransaction::Stash(tx))
+                    }
+                    return Some(IncomingTransaction::Process(tx))
+                }
                 // note TryRecvError::Lagged can be returned here, which is an error that attempts
                 // to correct itself on consecutive try_recv() attempts
 
@@ -144,47 +160,41 @@ impl<T: TransactionOrdering> BestTransactions<T> {
     /// set.
     fn pop_best(&mut self) -> Option<PendingTransaction<T>> {
         self.independent.pop_last().inspect(|best| {
-            let removed = self.all.remove(best.transaction.id());
-            debug_assert!(removed.is_some(), "must be present in both sets");
+            self.all.remove(best.transaction.id());
         })
     }
 
     /// Checks for new transactions that have come into the `PendingPool` after this iterator was
     /// created and inserts them
     fn add_new_transactions(&mut self) {
-        while let Some(pending_tx) = self.try_recv() {
-            //  same logic as PendingPool::add_transaction/PendingPool::best_with_unlocked
-            let tx_id = *pending_tx.transaction.id();
-            if self.ancestor(&tx_id).is_none() {
-                self.independent.insert(pending_tx.clone());
+        for _ in 0..MAX_NEW_TRANSACTIONS_PER_BATCH {
+            if let Some(pending_tx) = self.try_recv() {
+                //  same logic as PendingPool::add_transaction/PendingPool::best_with_unlocked
+
+                match pending_tx {
+                    IncomingTransaction::Process(tx) => {
+                        let tx_id = *tx.transaction.id();
+                        if self.ancestor(&tx_id).is_none() {
+                            self.independent.insert(tx.clone());
+                        }
+                        self.all.insert(tx_id, tx);
+                    }
+                    IncomingTransaction::Stash(tx) => {
+                        let tx_id = *tx.transaction.id();
+                        self.all.insert(tx_id, tx);
+                    }
+                }
+            } else {
+                break;
             }
-            self.all.insert(tx_id, pending_tx);
         }
     }
-}
 
-impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransactions<T> {
-    fn mark_invalid(&mut self, tx: &Self::Item, kind: InvalidPoolTransactionError) {
-        Self::mark_invalid(self, tx, kind)
-    }
-
-    fn no_updates(&mut self) {
-        self.new_transaction_receiver.take();
-    }
-
-    fn skip_blobs(&mut self) {
-        self.set_skip_blobs(true);
-    }
-
-    fn set_skip_blobs(&mut self, skip_blobs: bool) {
-        self.skip_blobs = skip_blobs;
-    }
-}
-
-impl<T: TransactionOrdering> Iterator for BestTransactions<T> {
-    type Item = Arc<ValidPoolTransaction<T::Transaction>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Returns the next best transaction and its priority value.
+    #[allow(clippy::type_complexity)]
+    pub fn next_tx_and_priority(
+        &mut self,
+    ) -> Option<(Arc<ValidPoolTransaction<T::Transaction>>, Priority<T::PriorityValue>)> {
         loop {
             self.add_new_transactions();
             // Remove the next independent tx with the highest priority
@@ -211,14 +221,71 @@ impl<T: TransactionOrdering> Iterator for BestTransactions<T> {
                 // transactions are returned
                 self.mark_invalid(
                     &best.transaction,
-                    InvalidPoolTransactionError::Eip4844(
+                    &InvalidPoolTransactionError::Eip4844(
                         Eip4844PoolTransactionError::NoEip4844Blobs,
                     ),
                 )
             } else {
-                return Some(best.transaction)
+                if self.new_transaction_receiver.is_some() {
+                    self.last_priority = Some(best.priority.clone())
+                }
+                return Some((best.transaction, best.priority))
             }
         }
+    }
+}
+
+/// Result of attempting to receive a new transaction from the channel during iteration.
+///
+/// This enum determines how a newly received transaction should be handled based on its priority
+/// relative to transactions already yielded by the iterator.
+enum IncomingTransaction<T: TransactionOrdering> {
+    /// Process the transaction normally: add to both `all` map and potentially to `independent`
+    /// set (if it has no ancestor).
+    ///
+    /// This variant is used when the transaction's priority is lower than or equal to the last
+    /// yielded transaction, meaning it can be safely processed without breaking the descending
+    /// priority order.
+    Process(PendingTransaction<T>),
+
+    /// Stash the transaction: add only to the `all` map, but NOT to the `independent` set.
+    ///
+    /// This variant is used when the transaction has a higher priority than the last yielded
+    /// transaction. We cannot yield it immediately (to maintain strict priority ordering), but we
+    /// must still track it so that:
+    /// - Its descendants can find it via `ancestor()` lookups
+    /// - We prevent those descendants from being incorrectly promoted to `independent`
+    ///
+    /// Without stashing, if a child of this transaction arrives later, it would fail to find its
+    /// parent in `all`, be marked as `independent`, and be yielded out of order (before its
+    /// parent), causing nonce gaps.
+    Stash(PendingTransaction<T>),
+}
+
+impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransactions<T> {
+    fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
+        Self::mark_invalid(self, tx, kind)
+    }
+
+    fn no_updates(&mut self) {
+        self.new_transaction_receiver.take();
+        self.last_priority.take();
+    }
+
+    fn skip_blobs(&mut self) {
+        self.set_skip_blobs(true);
+    }
+
+    fn set_skip_blobs(&mut self, skip_blobs: bool) {
+        self.skip_blobs = skip_blobs;
+    }
+}
+
+impl<T: TransactionOrdering> Iterator for BestTransactions<T> {
+    type Item = Arc<ValidPoolTransaction<T::Transaction>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_tx_and_priority().map(|(tx, _)| tx)
     }
 }
 
@@ -254,7 +321,9 @@ where
             }
             self.best.mark_invalid(
                 &best,
-                InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
+                &InvalidPoolTransactionError::Consensus(
+                    InvalidTransactionError::TxTypeNotSupported,
+                ),
             );
         }
     }
@@ -265,7 +334,7 @@ where
     I: crate::traits::BestTransactions,
     P: FnMut(&<I as Iterator>::Item) -> bool + Send,
 {
-    fn mark_invalid(&mut self, tx: &Self::Item, kind: InvalidPoolTransactionError) {
+    fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
         crate::traits::BestTransactions::mark_invalid(&mut self.best, tx, kind)
     }
 
@@ -354,7 +423,7 @@ where
     I: crate::traits::BestTransactions<Item = Arc<ValidPoolTransaction<T>>>,
     T: PoolTransaction,
 {
-    fn mark_invalid(&mut self, tx: &Self::Item, kind: InvalidPoolTransactionError) {
+    fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
         self.inner.mark_invalid(tx, kind)
     }
 
@@ -378,7 +447,6 @@ mod tests {
         test_utils::{MockOrdering, MockTransaction, MockTransactionFactory},
         BestTransactions, Priority,
     };
-    use alloy_primitives::U256;
 
     #[test]
     fn test_best_iter() {
@@ -426,7 +494,7 @@ mod tests {
         let invalid = best.independent.iter().next().unwrap();
         best.mark_invalid(
             &invalid.transaction.clone(),
-            InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
+            &InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
         );
 
         // iterator is empty
@@ -455,7 +523,7 @@ mod tests {
         crate::traits::BestTransactions::mark_invalid(
             &mut *best,
             &tx,
-            InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
+            &InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
         );
         assert!(Iterator::next(&mut best).is_none());
     }
@@ -649,7 +717,7 @@ mod tests {
         let pending_tx = PendingTransaction {
             submission_id: 10,
             transaction: Arc::new(valid_new_tx.clone()),
-            priority: Priority::Value(U256::from(1000)),
+            priority: Priority::Value(1000),
         };
         tx_sender.send(pending_tx.clone()).unwrap();
 
@@ -696,7 +764,7 @@ mod tests {
         let pending_tx1 = PendingTransaction {
             submission_id: 10,
             transaction: Arc::new(valid_new_tx1.clone()),
-            priority: Priority::Value(U256::from(1000)),
+            priority: Priority::Value(1000),
         };
         tx_sender.send(pending_tx1.clone()).unwrap();
 
@@ -719,7 +787,7 @@ mod tests {
         let pending_tx2 = PendingTransaction {
             submission_id: 11, // Different submission ID
             transaction: Arc::new(valid_new_tx2.clone()),
-            priority: Priority::Value(U256::from(1000)),
+            priority: Priority::Value(1000),
         };
         tx_sender.send(pending_tx2.clone()).unwrap();
 
@@ -756,7 +824,7 @@ mod tests {
         // Create a filter that only returns transactions with even nonces
         let filter =
             BestTransactionFilter::new(best, |tx: &Arc<ValidPoolTransaction<MockTransaction>>| {
-                tx.nonce() % 2 == 0
+                tx.nonce().is_multiple_of(2)
             });
 
         // Verify that the filter only returns transactions with even nonces
@@ -772,17 +840,24 @@ mod tests {
 
         // Add 5 plain transactions from different senders with increasing gas price
         for gas_price in 0..5 {
-            let tx = MockTransaction::eip1559().with_gas_price(gas_price);
+            let tx = MockTransaction::eip1559().with_gas_price((gas_price + 1) * 10);
             let valid_tx = f.validated(tx);
             pool.add_transaction(Arc::new(valid_tx), 0);
         }
 
-        // Add another transaction with 0 gas price that's going to be prioritized by sender
-        let prioritized_tx = MockTransaction::eip1559().with_gas_price(0);
+        // Add another transaction with 5 gas price that's going to be prioritized by sender
+        let prioritized_tx = MockTransaction::eip1559().with_gas_price(5).with_gas_limit(200);
         let valid_prioritized_tx = f.validated(prioritized_tx.clone());
         pool.add_transaction(Arc::new(valid_prioritized_tx), 0);
 
-        let prioritized_senders = HashSet::from([prioritized_tx.sender()]);
+        // Add another transaction with 3 gas price that should not be prioritized by sender because
+        // of gas limit.
+        let prioritized_tx2 = MockTransaction::eip1559().with_gas_price(3);
+        let valid_prioritized_tx2 = f.validated(prioritized_tx2.clone());
+        pool.add_transaction(Arc::new(valid_prioritized_tx2), 0);
+
+        let prioritized_senders =
+            HashSet::from([prioritized_tx.sender(), prioritized_tx2.sender()]);
         let best =
             BestTransactionsWithPrioritizedSenders::new(prioritized_senders, 200, pool.best());
 
@@ -790,13 +865,17 @@ mod tests {
         // and the rest are returned in the reverse order of gas price
         let mut iter = best.into_iter();
         let top_of_block_tx = iter.next().unwrap();
-        assert_eq!(top_of_block_tx.max_fee_per_gas(), 0);
+        assert_eq!(top_of_block_tx.max_fee_per_gas(), 5);
         assert_eq!(top_of_block_tx.sender(), prioritized_tx.sender());
         for gas_price in (0..5).rev() {
-            assert_eq!(iter.next().unwrap().max_fee_per_gas(), gas_price);
+            assert_eq!(iter.next().unwrap().max_fee_per_gas(), (gas_price + 1) * 10);
         }
 
-        // TODO: Test that gas limits for prioritized transactions are respected
+        // Due to the gas limit, the transaction from second-prioritized sender was not
+        // prioritized.
+        let top_of_block_tx2 = iter.next().unwrap();
+        assert_eq!(top_of_block_tx2.max_fee_per_gas(), 3);
+        assert_eq!(top_of_block_tx2.sender(), prioritized_tx2.sender());
     }
 
     #[test]
@@ -921,5 +1000,47 @@ mod tests {
         assert!(best.new_transaction_receiver.is_none());
     }
 
-    // TODO: Same nonce test
+    #[test]
+    fn test_best_update_transaction_priority() {
+        let mut pool = PendingPool::new(MockOrdering::default());
+        let mut f = MockTransactionFactory::default();
+
+        // Add 5 transactions with increasing nonces to the pool
+        let num_tx = 5;
+        let tx = MockTransaction::eip1559();
+        for nonce in 0..num_tx {
+            let tx = tx.clone().rng_hash().with_nonce(nonce);
+            let valid_tx = f.validated(tx);
+            pool.add_transaction(Arc::new(valid_tx), 0);
+        }
+
+        // Create a BestTransactions iterator from the pool
+        let mut best = pool.best();
+
+        // Use a broadcast channel for transaction updates
+        let (tx_sender, tx_receiver) =
+            tokio::sync::broadcast::channel::<PendingTransaction<MockOrdering>>(1000);
+        best.new_transaction_receiver = Some(tx_receiver);
+
+        // yield one tx, effectively locking in the highest prio
+        let first = best.next().unwrap();
+
+        // Create a new transaction with nonce 5 and validate it
+        let new_higher_fee_tx = MockTransaction::eip1559().with_nonce(0);
+        let valid_new_higher_fee_tx = f.validated(new_higher_fee_tx);
+
+        // Send the new transaction through the broadcast channel
+        let pending_tx = PendingTransaction {
+            submission_id: 10,
+            transaction: Arc::new(valid_new_higher_fee_tx.clone()),
+            priority: Priority::Value(u128::MAX),
+        };
+        tx_sender.send(pending_tx).unwrap();
+
+        // ensure that the higher prio tx is skipped since we yielded a lower one
+        for tx in best {
+            assert_eq!(tx.sender_id(), first.sender_id());
+            assert_ne!(tx.sender_id(), valid_new_higher_fee_tx.sender_id());
+        }
+    }
 }

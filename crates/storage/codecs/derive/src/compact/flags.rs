@@ -51,11 +51,12 @@ pub(crate) fn generate_flag_struct(
         quote! {
             buf.get_u8(),
         };
-        total_bytes.into()
+        total_bytes
     ];
 
-    let docs =
-        format!("Fieldset that facilitates compacting the parent type. Used bytes: {total_bytes} | Unused bits: {unused_bits}");
+    let docs = format!(
+        "Fieldset that facilitates compacting the parent type. Used bytes: {total_bytes} | Unused bits: {unused_bits}"
+    );
     let bitflag_encoded_bytes = format!("Used bytes by [`{flags_ident}`]");
     let bitflag_unused_bits = format!("Unused bits for new fields by [`{flags_ident}`]");
     let impl_bitflag_encoded_bytes = if has_lifetime {
@@ -63,11 +64,11 @@ pub(crate) fn generate_flag_struct(
             impl<'a> #ident<'a> {
                 #[doc = #bitflag_encoded_bytes]
                 pub const fn bitflag_encoded_bytes() -> usize {
-                    #total_bytes as usize
+                    #total_bytes
                 }
                 #[doc = #bitflag_unused_bits]
                 pub const fn bitflag_unused_bits() -> usize {
-                    #unused_bits as usize
+                    #unused_bits
                 }
            }
         }
@@ -76,11 +77,11 @@ pub(crate) fn generate_flag_struct(
             impl #ident {
                 #[doc = #bitflag_encoded_bytes]
                 pub const fn bitflag_encoded_bytes() -> usize {
-                    #total_bytes as usize
+                    #total_bytes
                 }
                 #[doc = #bitflag_unused_bits]
                 pub const fn bitflag_unused_bits() -> usize {
-                    #unused_bits as usize
+                    #unused_bits
                 }
            }
         }
@@ -90,7 +91,7 @@ pub(crate) fn generate_flag_struct(
     quote! {
         #impl_bitflag_encoded_bytes
         pub use #mod_flags_ident::#flags_ident;
-        #[allow(non_snake_case)]
+        #[expect(non_snake_case)]
         mod #mod_flags_ident {
             use #reth_codecs::__private::Buf;
             use #reth_codecs::__private::modular_bitfield;
@@ -122,8 +123,8 @@ fn build_struct_field_flags(
     fields: Vec<&StructFieldDescriptor>,
     field_flags: &mut Vec<TokenStream2>,
     is_zstd: bool,
-) -> u8 {
-    let mut total_bits = 0;
+) -> usize {
+    let mut total_bits: usize = 0;
 
     // Find out the adequate bit size for the length of each field, if applicable.
     for field in fields {
@@ -137,7 +138,7 @@ fn build_struct_field_flags(
                 let name = format_ident!("{name}_len");
                 let bitsize = get_bit_size(ftype);
                 let bsize = format_ident!("B{bitsize}");
-                total_bits += bitsize;
+                total_bits += bitsize as usize;
 
                 field_flags.push(quote! {
                     pub #name: #bsize ,
@@ -169,7 +170,7 @@ fn build_struct_field_flags(
 /// skipped field.
 ///
 /// Returns the total number of bytes used by the flags struct and how many unused bits.
-fn pad_flag_struct(total_bits: u8, field_flags: &mut Vec<TokenStream2>) -> (u8, u8) {
+fn pad_flag_struct(total_bits: usize, field_flags: &mut Vec<TokenStream2>) -> (usize, usize) {
     let remaining = 8 - total_bits % 8;
     if remaining == 8 {
         (total_bits / 8, 0)

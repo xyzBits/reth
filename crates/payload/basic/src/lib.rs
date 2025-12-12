@@ -6,20 +6,20 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use crate::metrics::PayloadBuilderMetrics;
 use alloy_eips::merge::SLOT_DURATION;
 use alloy_primitives::{B256, U256};
 use futures_core::ready;
 use futures_util::FutureExt;
+use reth_chain_state::CanonStateNotification;
 use reth_payload_builder::{KeepPayloadJobAlive, PayloadId, PayloadJob, PayloadJobGenerator};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes, PayloadKind};
-use reth_primitives::{NodePrimitives, SealedHeader};
-use reth_primitives_traits::HeaderTy;
-use reth_provider::{BlockReaderIdExt, CanonStateNotification, StateProviderFactory};
+use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader};
 use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop};
+use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
 use std::{
     fmt,
@@ -36,9 +36,11 @@ use tokio::{
 };
 use tracing::{debug, trace, warn};
 
+mod better_payload_emitter;
 mod metrics;
 mod stack;
 
+pub use better_payload_emitter::BetterPayloadEmitter;
 pub use stack::PayloadBuilderStack;
 
 /// Helper to access [`NodePrimitives::BlockHeader`] from [`PayloadBuilder::BuiltPayload`].
@@ -453,6 +455,10 @@ where
         Ok(self.config.attributes.clone())
     }
 
+    fn payload_timestamp(&self) -> Result<u64, PayloadBuilderError> {
+        Ok(self.config.attributes.timestamp())
+    }
+
     fn resolve_kind(
         &mut self,
         kind: PayloadKind,
@@ -581,15 +587,15 @@ where
         let this = self.get_mut();
 
         // check if there is a better payload before returning the best payload
-        if let Some(fut) = Pin::new(&mut this.maybe_better).as_pin_mut() {
-            if let Poll::Ready(res) = fut.poll(cx) {
-                this.maybe_better = None;
-                if let Ok(Some(payload)) = res.map(|out| out.into_payload())
-                    .inspect_err(|err| warn!(target: "payload_builder", %err, "failed to resolve pending payload"))
-                {
-                    debug!(target: "payload_builder", "resolving better payload");
-                    return Poll::Ready(Ok(payload))
-                }
+        if let Some(fut) = Pin::new(&mut this.maybe_better).as_pin_mut() &&
+            let Poll::Ready(res) = fut.poll(cx)
+        {
+            this.maybe_better = None;
+            if let Ok(Some(payload)) = res.map(|out| out.into_payload()).inspect_err(
+                |err| warn!(target: "payload_builder", %err, "failed to resolve pending payload"),
+            ) {
+                debug!(target: "payload_builder", "resolving better payload");
+                return Poll::Ready(Ok(payload))
             }
         }
 
@@ -598,20 +604,20 @@ where
             return Poll::Ready(Ok(best))
         }
 
-        if let Some(fut) = Pin::new(&mut this.empty_payload).as_pin_mut() {
-            if let Poll::Ready(res) = fut.poll(cx) {
-                this.empty_payload = None;
-                return match res {
-                    Ok(res) => {
-                        if let Err(err) = &res {
-                            warn!(target: "payload_builder", %err, "failed to resolve empty payload");
-                        } else {
-                            debug!(target: "payload_builder", "resolving empty payload");
-                        }
-                        Poll::Ready(res)
+        if let Some(fut) = Pin::new(&mut this.empty_payload).as_pin_mut() &&
+            let Poll::Ready(res) = fut.poll(cx)
+        {
+            this.empty_payload = None;
+            return match res {
+                Ok(res) => {
+                    if let Err(err) = &res {
+                        warn!(target: "payload_builder", %err, "failed to resolve empty payload");
+                    } else {
+                        debug!(target: "payload_builder", "resolving empty payload");
                     }
-                    Err(err) => Poll::Ready(Err(err.into())),
+                    Poll::Ready(res)
                 }
+                Err(err) => Poll::Ready(Err(err.into())),
             }
         }
 
@@ -700,8 +706,16 @@ pub enum BuildOutcome<Payload> {
 }
 
 impl<Payload> BuildOutcome<Payload> {
-    /// Consumes the type and returns the payload if the outcome is `Better`.
+    /// Consumes the type and returns the payload if the outcome is `Better` or `Freeze`.
     pub fn into_payload(self) -> Option<Payload> {
+        match self {
+            Self::Better { payload, .. } | Self::Freeze(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// Consumes the type and returns the payload if the outcome is `Better` or `Freeze`.
+    pub const fn payload(&self) -> Option<&Payload> {
         match self {
             Self::Better { payload, .. } | Self::Freeze(payload) => Some(payload),
             _ => None,
@@ -711,6 +725,11 @@ impl<Payload> BuildOutcome<Payload> {
     /// Returns true if the outcome is `Better`.
     pub const fn is_better(&self) -> bool {
         matches!(self, Self::Better { .. })
+    }
+
+    /// Returns true if the outcome is `Freeze`.
+    pub const fn is_frozen(&self) -> bool {
+        matches!(self, Self::Freeze { .. })
     }
 
     /// Returns true if the outcome is `Aborted`.
@@ -724,7 +743,7 @@ impl<Payload> BuildOutcome<Payload> {
     }
 
     /// Applies a fn on the current payload.
-    pub(crate) fn map_payload<F, P>(self, f: F) -> BuildOutcome<P>
+    pub fn map_payload<F, P>(self, f: F) -> BuildOutcome<P>
     where
         F: FnOnce(Payload) -> P,
     {
@@ -850,10 +869,12 @@ pub trait PayloadBuilder: Send + Sync + Clone {
 /// Tells the payload builder how to react to payload request if there's no payload available yet.
 ///
 /// This situation can occur if the CL requests a payload before the first payload has been built.
+#[derive(Default)]
 pub enum MissingPayloadBehaviour<Payload> {
     /// Await the regular scheduled payload process.
     AwaitInProgress,
     /// Race the in progress payload process with an empty payload.
+    #[default]
     RaceEmptyPayload,
     /// Race the in progress payload process with this job.
     RacePayload(Box<dyn FnOnce() -> Result<Payload, PayloadBuilderError> + Send>),
@@ -868,12 +889,6 @@ impl<Payload> fmt::Debug for MissingPayloadBehaviour<Payload> {
             }
             Self::RacePayload(_) => write!(f, "RacePayload"),
         }
-    }
-}
-
-impl<Payload> Default for MissingPayloadBehaviour<Payload> {
-    fn default() -> Self {
-        Self::RaceEmptyPayload
     }
 }
 

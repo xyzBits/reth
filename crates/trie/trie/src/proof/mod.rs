@@ -1,8 +1,11 @@
 use crate::{
-    hashed_cursor::{HashedCursorFactory, HashedStorageCursor},
+    hashed_cursor::{
+        HashedCursorFactory, HashedCursorMetricsCache, HashedStorageCursor,
+        InstrumentedHashedCursor,
+    },
     node_iter::{TrieElement, TrieNodeIter},
     prefix_set::{PrefixSetMut, TriePrefixSetsMut},
-    trie_cursor::TrieCursorFactory,
+    trie_cursor::{InstrumentedTrieCursor, TrieCursorFactory, TrieCursorMetricsCache},
     walker::TrieWalker,
     HashBuilder, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE,
 };
@@ -12,13 +15,14 @@ use alloy_primitives::{
     Address, B256,
 };
 use alloy_rlp::{BufMut, Encodable};
+use alloy_trie::proof::AddedRemovedKeys;
 use reth_execution_errors::trie::StateProofError;
 use reth_trie_common::{
     proof::ProofRetainer, AccountProof, MultiProof, MultiProofTargets, StorageMultiProof,
 };
 
-mod blinded;
-pub use blinded::*;
+mod trie_node;
+pub use trie_node::*;
 
 /// A struct for generating merkle proofs.
 ///
@@ -79,6 +83,16 @@ impl<T, H> Proof<T, H> {
         self.collect_branch_node_masks = branch_node_masks;
         self
     }
+
+    /// Get a reference to the trie cursor factory.
+    pub const fn trie_cursor_factory(&self) -> &T {
+        &self.trie_cursor_factory
+    }
+
+    /// Get a reference to the hashed cursor factory.
+    pub const fn hashed_cursor_factory(&self) -> &H {
+        &self.hashed_cursor_factory
+    }
 }
 
 impl<T, H> Proof<T, H>
@@ -111,7 +125,7 @@ where
         // Create the walker.
         let mut prefix_set = self.prefix_sets.account_prefix_set.clone();
         prefix_set.extend_keys(targets.keys().map(Nibbles::unpack));
-        let walker = TrieWalker::new(trie_cursor, prefix_set.freeze());
+        let walker = TrieWalker::<_>::state_trie(trie_cursor, prefix_set.freeze());
 
         // Create a hash builder to rebuild the root node since it is not available in the database.
         let retainer = targets.keys().map(Nibbles::unpack).collect();
@@ -120,11 +134,11 @@ where
             .with_updates(self.collect_branch_node_masks);
 
         // Initialize all storage multiproofs as empty.
-        // Storage multiproofs for non empty tries will be overwritten if necessary.
+        // Storage multiproofs for non-empty tries will be overwritten if necessary.
         let mut storages: B256Map<_> =
             targets.keys().map(|key| (*key, StorageMultiProof::empty())).collect();
         let mut account_rlp = Vec::with_capacity(TRIE_ACCOUNT_RLP_MAX_SIZE);
-        let mut account_node_iter = TrieNodeIter::new(walker, hashed_account_cursor);
+        let mut account_node_iter = TrieNodeIter::state_trie(walker, hashed_account_cursor);
         while let Some(account_node) = account_node_iter.try_next()? {
             match account_node {
                 TrieElement::Branch(node) => {
@@ -133,6 +147,8 @@ where
                 TrieElement::Leaf(hashed_address, account) => {
                     let proof_targets = targets.remove(&hashed_address);
                     let leaf_is_proof_target = proof_targets.is_some();
+                    let collect_storage_masks =
+                        self.collect_branch_node_masks && leaf_is_proof_target;
                     let storage_prefix_set = self
                         .prefix_sets
                         .storage_prefix_sets
@@ -144,7 +160,7 @@ where
                         hashed_address,
                     )
                     .with_prefix_set_mut(storage_prefix_set)
-                    .with_branch_node_masks(self.collect_branch_node_masks)
+                    .with_branch_node_masks(collect_storage_masks)
                     .storage_multiproof(proof_targets.unwrap_or_default())?;
 
                     // Encode account
@@ -167,10 +183,7 @@ where
         let (branch_node_hash_masks, branch_node_tree_masks) = if self.collect_branch_node_masks {
             let updated_branch_nodes = hash_builder.updated_branch_nodes.unwrap_or_default();
             (
-                updated_branch_nodes
-                    .iter()
-                    .map(|(path, node)| (path.clone(), node.hash_mask))
-                    .collect(),
+                updated_branch_nodes.iter().map(|(path, node)| (*path, node.hash_mask)).collect(),
                 updated_branch_nodes
                     .into_iter()
                     .map(|(path, node)| (path, node.tree_mask))
@@ -186,7 +199,7 @@ where
 
 /// Generates storage merkle proofs.
 #[derive(Debug)]
-pub struct StorageProof<T, H> {
+pub struct StorageProof<'a, T, H, K = AddedRemovedKeys> {
     /// The factory for traversing trie nodes.
     trie_cursor_factory: T,
     /// The factory for hashed cursors.
@@ -197,9 +210,15 @@ pub struct StorageProof<T, H> {
     prefix_set: PrefixSetMut,
     /// Flag indicating whether to include branch node masks in the proof.
     collect_branch_node_masks: bool,
+    /// Provided by the user to give the necessary context to retain extra proofs.
+    added_removed_keys: Option<K>,
+    /// Optional reference to accumulate trie cursor metrics.
+    trie_cursor_metrics: Option<&'a mut TrieCursorMetricsCache>,
+    /// Optional reference to accumulate hashed cursor metrics.
+    hashed_cursor_metrics: Option<&'a mut HashedCursorMetricsCache>,
 }
 
-impl<T, H> StorageProof<T, H> {
+impl<T, H> StorageProof<'static, T, H> {
     /// Create a new [`StorageProof`] instance.
     pub fn new(t: T, h: H, address: Address) -> Self {
         Self::new_hashed(t, h, keccak256(address))
@@ -213,28 +232,45 @@ impl<T, H> StorageProof<T, H> {
             hashed_address,
             prefix_set: PrefixSetMut::default(),
             collect_branch_node_masks: false,
+            added_removed_keys: None,
+            trie_cursor_metrics: None,
+            hashed_cursor_metrics: None,
         }
     }
+}
 
+impl<'a, T, H, K> StorageProof<'a, T, H, K> {
     /// Set the trie cursor factory.
-    pub fn with_trie_cursor_factory<TF>(self, trie_cursor_factory: TF) -> StorageProof<TF, H> {
+    pub fn with_trie_cursor_factory<TF>(
+        self,
+        trie_cursor_factory: TF,
+    ) -> StorageProof<'a, TF, H, K> {
         StorageProof {
             trie_cursor_factory,
             hashed_cursor_factory: self.hashed_cursor_factory,
             hashed_address: self.hashed_address,
             prefix_set: self.prefix_set,
             collect_branch_node_masks: self.collect_branch_node_masks,
+            added_removed_keys: self.added_removed_keys,
+            trie_cursor_metrics: self.trie_cursor_metrics,
+            hashed_cursor_metrics: self.hashed_cursor_metrics,
         }
     }
 
     /// Set the hashed cursor factory.
-    pub fn with_hashed_cursor_factory<HF>(self, hashed_cursor_factory: HF) -> StorageProof<T, HF> {
+    pub fn with_hashed_cursor_factory<HF>(
+        self,
+        hashed_cursor_factory: HF,
+    ) -> StorageProof<'a, T, HF, K> {
         StorageProof {
             trie_cursor_factory: self.trie_cursor_factory,
             hashed_cursor_factory,
             hashed_address: self.hashed_address,
             prefix_set: self.prefix_set,
             collect_branch_node_masks: self.collect_branch_node_masks,
+            added_removed_keys: self.added_removed_keys,
+            trie_cursor_metrics: self.trie_cursor_metrics,
+            hashed_cursor_metrics: self.hashed_cursor_metrics,
         }
     }
 
@@ -249,12 +285,52 @@ impl<T, H> StorageProof<T, H> {
         self.collect_branch_node_masks = branch_node_masks;
         self
     }
+
+    /// Set the trie cursor metrics cache to accumulate metrics into.
+    pub const fn with_trie_cursor_metrics(
+        mut self,
+        metrics: &'a mut TrieCursorMetricsCache,
+    ) -> Self {
+        self.trie_cursor_metrics = Some(metrics);
+        self
+    }
+
+    /// Set the hashed cursor metrics cache to accumulate metrics into.
+    pub const fn with_hashed_cursor_metrics(
+        mut self,
+        metrics: &'a mut HashedCursorMetricsCache,
+    ) -> Self {
+        self.hashed_cursor_metrics = Some(metrics);
+        self
+    }
+
+    /// Configures the retainer to retain proofs for certain nodes which would otherwise fall
+    /// outside the target set, when those nodes might be required to calculate the state root when
+    /// keys have been added or removed to the trie.
+    ///
+    /// If None is given then retention of extra proofs is disabled.
+    pub fn with_added_removed_keys<K2>(
+        self,
+        added_removed_keys: Option<K2>,
+    ) -> StorageProof<'a, T, H, K2> {
+        StorageProof {
+            trie_cursor_factory: self.trie_cursor_factory,
+            hashed_cursor_factory: self.hashed_cursor_factory,
+            hashed_address: self.hashed_address,
+            prefix_set: self.prefix_set,
+            collect_branch_node_masks: self.collect_branch_node_masks,
+            added_removed_keys,
+            trie_cursor_metrics: self.trie_cursor_metrics,
+            hashed_cursor_metrics: self.hashed_cursor_metrics,
+        }
+    }
 }
 
-impl<T, H> StorageProof<T, H>
+impl<'a, T, H, K> StorageProof<'a, T, H, K>
 where
     T: TrieCursorFactory,
     H: HashedCursorFactory,
+    K: AsRef<AddedRemovedKeys>,
 {
     /// Generate an account proof from intermediate nodes.
     pub fn storage_proof(
@@ -267,28 +343,45 @@ where
 
     /// Generate storage proof.
     pub fn storage_multiproof(
-        mut self,
+        self,
         targets: B256Set,
     ) -> Result<StorageMultiProof, StateProofError> {
-        let mut hashed_storage_cursor =
+        let mut discard_hashed_cursor_metrics = HashedCursorMetricsCache::default();
+        let hashed_cursor_metrics =
+            self.hashed_cursor_metrics.unwrap_or(&mut discard_hashed_cursor_metrics);
+
+        let hashed_storage_cursor =
             self.hashed_cursor_factory.hashed_storage_cursor(self.hashed_address)?;
+
+        let mut hashed_storage_cursor =
+            InstrumentedHashedCursor::new(hashed_storage_cursor, hashed_cursor_metrics);
 
         // short circuit on empty storage
         if hashed_storage_cursor.is_storage_empty()? {
             return Ok(StorageMultiProof::empty())
         }
 
+        let mut discard_trie_cursor_metrics = TrieCursorMetricsCache::default();
+        let trie_cursor_metrics =
+            self.trie_cursor_metrics.unwrap_or(&mut discard_trie_cursor_metrics);
+
         let target_nibbles = targets.into_iter().map(Nibbles::unpack).collect::<Vec<_>>();
-        self.prefix_set.extend_keys(target_nibbles.clone());
+        let mut prefix_set = self.prefix_set;
+        prefix_set.extend_keys(target_nibbles.clone());
 
         let trie_cursor = self.trie_cursor_factory.storage_trie_cursor(self.hashed_address)?;
-        let walker = TrieWalker::new(trie_cursor, self.prefix_set.freeze());
 
-        let retainer = ProofRetainer::from_iter(target_nibbles);
+        let trie_cursor = InstrumentedTrieCursor::new(trie_cursor, trie_cursor_metrics);
+
+        let walker = TrieWalker::<_>::storage_trie(trie_cursor, prefix_set.freeze())
+            .with_added_removed_keys(self.added_removed_keys.as_ref());
+
+        let retainer = ProofRetainer::from_iter(target_nibbles)
+            .with_added_removed_keys(self.added_removed_keys.as_ref());
         let mut hash_builder = HashBuilder::default()
             .with_proof_retainer(retainer)
             .with_updates(self.collect_branch_node_masks);
-        let mut storage_node_iter = TrieNodeIter::new(walker, hashed_storage_cursor);
+        let mut storage_node_iter = TrieNodeIter::storage_trie(walker, hashed_storage_cursor);
         while let Some(node) = storage_node_iter.try_next()? {
             match node {
                 TrieElement::Branch(node) => {
@@ -308,10 +401,7 @@ where
         let (branch_node_hash_masks, branch_node_tree_masks) = if self.collect_branch_node_masks {
             let updated_branch_nodes = hash_builder.updated_branch_nodes.unwrap_or_default();
             (
-                updated_branch_nodes
-                    .iter()
-                    .map(|(path, node)| (path.clone(), node.hash_mask))
-                    .collect(),
+                updated_branch_nodes.iter().map(|(path, node)| (*path, node.hash_mask)).collect(),
                 updated_branch_nodes
                     .into_iter()
                     .map(|(path, node)| (path, node.tree_mask))

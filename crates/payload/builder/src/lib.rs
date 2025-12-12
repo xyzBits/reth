@@ -28,10 +28,10 @@
 //! use std::pin::Pin;
 //! use std::sync::Arc;
 //! use std::task::{Context, Poll};
-//! use alloy_consensus::Header;
+//! use alloy_consensus::{Header, Block};
 //! use alloy_primitives::U256;
 //! use reth_payload_builder::{EthBuiltPayload, PayloadBuilderError, KeepPayloadJobAlive, EthPayloadBuilderAttributes, PayloadJob, PayloadJobGenerator, PayloadKind};
-//! use reth_primitives::{Block, SealedBlock};
+//! use reth_primitives_traits::SealedBlock;
 //!
 //! /// The generator type that creates new jobs that builds empty blocks.
 //! pub struct EmptyBlockPayloadJobGenerator;
@@ -75,6 +75,10 @@
 //!     Ok(self.attributes.clone())
 //! }
 //!
+//! fn payload_timestamp(&self) -> Result<u64, PayloadBuilderError> {
+//!     Ok(self.attributes.timestamp)
+//! }
+//!
 //! fn resolve_kind(&mut self, _kind: PayloadKind) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive) {
 //!        let payload = self.best_payload();
 //!        (futures_util::future::ready(payload), KeepPayloadJobAlive::No)
@@ -101,7 +105,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod metrics;
 mod service;
@@ -122,4 +126,6 @@ pub use traits::{KeepPayloadJobAlive, PayloadJob, PayloadJobGenerator};
 
 // re-export the Ethereum engine primitives for convenience
 #[doc(inline)]
-pub use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadBuilderAttributes};
+pub use reth_ethereum_engine_primitives::{
+    BlobSidecars, EthBuiltPayload, EthPayloadBuilderAttributes,
+};

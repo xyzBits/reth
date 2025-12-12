@@ -1,24 +1,15 @@
 //! Contains RPC handler implementations specific to tracing.
 
-use reth_evm::ConfigureEvm;
-use reth_provider::{BlockReader, ProviderHeader, ProviderTx};
-use reth_rpc_eth_api::{
-    helpers::{LoadState, Trace},
-    FromEvmError,
-};
+use reth_rpc_convert::RpcConvert;
+use reth_rpc_eth_api::{helpers::Trace, FromEvmError, RpcNodeCore};
+use reth_rpc_eth_types::EthApiError;
 
 use crate::EthApi;
 
-impl<Provider, Pool, Network, EvmConfig> Trace for EthApi<Provider, Pool, Network, EvmConfig>
+impl<N, Rpc> Trace for EthApi<N, Rpc>
 where
-    Self: LoadState<
-        Provider: BlockReader,
-        Evm: ConfigureEvm<
-            Header = ProviderHeader<Self::Provider>,
-            Transaction = ProviderTx<Self::Provider>,
-        >,
-        Error: FromEvmError<Self::Evm>,
-    >,
-    Provider: BlockReader,
+    N: RpcNodeCore,
+    EthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError, Evm = N::Evm>,
 {
 }

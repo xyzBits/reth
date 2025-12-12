@@ -190,16 +190,17 @@ mod tests {
         let factory = create_test_provider_factory();
         let (headers, mut bodies) = generate_bodies(0..=19);
 
-        insert_headers(factory.db_ref().db(), &headers);
+        insert_headers(&factory, &headers);
 
         let client = Arc::new(
             TestBodiesClient::default().with_bodies(bodies.clone()).with_should_delay(true),
         );
-        let downloader = BodiesDownloaderBuilder::default().build::<reth_primitives::Block, _, _>(
-            client.clone(),
-            Arc::new(TestConsensus::default()),
-            factory,
-        );
+        let downloader = BodiesDownloaderBuilder::default()
+            .build::<reth_ethereum_primitives::Block, _, _>(
+                client.clone(),
+                Arc::new(TestConsensus::default()),
+                factory,
+            );
         let mut downloader = TaskDownloader::spawn(downloader);
 
         downloader.set_download_range(0..=19).expect("failed to set download range");
@@ -212,16 +213,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::reversed_empty_ranges)]
+    #[expect(clippy::reversed_empty_ranges)]
     async fn set_download_range_error_returned() {
         reth_tracing::init_test_tracing();
         let factory = create_test_provider_factory();
 
-        let downloader = BodiesDownloaderBuilder::default().build::<reth_primitives::Block, _, _>(
-            Arc::new(TestBodiesClient::default()),
-            Arc::new(TestConsensus::default()),
-            factory,
-        );
+        let downloader = BodiesDownloaderBuilder::default()
+            .build::<reth_ethereum_primitives::Block, _, _>(
+                Arc::new(TestBodiesClient::default()),
+                Arc::new(TestConsensus::default()),
+                factory,
+            );
         let mut downloader = TaskDownloader::spawn(downloader);
 
         downloader.set_download_range(1..=0).expect("failed to set download range");

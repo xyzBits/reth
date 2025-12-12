@@ -5,11 +5,11 @@ use crate::{
     PayloadBuilderHandle, PayloadBuilderService, PayloadJob, PayloadJobGenerator,
 };
 
+use alloy_consensus::Block;
 use alloy_primitives::U256;
 use reth_chain_state::CanonStateNotification;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{PayloadKind, PayloadTypes};
-use reth_primitives::Block;
 use reth_primitives_traits::Block as _;
 use std::{
     future::Future,
@@ -96,6 +96,10 @@ impl PayloadJob for TestPayloadJob {
 
     fn payload_attributes(&self) -> Result<EthPayloadBuilderAttributes, PayloadBuilderError> {
         Ok(self.attr.clone())
+    }
+
+    fn payload_timestamp(&self) -> Result<u64, PayloadBuilderError> {
+        Ok(self.attr.timestamp)
     }
 
     fn resolve_kind(

@@ -1,7 +1,7 @@
 use crate::tree::metrics::BlockBufferMetrics;
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockHash, BlockNumber};
-use reth_primitives_traits::{Block, RecoveredBlock};
+use reth_primitives_traits::{Block, SealedBlock};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Contains the tree of pending blocks that cannot be executed due to missing parent.
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[derive(Debug)]
 pub struct BlockBuffer<B: Block> {
     /// All blocks in the buffer stored by their block hash.
-    pub(crate) blocks: HashMap<BlockHash, RecoveredBlock<B>>,
+    pub(crate) blocks: HashMap<BlockHash, SealedBlock<B>>,
     /// Map of any parent block hash (even the ones not currently in the buffer)
     /// to the buffered children.
     /// Allows connecting buffered blocks by parent.
@@ -49,12 +49,12 @@ impl<B: Block> BlockBuffer<B> {
     }
 
     /// Return reference to the requested block.
-    pub fn block(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
+    pub fn block(&self, hash: &BlockHash) -> Option<&SealedBlock<B>> {
         self.blocks.get(hash)
     }
 
     /// Return a reference to the lowest ancestor of the given block in the buffer.
-    pub fn lowest_ancestor(&self, hash: &BlockHash) -> Option<&RecoveredBlock<B>> {
+    pub fn lowest_ancestor(&self, hash: &BlockHash) -> Option<&SealedBlock<B>> {
         let mut current_block = self.blocks.get(hash)?;
         while let Some(parent) = self.blocks.get(&current_block.parent_hash()) {
             current_block = parent;
@@ -63,7 +63,7 @@ impl<B: Block> BlockBuffer<B> {
     }
 
     /// Insert a correct block inside the buffer.
-    pub fn insert_block(&mut self, block: RecoveredBlock<B>) {
+    pub fn insert_block(&mut self, block: SealedBlock<B>) {
         let hash = block.hash();
 
         self.parent_to_child.entry(block.parent_hash()).or_default().insert(hash);
@@ -74,9 +74,7 @@ impl<B: Block> BlockBuffer<B> {
         if self.block_queue.len() >= self.max_blocks {
             // Evict oldest block if limit is hit
             if let Some(evicted_hash) = self.block_queue.pop_front() {
-                if let Some(evicted_block) = self.remove_block(&evicted_hash) {
-                    self.remove_from_parent(evicted_block.parent_hash(), &evicted_hash);
-                }
+                self.remove_block(&evicted_hash);
             }
         }
         self.block_queue.push_back(hash);
@@ -89,10 +87,7 @@ impl<B: Block> BlockBuffer<B> {
     ///
     /// Note: that order of returned blocks is important and the blocks with lower block number
     /// in the chain will come first so that they can be executed in the correct order.
-    pub fn remove_block_with_children(
-        &mut self,
-        parent_hash: &BlockHash,
-    ) -> Vec<RecoveredBlock<B>> {
+    pub fn remove_block_with_children(&mut self, parent_hash: &BlockHash) -> Vec<SealedBlock<B>> {
         let removed = self
             .remove_block(parent_hash)
             .into_iter()
@@ -151,7 +146,7 @@ impl<B: Block> BlockBuffer<B> {
     /// This method will only remove the block if it's present inside `self.blocks`.
     /// The block might be missing from other collections, the method will only ensure that it has
     /// been removed.
-    fn remove_block(&mut self, hash: &BlockHash) -> Option<RecoveredBlock<B>> {
+    fn remove_block(&mut self, hash: &BlockHash) -> Option<SealedBlock<B>> {
         let block = self.blocks.remove(hash)?;
         self.remove_from_earliest_blocks(block.number(), hash);
         self.remove_from_parent(block.parent_hash(), hash);
@@ -160,7 +155,7 @@ impl<B: Block> BlockBuffer<B> {
     }
 
     /// Remove all children and their descendants for the given blocks and return them.
-    fn remove_children(&mut self, parent_hashes: Vec<BlockHash>) -> Vec<RecoveredBlock<B>> {
+    fn remove_children(&mut self, parent_hashes: Vec<BlockHash>) -> Vec<SealedBlock<B>> {
         // remove all parent child connection and all the child children blocks that are connected
         // to the discarded parent blocks.
         let mut remove_parent_children = parent_hashes;
@@ -186,7 +181,6 @@ mod tests {
     use super::*;
     use alloy_eips::BlockNumHash;
     use alloy_primitives::BlockHash;
-    use reth_primitives_traits::RecoveredBlock;
     use reth_testing_utils::generators::{self, random_block, BlockParams, Rng};
     use std::collections::HashMap;
 
@@ -195,10 +189,8 @@ mod tests {
         rng: &mut R,
         number: u64,
         parent: BlockHash,
-    ) -> RecoveredBlock<reth_ethereum_primitives::Block> {
-        let block =
-            random_block(rng, number, BlockParams { parent: Some(parent), ..Default::default() });
-        block.try_recover().unwrap()
+    ) -> SealedBlock<reth_ethereum_primitives::Block> {
+        random_block(rng, number, BlockParams { parent: Some(parent), ..Default::default() })
     }
 
     /// Assert that all buffer collections have the same data length.
@@ -218,7 +210,7 @@ mod tests {
     /// Assert that the block was removed from all buffer collections.
     fn assert_block_removal<B: Block>(
         buffer: &BlockBuffer<B>,
-        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        block: &SealedBlock<reth_ethereum_primitives::Block>,
     ) {
         assert!(!buffer.blocks.contains_key(&block.hash()));
         assert!(buffer
@@ -236,7 +228,7 @@ mod tests {
     #[test]
     fn simple_insertion() {
         let mut rng = generators::rng();
-        let parent = rng.gen();
+        let parent = rng.random();
         let block1 = create_block(&mut rng, 10, parent);
         let mut buffer = BlockBuffer::new(3);
 
@@ -249,11 +241,11 @@ mod tests {
     fn take_entire_chain_of_children() {
         let mut rng = generators::rng();
 
-        let main_parent_hash = rng.gen();
+        let main_parent_hash = rng.random();
         let block1 = create_block(&mut rng, 10, main_parent_hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 12, block2.hash());
-        let parent4 = rng.gen();
+        let parent4 = rng.random();
         let block4 = create_block(&mut rng, 14, parent4);
 
         let mut buffer = BlockBuffer::new(5);
@@ -282,7 +274,7 @@ mod tests {
     fn take_all_multi_level_children() {
         let mut rng = generators::rng();
 
-        let main_parent_hash = rng.gen();
+        let main_parent_hash = rng.random();
         let block1 = create_block(&mut rng, 10, main_parent_hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 11, block1.hash());
@@ -316,7 +308,7 @@ mod tests {
     fn take_block_with_children() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 11, block1.hash());
@@ -350,11 +342,11 @@ mod tests {
     fn remove_chain_of_children() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 12, block2.hash());
-        let parent4 = rng.gen();
+        let parent4 = rng.random();
         let block4 = create_block(&mut rng, 14, parent4);
 
         let mut buffer = BlockBuffer::new(5);
@@ -373,7 +365,7 @@ mod tests {
     fn remove_all_multi_level_children() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 11, block1.hash());
@@ -395,16 +387,16 @@ mod tests {
     fn remove_multi_chains() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block1a = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block2a = create_block(&mut rng, 11, block1.hash());
-        let random_parent1 = rng.gen();
+        let random_parent1 = rng.random();
         let random_block1 = create_block(&mut rng, 10, random_parent1);
-        let random_parent2 = rng.gen();
+        let random_parent2 = rng.random();
         let random_block2 = create_block(&mut rng, 11, random_parent2);
-        let random_parent3 = rng.gen();
+        let random_parent3 = rng.random();
         let random_block3 = create_block(&mut rng, 12, random_parent3);
 
         let mut buffer = BlockBuffer::new(10);
@@ -439,11 +431,11 @@ mod tests {
     fn evict_with_gap() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 12, block2.hash());
-        let parent4 = rng.gen();
+        let parent4 = rng.random();
         let block4 = create_block(&mut rng, 13, parent4);
 
         let mut buffer = BlockBuffer::new(3);
@@ -476,11 +468,11 @@ mod tests {
     fn simple_eviction() {
         let mut rng = generators::rng();
 
-        let main_parent = BlockNumHash::new(9, rng.gen());
+        let main_parent = BlockNumHash::new(9, rng.random());
         let block1 = create_block(&mut rng, 10, main_parent.hash);
         let block2 = create_block(&mut rng, 11, block1.hash());
         let block3 = create_block(&mut rng, 12, block2.hash());
-        let parent4 = rng.gen();
+        let parent4 = rng.random();
         let block4 = create_block(&mut rng, 13, parent4);
 
         let mut buffer = BlockBuffer::new(3);
@@ -494,5 +486,58 @@ mod tests {
         assert_block_removal(&buffer, &block1);
 
         assert_buffer_lengths(&buffer, 3);
+    }
+
+    #[test]
+    fn eviction_parent_child_cleanup() {
+        let mut rng = generators::rng();
+
+        let main_parent = BlockNumHash::new(9, rng.random());
+        let block1 = create_block(&mut rng, 10, main_parent.hash);
+        let block2 = create_block(&mut rng, 11, block1.hash());
+        // Unrelated block to trigger eviction
+        let unrelated_parent = rng.random();
+        let unrelated_block = create_block(&mut rng, 12, unrelated_parent);
+
+        // Capacity 2 so third insert evicts the oldest (block1)
+        let mut buffer = BlockBuffer::new(2);
+
+        buffer.insert_block(block1.clone());
+        buffer.insert_block(block2.clone());
+
+        // Pre-eviction: parent_to_child contains main_parent -> {block1}, block1 -> {block2}
+        assert!(buffer
+            .parent_to_child
+            .get(&main_parent.hash)
+            .and_then(|s| s.get(&block1.hash()))
+            .is_some());
+        assert!(buffer
+            .parent_to_child
+            .get(&block1.hash())
+            .and_then(|s| s.get(&block2.hash()))
+            .is_some());
+
+        // Insert unrelated block to evict block1
+        buffer.insert_block(unrelated_block);
+
+        // Evicted block1 should be fully removed from collections
+        assert_block_removal(&buffer, &block1);
+
+        // Cleanup: parent_to_child must no longer have (main_parent -> block1)
+        assert!(buffer
+            .parent_to_child
+            .get(&main_parent.hash)
+            .and_then(|s| s.get(&block1.hash()))
+            .is_none());
+
+        // But the mapping (block1 -> block2) must remain so descendants can still be tracked
+        assert!(buffer
+            .parent_to_child
+            .get(&block1.hash())
+            .and_then(|s| s.get(&block2.hash()))
+            .is_some());
+
+        // And lowest ancestor for block2 becomes itself after its parent is evicted
+        assert_eq!(buffer.lowest_ancestor(&block2.hash()), Some(&block2));
     }
 }

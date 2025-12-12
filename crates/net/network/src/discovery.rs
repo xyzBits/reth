@@ -25,7 +25,7 @@ use std::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Default max capacity for cache of discovered peers.
 ///
@@ -95,12 +95,15 @@ impl Discovery {
             // spawn the service
             let discv4_service = discv4_service.spawn();
 
+            debug!(target:"net", ?discovery_v4_addr, "started discovery v4");
+
             Ok((Some(discv4), Some(discv4_updates), Some(discv4_service)))
         };
 
         let discv5_future = async {
             let Some(config) = discv5_config else { return Ok::<_, NetworkError>((None, None)) };
-            let (discv5, discv5_updates, _local_enr_discv5) = Discv5::start(&sk, config).await?;
+            let (discv5, discv5_updates) = Discv5::start(&sk, config).await?;
+            debug!(target:"net", discovery_v5_enr=? discv5.local_enr(), "started discovery v5");
             Ok((Some(discv5), Some(discv5_updates.into())))
         };
 
@@ -266,12 +269,11 @@ impl Discovery {
             while let Some(Poll::Ready(Some(update))) =
                 self.discv5_updates.as_mut().map(|updates| updates.poll_next_unpin(cx))
             {
-                if let Some(discv5) = self.discv5.as_mut() {
-                    if let Some(DiscoveredPeer { node_record, fork_id }) =
+                if let Some(discv5) = self.discv5.as_mut() &&
+                    let Some(DiscoveredPeer { node_record, fork_id }) =
                         discv5.on_discv5_update(update)
-                    {
-                        self.on_node_record_update(node_record, fork_id);
-                    }
+                {
+                    self.on_node_record_update(node_record, fork_id);
                 }
             }
 
@@ -338,14 +340,12 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::thread_rng;
     use secp256k1::SECP256K1;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_discovery_setup() {
-        let mut rng = thread_rng();
-        let (secret_key, _) = SECP256K1.generate_keypair(&mut rng);
+        let (secret_key, _) = SECP256K1.generate_keypair(&mut rand_08::thread_rng());
         let discovery_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let _discovery = Discovery::new(
             discovery_addr,
@@ -364,7 +364,7 @@ mod tests {
     use tracing::trace;
 
     async fn start_discovery_node(udp_port_discv4: u16, udp_port_discv5: u16) -> Discovery {
-        let secret_key = SecretKey::new(&mut thread_rng());
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
 
         let discv4_addr = format!("127.0.0.1:{udp_port_discv4}").parse().unwrap();
         let discv5_addr: SocketAddr = format!("127.0.0.1:{udp_port_discv5}").parse().unwrap();

@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 /// Re-exported ethereum types
@@ -21,7 +21,16 @@ pub mod primitives {
 
 /// Re-exported cli types
 #[cfg(feature = "cli")]
-pub use reth_ethereum_cli as cli;
+pub mod cli {
+    #[doc(inline)]
+    pub use reth_cli_util::*;
+    #[doc(inline)]
+    pub use reth_ethereum_cli::*;
+}
+
+/// Re-exported pool types
+#[cfg(feature = "pool")]
+pub use reth_transaction_pool as pool;
 
 /// Re-exported consensus types
 #[cfg(feature = "consensus")]
@@ -46,17 +55,30 @@ pub mod evm {
 
     #[doc(inline)]
     pub use reth_evm as primitives;
+
+    #[doc(inline)]
+    pub use reth_revm as revm;
 }
 
 /// Re-exported exex types
 #[cfg(feature = "exex")]
 pub use reth_exex as exex;
 
+/// Re-exported from `tasks`.
+#[cfg(feature = "tasks")]
+pub mod tasks {
+    pub use reth_tasks::*;
+}
+
 /// Re-exported reth network types
 #[cfg(feature = "network")]
 pub mod network {
     #[doc(inline)]
+    pub use reth_eth_wire as eth_wire;
+    #[doc(inline)]
     pub use reth_network::*;
+    #[doc(inline)]
+    pub use reth_network_api as api;
 }
 
 /// Re-exported reth provider types
@@ -68,6 +90,10 @@ pub mod provider {
     #[doc(inline)]
     pub use reth_db as db;
 }
+
+/// Re-exported codec crate
+#[cfg(feature = "provider")]
+pub use reth_codecs as codec;
 
 /// Re-exported reth storage api types
 #[cfg(feature = "storage-api")]
@@ -82,7 +108,20 @@ pub mod node {
     #[doc(inline)]
     pub use reth_node_api as api;
     #[cfg(feature = "node")]
+    pub use reth_node_builder as builder;
+    #[doc(inline)]
+    pub use reth_node_core as core;
+    #[cfg(feature = "node")]
     pub use reth_node_ethereum::*;
+}
+
+/// Re-exported ethereum engine types
+#[cfg(feature = "node")]
+pub mod engine {
+    #[doc(inline)]
+    pub use reth_engine_local as local;
+    #[doc(inline)]
+    pub use reth_node_ethereum::engine::*;
 }
 
 /// Re-exported reth trie types
@@ -90,6 +129,10 @@ pub mod node {
 pub mod trie {
     #[doc(inline)]
     pub use reth_trie::*;
+
+    #[cfg(feature = "trie-db")]
+    #[doc(inline)]
+    pub use reth_trie_db::*;
 }
 
 /// Re-exported rpc types
@@ -104,10 +147,19 @@ pub mod rpc {
     pub use reth_rpc_builder as builder;
 
     /// Re-exported eth types
+    #[allow(ambiguous_glob_reexports)]
     pub mod eth {
         #[doc(inline)]
         pub use alloy_rpc_types_eth as primitives;
         #[doc(inline)]
         pub use reth_rpc_eth_types::*;
+
+        pub use reth_rpc::eth::*;
+    }
+
+    /// Re-exported types
+    pub mod types {
+        #[doc(inline)]
+        pub use alloy_rpc_types_engine as engine;
     }
 }

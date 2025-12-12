@@ -1,52 +1,75 @@
 //! Loads and formats OP transaction RPC response.
 
-use alloy_consensus::Transaction as _;
-use alloy_primitives::{Bytes, PrimitiveSignature as Signature, Sealable, Sealed, B256};
+use crate::{OpEthApi, OpEthApiError, SequencerClient};
+use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_eth::TransactionInfo;
-use op_alloy_consensus::OpTxEnvelope;
-use op_alloy_rpc_types::{OpTransactionRequest, Transaction};
-use reth_node_api::FullNodeComponents;
-use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
-use reth_primitives::Recovered;
-use reth_provider::{
-    BlockReader, BlockReaderIdExt, ProviderTx, ReceiptProvider, TransactionsProvider,
+use futures::StreamExt;
+use op_alloy_consensus::{transaction::OpTransactionInfo, OpTransaction};
+use reth_chain_state::CanonStateSubscriptions;
+use reth_optimism_primitives::DepositReceipt;
+use reth_primitives_traits::{
+    BlockBody, Recovered, SignedTransaction, SignerRecoverable, WithEncoded,
 };
 use reth_rpc_eth_api::{
-    helpers::{EthSigner, EthTransactions, LoadTransaction, SpawnBlocking},
-    FromEthApiError, FullEthApiTypes, RpcNodeCore, RpcNodeCoreExt, TransactionCompat,
+    helpers::{spec::SignersForRpc, EthTransactions, LoadReceipt, LoadTransaction, SpawnBlocking},
+    try_into_op_tx_info, EthApiTypes as _, FromEthApiError, FromEvmError, RpcConvert, RpcNodeCore,
+    RpcReceipt, TxInfoMapper,
 };
-use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError};
-use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
+use reth_rpc_eth_types::{EthApiError, TransactionSource};
+use reth_storage_api::{errors::ProviderError, ProviderTx, ReceiptProvider, TransactionsProvider};
+use reth_transaction_pool::{
+    AddedTransactionOutcome, PoolPooledTx, PoolTransaction, TransactionOrigin, TransactionPool,
+};
+use std::{
+    fmt::{Debug, Formatter},
+    future::Future,
+    time::Duration,
+};
+use tokio_stream::wrappers::WatchStream;
 
-use crate::{eth::OpNodeCore, OpEthApi, OpEthApiError, SequencerClient};
-
-impl<N> EthTransactions for OpEthApi<N>
+impl<N, Rpc> EthTransactions for OpEthApi<N, Rpc>
 where
-    Self: LoadTransaction<Provider: BlockReaderIdExt>,
-    N: OpNodeCore<Provider: BlockReader<Transaction = ProviderTx<Self::Provider>>>,
+    N: RpcNodeCore,
+    OpEthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
 {
-    fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn EthSigner<ProviderTx<Self::Provider>>>>> {
+    fn signers(&self) -> &SignersForRpc<Self::Provider, Self::NetworkTypes> {
         self.inner.eth_api.signers()
     }
 
-    /// Decodes and recovers the transaction and submits it to the pool.
-    ///
-    /// Returns the hash of the transaction.
-    async fn send_raw_transaction(&self, tx: Bytes) -> Result<B256, Self::Error> {
-        let recovered = recover_raw_transaction(&tx)?;
+    fn send_raw_transaction_sync_timeout(&self) -> Duration {
+        self.inner.eth_api.send_raw_transaction_sync_timeout()
+    }
+
+    async fn send_transaction(
+        &self,
+        tx: WithEncoded<Recovered<PoolPooledTx<Self::Pool>>>,
+    ) -> Result<B256, Self::Error> {
+        let (tx, recovered) = tx.split();
+
+        // broadcast raw transaction to subscribers if there is any.
+        self.eth_api().broadcast_raw_transaction(tx.clone());
+
         let pool_transaction = <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
 
         // On optimism, transactions are forwarded directly to the sequencer to be included in
         // blocks that it builds.
         if let Some(client) = self.raw_tx_forwarder().as_ref() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to sequencer");
-            let _ = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
+            let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
                     tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
-                });
+                })?;
+
+            // Retain tx in local tx pool after forwarding, for local RPC usage.
+            let _ = self.inner.eth_api.add_pool_transaction(pool_transaction).await.inspect_err(|err| {
+                tracing::warn!(target: "rpc::eth", %err, %hash, "successfully sent tx to sequencer, but failed to persist in local tx pool");
+            });
+
+            return Ok(hash)
         }
 
         // submit the transaction to the pool with a `Local` origin
-        let hash = self
+        let AddedTransactionOutcome { hash, .. } = self
             .pool()
             .add_transaction(TransactionOrigin::Local, pool_transaction)
             .await
@@ -54,19 +77,163 @@ where
 
         Ok(hash)
     }
+
+    /// Decodes and recovers the transaction and submits it to the pool.
+    ///
+    /// And awaits the receipt, checking both canonical blocks and flashblocks for faster
+    /// confirmation.
+    fn send_raw_transaction_sync(
+        &self,
+        tx: Bytes,
+    ) -> impl Future<Output = Result<RpcReceipt<Self::NetworkTypes>, Self::Error>> + Send {
+        let this = self.clone();
+        let timeout_duration = self.send_raw_transaction_sync_timeout();
+        async move {
+            let mut canonical_stream = this.provider().canonical_state_stream();
+            let hash = EthTransactions::send_raw_transaction(&this, tx).await?;
+            let mut flashblock_stream = this.pending_block_rx().map(WatchStream::new);
+
+            tokio::time::timeout(timeout_duration, async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        // check if the tx was preconfirmed in a new flashblock
+                        flashblock = async {
+                            if let Some(stream) = &mut flashblock_stream {
+                                stream.next().await
+                            } else {
+                                futures::future::pending().await
+                            }
+                        } => {
+                            if let Some(flashblock) = flashblock.flatten() {
+                                // if flashblocks are supported, attempt to find id from the pending block
+                                if let Some(receipt) = flashblock
+                                .find_and_convert_transaction_receipt(hash, this.converter())
+                                {
+                                    return receipt;
+                                }
+                            }
+                        }
+                        // Listen for regular canonical block updates for inclusion
+                        canonical_notification = canonical_stream.next() => {
+                            if let Some(notification) = canonical_notification {
+                                let chain = notification.committed();
+                                for block in chain.blocks_iter() {
+                                    if block.body().contains_transaction(&hash)
+                                        && let Some(receipt) = this.transaction_receipt(hash).await? {
+                                            return Ok(receipt);
+                                        }
+                                }
+                            } else {
+                                // Canonical stream ended
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(Self::Error::from_eth_err(EthApiError::TransactionConfirmationTimeout {
+                    hash,
+                    duration: timeout_duration,
+                }))
+            })
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(Self::Error::from_eth_err(EthApiError::TransactionConfirmationTimeout {
+                    hash,
+                    duration: timeout_duration,
+                }))
+            })
+        }
+    }
+
+    /// Returns the transaction receipt for the given hash.
+    ///
+    /// With flashblocks, we should also lookup the pending block for the transaction
+    /// because this is considered confirmed/mined.
+    fn transaction_receipt(
+        &self,
+        hash: B256,
+    ) -> impl Future<Output = Result<Option<RpcReceipt<Self::NetworkTypes>>, Self::Error>> + Send
+    {
+        let this = self.clone();
+        async move {
+            // first attempt to fetch the mined transaction receipt data
+            let tx_receipt = this.load_transaction_and_receipt(hash).await?;
+
+            if tx_receipt.is_none() {
+                // if flashblocks are supported, attempt to find id from the pending block
+                if let Ok(Some(pending_block)) = this.pending_flashblock().await &&
+                    let Some(Ok(receipt)) = pending_block
+                        .find_and_convert_transaction_receipt(hash, this.converter())
+                {
+                    return Ok(Some(receipt));
+                }
+            }
+            let Some((tx, meta, receipt)) = tx_receipt else { return Ok(None) };
+            self.build_transaction_receipt(tx, meta, receipt).await.map(Some)
+        }
+    }
 }
 
-impl<N> LoadTransaction for OpEthApi<N>
+impl<N, Rpc> LoadTransaction for OpEthApi<N, Rpc>
 where
-    Self: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt,
-    N: OpNodeCore<Provider: TransactionsProvider, Pool: TransactionPool>,
-    Self::Pool: TransactionPool,
+    N: RpcNodeCore,
+    OpEthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
 {
+    async fn transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<TransactionSource<ProviderTx<Self::Provider>>>, Self::Error> {
+        // 1. Try to find the transaction on disk (historical blocks)
+        if let Some((tx, meta)) = self
+            .spawn_blocking_io(move |this| {
+                this.provider()
+                    .transaction_by_hash_with_meta(hash)
+                    .map_err(Self::Error::from_eth_err)
+            })
+            .await?
+        {
+            let transaction = tx
+                .try_into_recovered_unchecked()
+                .map_err(|_| EthApiError::InvalidTransactionSignature)?;
+
+            return Ok(Some(TransactionSource::Block {
+                transaction,
+                index: meta.index,
+                block_hash: meta.block_hash,
+                block_number: meta.block_number,
+                base_fee: meta.base_fee,
+            }));
+        }
+
+        // 2. check flashblocks (sequencer preconfirmations)
+        if let Ok(Some(pending_block)) = self.pending_flashblock().await &&
+            let Some(indexed_tx) = pending_block.block().find_indexed(hash)
+        {
+            let meta = indexed_tx.meta();
+            return Ok(Some(TransactionSource::Block {
+                transaction: indexed_tx.recovered_tx().cloned(),
+                index: meta.index,
+                block_hash: meta.block_hash,
+                block_number: meta.block_number,
+                base_fee: meta.base_fee,
+            }));
+        }
+
+        // 3. check local pool
+        if let Some(tx) = self.pool().get(&hash).map(|tx| tx.transaction.clone_into_consensus()) {
+            return Ok(Some(TransactionSource::Pool(tx)));
+        }
+
+        Ok(None)
+    }
 }
 
-impl<N> OpEthApi<N>
+impl<N, Rpc> OpEthApi<N, Rpc>
 where
-    N: OpNodeCore,
+    N: RpcNodeCore,
+    Rpc: RpcConvert<Primitives = N::Primitives>,
 {
     /// Returns the [`SequencerClient`] if one is set.
     pub fn raw_tx_forwarder(&self) -> Option<SequencerClient> {
@@ -74,102 +241,42 @@ where
     }
 }
 
-impl<N> TransactionCompat<OpTransactionSigned> for OpEthApi<N>
+/// Optimism implementation of [`TxInfoMapper`].
+///
+/// For deposits, receipt is fetched to extract `deposit_nonce` and `deposit_receipt_version`.
+/// Otherwise, it works like regular Ethereum implementation, i.e. uses [`TransactionInfo`].
+pub struct OpTxInfoMapper<Provider> {
+    provider: Provider,
+}
+
+impl<Provider: Clone> Clone for OpTxInfoMapper<Provider> {
+    fn clone(&self) -> Self {
+        Self { provider: self.provider.clone() }
+    }
+}
+
+impl<Provider> Debug for OpTxInfoMapper<Provider> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpTxInfoMapper").finish()
+    }
+}
+
+impl<Provider> OpTxInfoMapper<Provider> {
+    /// Creates [`OpTxInfoMapper`] that uses [`ReceiptProvider`] borrowed from given `eth_api`.
+    pub const fn new(provider: Provider) -> Self {
+        Self { provider }
+    }
+}
+
+impl<T, Provider> TxInfoMapper<T> for OpTxInfoMapper<Provider>
 where
-    N: FullNodeComponents<Provider: ReceiptProvider<Receipt = OpReceipt>>,
+    T: OpTransaction + SignedTransaction,
+    Provider: ReceiptProvider<Receipt: DepositReceipt>,
 {
-    type Transaction = Transaction;
-    type Error = OpEthApiError;
+    type Out = OpTransactionInfo;
+    type Err = ProviderError;
 
-    fn fill(
-        &self,
-        tx: Recovered<OpTransactionSigned>,
-        tx_info: TransactionInfo,
-    ) -> Result<Self::Transaction, Self::Error> {
-        let (tx, from) = tx.into_parts();
-        let mut deposit_receipt_version = None;
-        let mut deposit_nonce = None;
-
-        let inner: OpTxEnvelope = tx.into();
-
-        if inner.is_deposit() {
-            // for depost tx we need to fetch the receipt
-            self.inner
-                .eth_api
-                .provider()
-                .receipt_by_hash(inner.tx_hash())
-                .map_err(Self::Error::from_eth_err)?
-                .inspect(|receipt| {
-                    if let OpReceipt::Deposit(receipt) = receipt {
-                        deposit_receipt_version = receipt.deposit_receipt_version;
-                        deposit_nonce = receipt.deposit_nonce;
-                    }
-                });
-        }
-
-        let TransactionInfo {
-            block_hash, block_number, index: transaction_index, base_fee, ..
-        } = tx_info;
-
-        let effective_gas_price = if inner.is_deposit() {
-            // For deposits, we must always set the `gasPrice` field to 0 in rpc
-            // deposit tx don't have a gas price field, but serde of `Transaction` will take care of
-            // it
-            0
-        } else {
-            base_fee
-                .map(|base_fee| {
-                    inner.effective_tip_per_gas(base_fee).unwrap_or_default() + base_fee as u128
-                })
-                .unwrap_or_else(|| inner.max_fee_per_gas())
-        };
-
-        Ok(Transaction {
-            inner: alloy_rpc_types_eth::Transaction {
-                inner,
-                block_hash,
-                block_number,
-                transaction_index,
-                from,
-                effective_gas_price: Some(effective_gas_price),
-            },
-            deposit_nonce,
-            deposit_receipt_version,
-        })
-    }
-
-    fn build_simulate_v1_transaction(
-        &self,
-        request: alloy_rpc_types_eth::TransactionRequest,
-    ) -> Result<OpTransactionSigned, Self::Error> {
-        let request: OpTransactionRequest = request.into();
-        let Ok(tx) = request.build_typed_tx() else {
-            return Err(OpEthApiError::Eth(EthApiError::TransactionConversionError))
-        };
-
-        // Create an empty signature for the transaction.
-        let signature = Signature::new(Default::default(), Default::default(), false);
-        Ok(OpTransactionSigned::new_unhashed(tx, signature))
-    }
-
-    fn otterscan_api_truncate_input(tx: &mut Self::Transaction) {
-        let input = match &mut tx.inner.inner {
-            OpTxEnvelope::Eip1559(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Eip2930(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Legacy(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Eip7702(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Deposit(tx) => {
-                let (mut deposit, hash) = std::mem::replace(
-                    tx,
-                    Sealed::new_unchecked(Default::default(), Default::default()),
-                )
-                .split();
-                deposit.input = deposit.input.slice(..4);
-                let mut deposit = deposit.seal_unchecked(hash);
-                std::mem::swap(tx, &mut deposit);
-                return
-            }
-        };
-        *input = input.slice(..4);
+    fn try_map(&self, tx: &T, tx_info: TransactionInfo) -> Result<Self::Out, ProviderError> {
+        try_into_op_tx_info(&self.provider, tx, tx_info)
     }
 }

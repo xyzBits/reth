@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -57,12 +57,6 @@ pub use trie::*;
 mod chain_info;
 pub use chain_info::*;
 
-mod withdrawals;
-pub use withdrawals::*;
-
-mod ommers;
-pub use ommers::*;
-
 #[cfg(feature = "db-api")]
 mod database_provider;
 #[cfg(feature = "db-api")]
@@ -85,11 +79,27 @@ mod stats;
 #[cfg(feature = "db-api")]
 pub use stats::*;
 
-mod legacy;
-pub use legacy::*;
-
 mod primitives;
 pub use primitives::*;
 
 mod block_indices;
 pub use block_indices::*;
+
+mod block_writer;
+pub use block_writer::*;
+
+mod state_writer;
+pub use state_writer::*;
+
+mod header_sync_gap;
+pub use header_sync_gap::HeaderSyncGapProvider;
+
+#[cfg(feature = "db-api")]
+pub mod metadata;
+#[cfg(feature = "db-api")]
+pub use metadata::{MetadataProvider, MetadataWriter, StorageSettingsCache};
+#[cfg(feature = "db-api")]
+pub use reth_db_api::models::StorageSettings;
+
+mod full;
+pub use full::*;

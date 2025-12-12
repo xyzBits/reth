@@ -12,8 +12,11 @@ workspace = true
 
 [dependencies]
 reth-static-file-types = { workspace = true, features = ["clap"] }
+reth-cli.workspace = true
 reth-cli-commands.workspace = true
 reth-consensus.workspace = true
+reth-rpc-server-types.workspace = true
+reth-primitives-traits.workspace = true
 reth-db = { workspace = true, features = ["mdbx", "op"] }
 reth-db-api.workspace = true
 reth-db-common.workspace = true
@@ -25,7 +28,6 @@ reth-static-file.workspace = true
 reth-execution-types.workspace = true
 reth-node-core.workspace = true
 reth-optimism-node.workspace = true
-reth-primitives.workspace = true
 reth-fs-util.workspace = true
 
 # so jemalloc metrics can be included
@@ -33,15 +35,14 @@ reth-node-metrics.workspace = true
 
 ## optimism
 reth-optimism-primitives.workspace = true
-reth-optimism-chainspec.workspace = true
+reth-optimism-chainspec = { workspace = true, features = ["superchain-configs"] }
 reth-optimism-consensus.workspace = true
 
 reth-chainspec.workspace = true
 reth-node-events.workspace = true
 reth-optimism-evm.workspace = true
-reth-cli.workspace = true
 reth-cli-runner.workspace = true
-reth-node-builder.workspace = true
+reth-node-builder = { workspace = true, features = ["op"] }
 reth-tracing.workspace = true
 
 # eth
@@ -68,15 +69,20 @@ op-alloy-consensus.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 reth-stages = { workspace = true, features = ["test-utils"] }
-reth-db-common.workspace = true
-reth-cli-commands.workspace = true
+
+[build-dependencies]
+reth-optimism-chainspec = { workspace = true, features = ["std", "superchain-configs"] }
 
 [features]
+default = []
+
+# Opentelemtry feature to activate metrics export
+otlp = ["reth-tracing/otlp", "reth-node-core/otlp"]
+
 asm-keccak = [
     "alloy-primitives/asm-keccak",
     "reth-node-core/asm-keccak",
     "reth-optimism-node/asm-keccak",
-    "reth-primitives/asm-keccak",
 ]
 
 # Jemalloc feature for vergen to generate correct env vars
@@ -96,6 +102,7 @@ serde = [
     "alloy-primitives/serde",
     "op-alloy-consensus/serde",
     "reth-execution-types/serde",
-    "reth-provider/serde",
     "reth-optimism-primitives/serde",
+    "reth-primitives-traits/serde",
+    "reth-optimism-chainspec/serde",
 ]

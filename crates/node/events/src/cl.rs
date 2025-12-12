@@ -13,9 +13,7 @@ use tokio::time::{Instant, Interval};
 
 /// Interval of checking Consensus Layer client health.
 const CHECK_INTERVAL: Duration = Duration::from_secs(300);
-/// Period of not exchanging transition configurations with Consensus Layer client,
-/// after which the warning is issued.
-const NO_TRANSITION_CONFIG_EXCHANGED_PERIOD: Duration = Duration::from_secs(120);
+
 /// Period of not receiving fork choice updates from Consensus Layer client,
 /// after which the warning is issued.
 const NO_FORKCHOICE_UPDATE_RECEIVED_PERIOD: Duration = Duration::from_secs(120);
@@ -63,21 +61,7 @@ impl<H: Send + Sync> Stream for ConsensusLayerHealthEvents<H> {
                 ))
             }
 
-            if let Some(transition_config) =
-                this.canon_chain.last_exchanged_transition_configuration_timestamp()
-            {
-                return if transition_config.elapsed() <= NO_TRANSITION_CONFIG_EXCHANGED_PERIOD {
-                    // We never had an FCU, but had a transition config exchange, and it's recent.
-                    Poll::Ready(Some(ConsensusLayerHealthEvent::NeverReceivedUpdates))
-                } else {
-                    // We never had an FCU, but had a transition config exchange, but it's too old.
-                    Poll::Ready(Some(ConsensusLayerHealthEvent::HasNotBeenSeenForAWhile(
-                        transition_config.elapsed(),
-                    )))
-                }
-            }
-
-            // We never had both FCU and transition config exchange.
+            // We never received any forkchoice updates.
             return Poll::Ready(Some(ConsensusLayerHealthEvent::NeverSeen))
         }
     }
@@ -87,12 +71,8 @@ impl<H: Send + Sync> Stream for ConsensusLayerHealthEvents<H> {
 /// Execution Layer point of view.
 #[derive(Clone, Copy, Debug)]
 pub enum ConsensusLayerHealthEvent {
-    /// Consensus Layer client was never seen.
+    /// Consensus Layer client was never seen (no forkchoice updates received).
     NeverSeen,
-    /// Consensus Layer client has not been seen for a while.
-    HasNotBeenSeenForAWhile(Duration),
-    /// Updates from the Consensus Layer client were never received.
-    NeverReceivedUpdates,
-    /// Updates from the Consensus Layer client have not been received for a while.
+    /// Forkchoice updates from the Consensus Layer client have not been received for a while.
     HaveNotReceivedUpdatesForAWhile(Duration),
 }

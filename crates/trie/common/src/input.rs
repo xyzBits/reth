@@ -1,4 +1,9 @@
-use crate::{prefix_set::TriePrefixSetsMut, updates::TrieUpdates, HashedPostState};
+use crate::{
+    prefix_set::TriePrefixSetsMut,
+    updates::{TrieUpdates, TrieUpdatesSorted},
+    HashedPostState, HashedPostStateSorted,
+};
+use alloc::sync::Arc;
 
 /// Inputs for trie-related computations.
 #[derive(Default, Debug, Clone)]
@@ -29,6 +34,50 @@ impl TrieInput {
     pub fn from_state(state: HashedPostState) -> Self {
         let prefix_sets = state.construct_prefix_sets();
         Self { nodes: TrieUpdates::default(), state, prefix_sets }
+    }
+
+    /// Create new trie input from the provided blocks, from oldest to newest. See the documentation
+    /// for [`Self::extend_with_blocks`] for details.
+    pub fn from_blocks<'a>(
+        blocks: impl IntoIterator<Item = (&'a HashedPostState, &'a TrieUpdates)>,
+    ) -> Self {
+        let mut input = Self::default();
+        input.extend_with_blocks(blocks);
+        input
+    }
+
+    /// Create new trie input from the provided sorted blocks, from oldest to newest.
+    /// Converts sorted types to unsorted for aggregation.
+    pub fn from_blocks_sorted<'a>(
+        blocks: impl IntoIterator<Item = (&'a HashedPostStateSorted, &'a TrieUpdatesSorted)>,
+    ) -> Self {
+        let mut input = Self::default();
+        for (hashed_state, trie_updates) in blocks {
+            // Extend directly from sorted types, avoiding intermediate HashMap allocations
+            input.nodes.extend_from_sorted(trie_updates);
+            input.state.extend_from_sorted(hashed_state);
+        }
+        input
+    }
+
+    /// Extend the trie input with the provided blocks, from oldest to newest.
+    pub fn extend_with_blocks<'a>(
+        &mut self,
+        blocks: impl IntoIterator<Item = (&'a HashedPostState, &'a TrieUpdates)>,
+    ) {
+        for (hashed_state, trie_updates) in blocks {
+            self.append_cached_ref(trie_updates, hashed_state);
+        }
+    }
+
+    /// Prepend another trie input to the current one.
+    pub fn prepend_self(&mut self, mut other: Self) {
+        core::mem::swap(&mut self.nodes, &mut other.nodes);
+        self.nodes.extend(other.nodes);
+        core::mem::swap(&mut self.state, &mut other.state);
+        self.state.extend(other.state);
+        // No need to swap prefix sets, as they will be sorted and deduplicated.
+        self.prefix_sets.extend(other.prefix_sets);
     }
 
     /// Prepend state to the input and extend the prefix sets.
@@ -72,4 +121,54 @@ impl TrieInput {
         self.nodes.extend_ref(nodes);
         self.state.extend_ref(state);
     }
+
+    /// This method clears the trie input nodes, state, and prefix sets.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.state.clear();
+        self.prefix_sets.clear();
+    }
+
+    /// This method returns a cleared version of this trie input.
+    pub fn cleared(mut self) -> Self {
+        self.clear();
+        self
+    }
 }
+
+/// Sorted variant of [`TrieInput`] for efficient proof generation.
+///
+/// This type holds sorted versions of trie data structures, which eliminates the need
+/// for expensive sorting operations during multiproof generation.
+#[derive(Default, Debug, Clone)]
+pub struct TrieInputSorted {
+    /// Sorted cached in-memory intermediate trie nodes.
+    pub nodes: Arc<TrieUpdatesSorted>,
+    /// Sorted in-memory overlay hashed state.
+    pub state: Arc<HashedPostStateSorted>,
+    /// Prefix sets for computation.
+    pub prefix_sets: TriePrefixSetsMut,
+}
+
+impl TrieInputSorted {
+    /// Create new sorted trie input.
+    pub const fn new(
+        nodes: Arc<TrieUpdatesSorted>,
+        state: Arc<HashedPostStateSorted>,
+        prefix_sets: TriePrefixSetsMut,
+    ) -> Self {
+        Self { nodes, state, prefix_sets }
+    }
+
+    /// Create from unsorted [`TrieInput`] by sorting.
+    pub fn from_unsorted(input: TrieInput) -> Self {
+        Self {
+            nodes: Arc::new(input.nodes.into_sorted()),
+            state: Arc::new(input.state.into_sorted()),
+            prefix_sets: input.prefix_sets,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {}

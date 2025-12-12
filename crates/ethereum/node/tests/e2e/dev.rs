@@ -1,16 +1,14 @@
 use alloy_eips::eip2718::Encodable2718;
 use alloy_genesis::Genesis;
-use alloy_primitives::{b256, hex};
+use alloy_primitives::{b256, hex, Address};
 use futures::StreamExt;
 use reth_chainspec::ChainSpec;
-use reth_node_api::{BlockBody, FullNodeComponents, FullNodePrimitives, NodeTypes};
-use reth_node_builder::{
-    rpc::RethRpcAddOns, EngineNodeLauncher, FullNode, NodeBuilder, NodeConfig, NodeHandle,
-};
+use reth_node_api::{BlockBody, FullNodeComponents};
+use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeBuilder, NodeConfig, NodeHandle};
 use reth_node_core::args::DevArgs;
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use reth_provider::{providers::BlockchainProvider, CanonStateSubscriptions};
-use reth_rpc_eth_api::helpers::EthTransactions;
+use reth_rpc_eth_api::{helpers::EthTransactions, EthApiServer};
 use reth_tasks::TaskManager;
 use std::sync::Arc;
 
@@ -28,37 +26,74 @@ async fn can_run_dev_node() -> eyre::Result<()> {
         .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
         .with_components(EthereumNode::components())
         .with_add_ons(EthereumAddOns::default())
-        .launch_with_fn(|builder| {
-            let launcher = EngineNodeLauncher::new(
-                builder.task_executor().clone(),
-                builder.config().datadir(),
-                Default::default(),
-            );
-            builder.launch_with(launcher)
-        })
+        .launch_with_debug_capabilities()
         .await?;
 
-    assert_chain_advances(node).await;
+    assert_chain_advances(&node).await;
 
     Ok(())
 }
 
-async fn assert_chain_advances<N, AddOns>(node: FullNode<N, AddOns>)
+#[tokio::test]
+async fn can_run_dev_node_custom_attributes() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let tasks = TaskManager::current();
+    let exec = tasks.executor();
+
+    let node_config = NodeConfig::test()
+        .with_chain(custom_chain())
+        .with_dev(DevArgs { dev: true, ..Default::default() });
+    let fee_recipient = Address::random();
+    let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
+        .testing_node(exec.clone())
+        .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
+        .with_components(EthereumNode::components())
+        .with_add_ons(EthereumAddOns::default())
+        .launch_with_debug_capabilities()
+        .map_debug_payload_attributes(move |mut attributes| {
+            attributes.suggested_fee_recipient = fee_recipient;
+            attributes
+        })
+        .await?;
+
+    assert_chain_advances(&node).await;
+
+    assert!(
+        node.rpc_registry.eth_api().balance(fee_recipient, Default::default()).await.unwrap() > 0
+    );
+
+    assert!(
+        node.rpc_registry
+            .eth_api()
+            .block_by_number(Default::default(), false)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .beneficiary ==
+            fee_recipient
+    );
+
+    Ok(())
+}
+
+async fn assert_chain_advances<N, AddOns>(node: &FullNode<N, AddOns>)
 where
     N: FullNodeComponents<Provider: CanonStateSubscriptions>,
     AddOns: RethRpcAddOns<N, EthApi: EthTransactions>,
-    N::Types: NodeTypes<Primitives: FullNodePrimitives>,
 {
     let mut notifications = node.provider.canonical_state_stream();
 
     // submit tx through rpc
-    let raw_tx = hex!("02f876820a28808477359400847735940082520894ab0840c0e43688012c1adb0f5e3fc665188f83d28a029d394a5d630544000080c080a0a044076b7e67b5deecc63f61a8d7913fab86ca365b344b5759d1fe3563b4c39ea019eab979dd000da04dfc72bb0377c092d30fd9e1cab5ae487de49586cc8b0090");
+    let raw_tx = hex!(
+        "02f876820a28808477359400847735940082520894ab0840c0e43688012c1adb0f5e3fc665188f83d28a029d394a5d630544000080c080a0a044076b7e67b5deecc63f61a8d7913fab86ca365b344b5759d1fe3563b4c39ea019eab979dd000da04dfc72bb0377c092d30fd9e1cab5ae487de49586cc8b0090"
+    );
 
     let eth_api = node.rpc_registry.eth_api();
 
     let hash = eth_api.send_raw_transaction(raw_tx.into()).await.unwrap();
 
-    let expected = b256!("b1c6512f4fc202c04355fbda66755e0e344b152e633010e8fd75ecec09b63398");
+    let expected = b256!("0xb1c6512f4fc202c04355fbda66755e0e344b152e633010e8fd75ecec09b63398");
 
     assert_eq!(hash, expected);
     println!("submitted transaction: {hash}");

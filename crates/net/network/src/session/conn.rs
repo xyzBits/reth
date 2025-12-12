@@ -3,12 +3,12 @@
 use futures::{Sink, Stream};
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::{
-    capability::RawCapabilityMessage,
     errors::EthStreamError,
     message::EthBroadcastMessage,
     multiplex::{ProtocolProxy, RlpxSatelliteStream},
     EthMessage, EthNetworkPrimitives, EthStream, EthVersion, NetworkPrimitives, P2PStream,
 };
+use reth_eth_wire_types::RawCapabilityMessage;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -65,7 +65,7 @@ impl<N: NetworkPrimitives> EthRlpxConnection<N> {
         }
     }
 
-    /// Returns  access to the underlying stream.
+    /// Returns access to the underlying stream.
     #[inline]
     pub(crate) const fn inner(&self) -> &P2PStream<ECIESStream<TcpStream>> {
         match self {

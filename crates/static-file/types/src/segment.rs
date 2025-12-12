@@ -1,13 +1,9 @@
 use crate::{BlockNumber, Compression};
-use alloc::{
-    format,
-    string::{String, ToString},
-};
+use alloc::{format, string::String};
 use alloy_primitives::TxNumber;
 use core::{ops::RangeInclusive, str::FromStr};
-use derive_more::Display;
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, EnumString};
+use strum::{EnumIs, EnumString};
 
 #[derive(
     Debug,
@@ -21,44 +17,44 @@ use strum::{AsRefStr, EnumString};
     Deserialize,
     Serialize,
     EnumString,
-    AsRefStr,
-    Display,
+    derive_more::Display,
+    EnumIs,
 )]
+#[strum(serialize_all = "kebab-case")]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 /// Segment of the data that can be moved to static files.
 pub enum StaticFileSegment {
-    #[strum(serialize = "headers")]
     /// Static File segment responsible for the `CanonicalHeaders`, `Headers`,
     /// `HeaderTerminalDifficulties` tables.
     Headers,
-    #[strum(serialize = "transactions")]
     /// Static File segment responsible for the `Transactions` table.
     Transactions,
-    #[strum(serialize = "receipts")]
     /// Static File segment responsible for the `Receipts` table.
     Receipts,
-    #[strum(serialize = "blockmeta")]
-    /// Static File segment responsible for the `BlockBodyIndices`, `BlockOmmers`,
-    /// `BlockWithdrawals` tables.
-    BlockMeta,
+    /// Static File segment responsible for the `TransactionSenders` table.
+    TransactionSenders,
 }
 
 impl StaticFileSegment {
-    /// Returns the segment as a string.
+    /// Returns a string representation of the segment.
     pub const fn as_str(&self) -> &'static str {
+        // `strum` doesn't generate a doc comment for `into_str` when using `IntoStaticStr` derive
+        // macro, so we need to manually implement it.
+        //
+        // NOTE: this name cannot have underscores in it, as underscores are used as delimiters in
+        // static file paths, for fetching static files for a specific block range
         match self {
             Self::Headers => "headers",
             Self::Transactions => "transactions",
             Self::Receipts => "receipts",
-            Self::BlockMeta => "blockmeta",
+            Self::TransactionSenders => "transaction-senders",
         }
     }
 
     /// Returns an iterator over all segments.
     pub fn iter() -> impl Iterator<Item = Self> {
-        // The order of segments is significant and must be maintained to ensure correctness. For
-        // example, Transactions require BlockBodyIndices from Blockmeta to be sound.
-        [Self::Headers, Self::BlockMeta, Self::Transactions, Self::Receipts].into_iter()
+        // The order of segments is significant and must be maintained to ensure correctness.
+        [Self::Headers, Self::Transactions, Self::Receipts, Self::TransactionSenders].into_iter()
     }
 
     /// Returns the default configuration of the segment.
@@ -69,8 +65,8 @@ impl StaticFileSegment {
     /// Returns the number of columns for the segment
     pub const fn columns(&self) -> usize {
         match self {
-            Self::Headers | Self::BlockMeta => 3,
-            Self::Transactions | Self::Receipts => 1,
+            Self::Headers => 3,
+            Self::Transactions | Self::Receipts | Self::TransactionSenders => 1,
         }
     }
 
@@ -78,7 +74,7 @@ impl StaticFileSegment {
     pub fn filename(&self, block_range: &SegmentRangeInclusive) -> String {
         // ATTENTION: if changing the name format, be sure to reflect those changes in
         // [`Self::parse_filename`].
-        format!("static_file_{}_{}_{}", self.as_ref(), block_range.start(), block_range.end())
+        format!("static_file_{}_{}_{}", self.as_str(), block_range.start(), block_range.end())
     }
 
     /// Returns file name for the provided segment and range, alongside filters, compression.
@@ -89,7 +85,7 @@ impl StaticFileSegment {
     ) -> String {
         let prefix = self.filename(block_range);
 
-        let filters_name = "none".to_string();
+        let filters_name = "none";
 
         // ATTENTION: if changing the name format, be sure to reflect those changes in
         // [`Self::parse_filename`.]
@@ -128,34 +124,25 @@ impl StaticFileSegment {
         Some((segment, SegmentRangeInclusive::new(block_start, block_end)))
     }
 
-    /// Returns `true` if the segment is `StaticFileSegment::Headers`.
-    pub const fn is_headers(&self) -> bool {
-        matches!(self, Self::Headers)
-    }
-
-    /// Returns `true` if the segment is `StaticFileSegment::BlockMeta`.
-    pub const fn is_block_meta(&self) -> bool {
-        matches!(self, Self::BlockMeta)
-    }
-
-    /// Returns `true` if the segment is `StaticFileSegment::Receipts`.
-    pub const fn is_receipts(&self) -> bool {
-        matches!(self, Self::Receipts)
-    }
-
     /// Returns `true` if a segment row is linked to a transaction.
     pub const fn is_tx_based(&self) -> bool {
-        matches!(self, Self::Receipts | Self::Transactions)
+        match self {
+            Self::Receipts | Self::Transactions | Self::TransactionSenders => true,
+            Self::Headers => false,
+        }
     }
 
     /// Returns `true` if a segment row is linked to a block.
     pub const fn is_block_based(&self) -> bool {
-        matches!(self, Self::Headers | Self::BlockMeta)
+        match self {
+            Self::Headers => true,
+            Self::Receipts | Self::Transactions | Self::TransactionSenders => false,
+        }
     }
 }
 
 /// A segment header that contains information common to all segments. Used for storage.
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone, Copy)]
 pub struct SegmentHeader {
     /// Defines the expected block range for a static file segment. This attribute is crucial for
     /// scenarios where the file contains no data, allowing for a representation beyond a
@@ -186,14 +173,19 @@ impl SegmentHeader {
         self.segment
     }
 
+    /// Returns the expected block range.
+    pub const fn expected_block_range(&self) -> SegmentRangeInclusive {
+        self.expected_block_range
+    }
+
     /// Returns the block range.
-    pub const fn block_range(&self) -> Option<&SegmentRangeInclusive> {
-        self.block_range.as_ref()
+    pub const fn block_range(&self) -> Option<SegmentRangeInclusive> {
+        self.block_range
     }
 
     /// Returns the transaction range.
-    pub const fn tx_range(&self) -> Option<&SegmentRangeInclusive> {
-        self.tx_range.as_ref()
+    pub const fn tx_range(&self) -> Option<SegmentRangeInclusive> {
+        self.tx_range
     }
 
     /// The expected block start of the segment.
@@ -228,16 +220,16 @@ impl SegmentHeader {
 
     /// Number of transactions.
     pub fn tx_len(&self) -> Option<u64> {
-        self.tx_range.as_ref().map(|r| (r.end() + 1) - r.start())
+        self.tx_range.as_ref().map(|r| r.len())
     }
 
     /// Number of blocks.
     pub fn block_len(&self) -> Option<u64> {
-        self.block_range.as_ref().map(|r| (r.end() + 1) - r.start())
+        self.block_range.as_ref().map(|r| r.len())
     }
 
     /// Increments block end range depending on segment
-    pub fn increment_block(&mut self) -> BlockNumber {
+    pub const fn increment_block(&mut self) -> BlockNumber {
         if let Some(block_range) = &mut self.block_range {
             block_range.end += 1;
             block_range.end
@@ -251,7 +243,7 @@ impl SegmentHeader {
     }
 
     /// Increments tx end range depending on segment
-    pub fn increment_tx(&mut self) {
+    pub const fn increment_tx(&mut self) {
         if self.segment.is_tx_based() {
             if let Some(tx_range) = &mut self.tx_range {
                 tx_range.end += 1;
@@ -262,7 +254,7 @@ impl SegmentHeader {
     }
 
     /// Removes `num` elements from end of tx or block range.
-    pub fn prune(&mut self, num: u64) {
+    pub const fn prune(&mut self, num: u64) {
         if self.segment.is_block_based() {
             if let Some(range) = &mut self.block_range {
                 if num > range.end - range.start {
@@ -281,7 +273,7 @@ impl SegmentHeader {
     }
 
     /// Sets a new `block_range`.
-    pub fn set_block_range(&mut self, block_start: BlockNumber, block_end: BlockNumber) {
+    pub const fn set_block_range(&mut self, block_start: BlockNumber, block_end: BlockNumber) {
         if let Some(block_range) = &mut self.block_range {
             block_range.start = block_start;
             block_range.end = block_end;
@@ -291,7 +283,7 @@ impl SegmentHeader {
     }
 
     /// Sets a new `tx_range`.
-    pub fn set_tx_range(&mut self, tx_start: TxNumber, tx_end: TxNumber) {
+    pub const fn set_tx_range(&mut self, tx_start: TxNumber, tx_end: TxNumber) {
         if let Some(tx_range) = &mut self.tx_range {
             tx_range.start = tx_start;
             tx_range.end = tx_end;
@@ -340,6 +332,16 @@ impl SegmentRangeInclusive {
     pub const fn end(&self) -> u64 {
         self.end
     }
+
+    /// Returns the length of the inclusive range.
+    pub const fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+
+    /// Returns true if the range is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.start > self.end
+    }
 }
 
 impl core::fmt::Display for SegmentRangeInclusive {
@@ -369,8 +371,9 @@ impl From<SegmentRangeInclusive> for RangeInclusive<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::hex;
+    use alloy_primitives::Bytes;
     use reth_nippy_jar::NippyJar;
+    use std::env::temp_dir;
 
     #[test]
     fn test_filename() {
@@ -429,47 +432,83 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_config_backwards() {
-        let headers = hex!("010000000000000000000000000000001fa10700000000000100000000000000001fa10700000000000000000000030000000000000020a107000000000001010000004a02000000000000");
-        let transactions = hex!("010000000000000000000000000000001fa10700000000000100000000000000001fa107000000000001000000000000000034a107000000000001000000010000000000000035a1070000000000004010000000000000");
-        let receipts = hex!("010000000000000000000000000000001fa10700000000000100000000000000000000000000000000000200000001000000000000000000000000000000000000000000000000");
+    fn test_segment_config_serialization() {
+        let segments = vec![
+            SegmentHeader {
+                expected_block_range: SegmentRangeInclusive::new(0, 200),
+                block_range: Some(SegmentRangeInclusive::new(0, 100)),
+                tx_range: None,
+                segment: StaticFileSegment::Headers,
+            },
+            SegmentHeader {
+                expected_block_range: SegmentRangeInclusive::new(0, 200),
+                block_range: None,
+                tx_range: Some(SegmentRangeInclusive::new(0, 300)),
+                segment: StaticFileSegment::Transactions,
+            },
+            SegmentHeader {
+                expected_block_range: SegmentRangeInclusive::new(0, 200),
+                block_range: Some(SegmentRangeInclusive::new(0, 100)),
+                tx_range: Some(SegmentRangeInclusive::new(0, 300)),
+                segment: StaticFileSegment::Receipts,
+            },
+            SegmentHeader {
+                expected_block_range: SegmentRangeInclusive::new(0, 200),
+                block_range: Some(SegmentRangeInclusive::new(0, 100)),
+                tx_range: Some(SegmentRangeInclusive::new(0, 300)),
+                segment: StaticFileSegment::TransactionSenders,
+            },
+        ];
+        // Check that we test all segments
+        assert_eq!(
+            segments.iter().map(|segment| segment.segment()).collect::<Vec<_>>(),
+            StaticFileSegment::iter().collect::<Vec<_>>()
+        );
 
-        {
-            let headers = NippyJar::<SegmentHeader>::load_from_reader(&headers[..]).unwrap();
-            assert_eq!(
-                &SegmentHeader {
-                    expected_block_range: SegmentRangeInclusive::new(0, 499999),
-                    block_range: Some(SegmentRangeInclusive::new(0, 499999)),
-                    tx_range: None,
-                    segment: StaticFileSegment::Headers,
-                },
-                headers.user_header()
-            );
+        for header in segments {
+            let segment_jar = NippyJar::new(1, &temp_dir(), header);
+            let mut serialized = Vec::new();
+            segment_jar.save_to_writer(&mut serialized).unwrap();
+
+            let deserialized =
+                NippyJar::<SegmentHeader>::load_from_reader(&serialized[..]).unwrap();
+            assert_eq!(deserialized.user_header(), segment_jar.user_header());
+
+            insta::assert_snapshot!(header.segment().to_string(), Bytes::from(serialized));
         }
-        {
-            let transactions =
-                NippyJar::<SegmentHeader>::load_from_reader(&transactions[..]).unwrap();
-            assert_eq!(
-                &SegmentHeader {
-                    expected_block_range: SegmentRangeInclusive::new(0, 499999),
-                    block_range: Some(SegmentRangeInclusive::new(0, 499999)),
-                    tx_range: Some(SegmentRangeInclusive::new(0, 500020)),
-                    segment: StaticFileSegment::Transactions,
-                },
-                transactions.user_header()
-            );
+    }
+
+    /// Used in filename writing/parsing
+    #[test]
+    fn test_static_file_segment_str_roundtrip() {
+        for segment in StaticFileSegment::iter() {
+            let static_str = segment.as_str();
+            assert_eq!(StaticFileSegment::from_str(static_str).unwrap(), segment);
+
+            let expected_str = match segment {
+                StaticFileSegment::Headers => "headers",
+                StaticFileSegment::Transactions => "transactions",
+                StaticFileSegment::Receipts => "receipts",
+                StaticFileSegment::TransactionSenders => "transaction-senders",
+            };
+            assert_eq!(static_str, expected_str);
         }
-        {
-            let receipts = NippyJar::<SegmentHeader>::load_from_reader(&receipts[..]).unwrap();
-            assert_eq!(
-                &SegmentHeader {
-                    expected_block_range: SegmentRangeInclusive::new(0, 499999),
-                    block_range: Some(SegmentRangeInclusive::new(0, 0)),
-                    tx_range: None,
-                    segment: StaticFileSegment::Receipts,
-                },
-                receipts.user_header()
-            );
+    }
+
+    /// Used in segment headers serialize/deserialize
+    #[test]
+    fn test_static_file_segment_serde_roundtrip() {
+        for segment in StaticFileSegment::iter() {
+            let ser = serde_json::to_string(&segment).unwrap();
+            assert_eq!(serde_json::from_str::<StaticFileSegment>(&ser).unwrap(), segment);
+
+            let expected_str = match segment {
+                StaticFileSegment::Headers => "Headers",
+                StaticFileSegment::Transactions => "Transactions",
+                StaticFileSegment::Receipts => "Receipts",
+                StaticFileSegment::TransactionSenders => "TransactionSenders",
+            };
+            assert_eq!(ser, format!("\"{expected_str}\""));
         }
     }
 }

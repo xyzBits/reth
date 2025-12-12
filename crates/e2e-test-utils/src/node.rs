@@ -1,31 +1,33 @@
 use crate::{network::NetworkTestContext, payload::PayloadTestContext, rpc::RpcTestContext};
-use alloy_consensus::BlockHeader;
+use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eips::BlockId;
 use alloy_primitives::{BlockHash, BlockNumber, Bytes, Sealable, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use eyre::Ok;
 use futures_util::Future;
+use jsonrpsee::http_client::HttpClient;
 use reth_chainspec::EthereumHardforks;
 use reth_network_api::test_utils::PeersHandleProvider;
 use reth_node_api::{
-    Block, BlockBody, BlockTy, EngineApiMessageVersion, EngineTypes, FullNodeComponents,
+    Block, BlockBody, BlockTy, EngineApiMessageVersion, FullNodeComponents, PayloadTypes,
     PrimitivesTy,
 };
-use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeTypesWithEngine};
-use reth_node_core::primitives::SignedTransaction;
+use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeTypes};
+
 use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes};
 use reth_provider::{
     BlockReader, BlockReaderIdExt, CanonStateNotificationStream, CanonStateSubscriptions,
-    StageCheckpointReader,
+    HeaderProvider, StageCheckpointReader,
 };
+use reth_rpc_builder::auth::AuthServerHandle;
 use reth_rpc_eth_api::helpers::{EthApiSpec, EthTransactions, TraceExt};
 use reth_stages_types::StageId;
 use std::pin::Pin;
 use tokio_stream::StreamExt;
 use url::Url;
 
-/// An helper struct to handle node actions
+/// A helper struct to handle node actions
 #[expect(missing_debug_implementations)]
 pub struct NodeTestContext<Node, AddOns>
 where
@@ -35,7 +37,7 @@ where
     /// The core structure representing the full node.
     pub inner: FullNode<Node, AddOns>,
     /// Context for testing payload-related features.
-    pub payload: PayloadTestContext<<Node::Types as NodeTypesWithEngine>::Engine>,
+    pub payload: PayloadTestContext<<Node::Types as NodeTypes>::Payload>,
     /// Context for testing network functionalities.
     pub network: NetworkTestContext<Node::Network>,
     /// Context for testing RPC features.
@@ -44,18 +46,18 @@ where
     pub canonical_stream: CanonStateNotificationStream<PrimitivesTy<Node::Types>>,
 }
 
-impl<Node, Engine, AddOns> NodeTestContext<Node, AddOns>
+impl<Node, Payload, AddOns> NodeTestContext<Node, AddOns>
 where
-    Engine: EngineTypes,
+    Payload: PayloadTypes,
     Node: FullNodeComponents,
-    Node::Types: NodeTypesWithEngine<ChainSpec: EthereumHardforks, Engine = Engine>,
+    Node::Types: NodeTypes<ChainSpec: EthereumHardforks, Payload = Payload>,
     Node::Network: PeersHandleProvider,
     AddOns: RethRpcAddOns<Node>,
 {
     /// Creates a new test node
     pub async fn new(
         node: FullNode<Node, AddOns>,
-        attributes_generator: impl Fn(u64) -> Engine::PayloadBuilderAttributes + 'static,
+        attributes_generator: impl Fn(u64) -> Payload::PayloadBuilderAttributes + Send + Sync + 'static,
     ) -> eyre::Result<Self> {
         Ok(Self {
             inner: node.clone(),
@@ -84,7 +86,7 @@ where
         &mut self,
         length: u64,
         tx_generator: impl Fn(u64) -> Pin<Box<dyn Future<Output = Bytes>>>,
-    ) -> eyre::Result<Vec<Engine::BuiltPayload>>
+    ) -> eyre::Result<Vec<Payload::BuiltPayload>>
     where
         AddOns::EthApi: EthApiSpec<Provider: BlockReader<Block = BlockTy<Node::Types>>>
             + EthTransactions
@@ -107,7 +109,7 @@ where
     /// expects a payload attribute event and waits until the payload is built.
     ///
     /// It triggers the resolve payload via engine api and expects the built payload event.
-    pub async fn new_payload(&mut self) -> eyre::Result<Engine::BuiltPayload> {
+    pub async fn new_payload(&mut self) -> eyre::Result<Payload::BuiltPayload> {
         // trigger new payload building draining the pool
         let eth_attr = self.payload.new_payload().await.unwrap();
         // first event is the payload attributes
@@ -119,7 +121,7 @@ where
     }
 
     /// Triggers payload building job and submits it to the engine.
-    pub async fn build_and_submit_payload(&mut self) -> eyre::Result<Engine::BuiltPayload> {
+    pub async fn build_and_submit_payload(&mut self) -> eyre::Result<Payload::BuiltPayload> {
         let payload = self.new_payload().await?;
 
         self.submit_payload(payload.clone()).await?;
@@ -128,7 +130,7 @@ where
     }
 
     /// Advances the node forward one block
-    pub async fn advance_block(&mut self) -> eyre::Result<Engine::BuiltPayload> {
+    pub async fn advance_block(&mut self) -> eyre::Result<Payload::BuiltPayload> {
         let payload = self.build_and_submit_payload().await?;
 
         // trigger forkchoice update via engine api to commit the block to the blockchain
@@ -148,19 +150,18 @@ where
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-            if !check && wait_finish_checkpoint {
-                if let Some(checkpoint) =
-                    self.inner.provider.get_stage_checkpoint(StageId::Finish)?
-                {
-                    if checkpoint.block_number >= number {
-                        check = true
-                    }
-                }
+            if !check &&
+                wait_finish_checkpoint &&
+                let Some(checkpoint) =
+                    self.inner.provider.get_stage_checkpoint(StageId::Finish)? &&
+                checkpoint.block_number >= number
+            {
+                check = true
             }
 
             if check {
-                if let Some(latest_block) = self.inner.provider.block_by_number(number)? {
-                    assert_eq!(latest_block.header().hash_slow(), expected_block_hash);
+                if let Some(latest_header) = self.inner.provider.header_by_number(number)? {
+                    assert_eq!(latest_header.hash_slow(), expected_block_hash);
                     break
                 }
                 assert!(
@@ -176,10 +177,10 @@ where
     pub async fn wait_unwind(&self, number: BlockNumber) -> eyre::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if let Some(checkpoint) = self.inner.provider.get_stage_checkpoint(StageId::Headers)? {
-                if checkpoint.block_number == number {
-                    break
-                }
+            if let Some(checkpoint) = self.inner.provider.get_stage_checkpoint(StageId::Headers)? &&
+                checkpoint.block_number == number
+            {
+                break
             }
         }
         Ok(())
@@ -205,14 +206,13 @@ where
             // wait for the block to commit
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             if let Some(latest_block) =
-                self.inner.provider.block_by_number_or_tag(BlockNumberOrTag::Latest)?
+                self.inner.provider.block_by_number_or_tag(BlockNumberOrTag::Latest)? &&
+                latest_block.header().number() == block_number
             {
-                if latest_block.header().number() == block_number {
-                    // make sure the block hash we submitted via FCU engine api is the new latest
-                    // block using an RPC call
-                    assert_eq!(latest_block.header().hash_slow(), block_hash);
-                    break
-                }
+                // make sure the block hash we submitted via FCU engine api is the new latest
+                // block using an RPC call
+                assert_eq!(latest_block.header().hash_slow(), block_hash);
+                break
             }
         }
         Ok(())
@@ -277,12 +277,12 @@ where
     }
 
     /// Submits a payload to the engine.
-    pub async fn submit_payload(&self, payload: Engine::BuiltPayload) -> eyre::Result<B256> {
+    pub async fn submit_payload(&self, payload: Payload::BuiltPayload) -> eyre::Result<B256> {
         let block_hash = payload.block().hash();
         self.inner
             .add_ons_handle
             .beacon_engine_handle
-            .new_payload(Engine::block_to_payload(payload.block().clone()))
+            .new_payload(Payload::block_to_payload(payload.block().clone()))
             .await?;
 
         Ok(block_hash)
@@ -291,6 +291,32 @@ where
     /// Returns the RPC URL.
     pub fn rpc_url(&self) -> Url {
         let addr = self.inner.rpc_server_handle().http_local_addr().unwrap();
-        format!("http://{}", addr).parse().unwrap()
+        format!("http://{addr}").parse().unwrap()
+    }
+
+    /// Returns an RPC client.
+    pub fn rpc_client(&self) -> Option<HttpClient> {
+        self.inner.rpc_server_handle().http_client()
+    }
+
+    /// Returns an Engine API client.
+    pub fn auth_server_handle(&self) -> AuthServerHandle {
+        self.inner.auth_server_handle().clone()
+    }
+
+    /// Creates a [`crate::testsuite::NodeClient`] from this test context.
+    ///
+    /// This helper method extracts the necessary handles and creates a client
+    /// that can interact with both the regular RPC and Engine API endpoints.
+    /// It automatically includes the beacon engine handle for direct consensus engine interaction.
+    pub fn to_node_client(&self) -> eyre::Result<crate::testsuite::NodeClient<Payload>> {
+        let rpc = self
+            .rpc_client()
+            .ok_or_else(|| eyre::eyre!("Failed to create HTTP RPC client for node"))?;
+        let auth = self.auth_server_handle();
+        let url = self.rpc_url();
+        let beacon_handle = self.inner.add_ons_handle.beacon_engine_handle.clone();
+
+        Ok(crate::testsuite::NodeClient::new_with_beacon_engine(rpc, auth, url, beacon_handle))
     }
 }

@@ -57,7 +57,7 @@ where
     }
 
     /// Returns a mutable reference to the handler
-    pub fn handler_mut(&mut self) -> &mut T {
+    pub const fn handler_mut(&mut self) -> &mut T {
         &mut self.handler
     }
 
@@ -71,7 +71,7 @@ where
     /// Internal function used to advance the chain.
     ///
     /// Polls the `ChainOrchestrator` for the next event.
-    #[tracing::instrument(level = "debug", name = "ChainOrchestrator::poll", skip(self, cx))]
+    #[tracing::instrument(level = "debug", target = "engine::tree::chain_orchestrator", skip_all)]
     fn poll_next_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ChainEvent<T::Event>> {
         let this = self.get_mut();
 

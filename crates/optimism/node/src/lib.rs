@@ -8,7 +8,8 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 /// CLI argument parsing for the optimism node.
 pub mod args;
@@ -19,7 +20,7 @@ pub mod engine;
 pub use engine::OpEngineTypes;
 
 pub mod node;
-pub use node::{OpNetworkPrimitives, OpNode};
+pub use node::*;
 
 pub mod rpc;
 pub use rpc::OpEngineApiBuilder;
@@ -34,7 +35,13 @@ pub use reth_optimism_txpool as txpool;
 pub mod utils;
 
 pub use reth_optimism_payload_builder::{
-    OpBuiltPayload, OpPayloadBuilder, OpPayloadBuilderAttributes,
+    self as payload, config::OpDAConfig, OpBuiltPayload, OpPayloadAttributes, OpPayloadBuilder,
+    OpPayloadBuilderAttributes, OpPayloadPrimitives, OpPayloadTypes,
 };
 
 pub use reth_optimism_evm::*;
+
+pub use reth_optimism_storage::OpStorage;
+
+use op_revm as _;
+use revm as _;

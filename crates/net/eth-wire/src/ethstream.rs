@@ -1,17 +1,22 @@
+//! Ethereum protocol stream implementations.
+//!
+//! Provides stream types for the Ethereum wire protocol.
+//! It separates protocol logic [`EthStreamInner`] from transport concerns [`EthStream`].
+//! Handles handshaking, message processing, and RLP serialization.
+
 use crate::{
-    capability::RawCapabilityMessage,
     errors::{EthHandshakeError, EthStreamError},
     handshake::EthereumEthHandshake,
     message::{EthBroadcastMessage, ProtocolBroadcastMessage},
     p2pstream::HANDSHAKE_TIMEOUT,
     CanDisconnect, DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion, ProtocolMessage,
-    Status,
+    UnifiedStatus,
 };
 use alloy_primitives::bytes::{Bytes, BytesMut};
 use alloy_rlp::Encodable;
 use futures::{ready, Sink, SinkExt};
 use pin_project::pin_project;
-use reth_eth_wire_types::NetworkPrimitives;
+use reth_eth_wire_types::{NetworkPrimitives, RawCapabilityMessage};
 use reth_ethereum_forks::ForkFilter;
 use std::{
     future::Future,
@@ -26,9 +31,6 @@ use tracing::{debug, trace};
 /// [`MAX_MESSAGE_SIZE`] is the maximum cap on the size of a protocol message.
 // https://github.com/ethereum/go-ethereum/blob/30602163d5d8321fbc68afdcbbaf2362b2641bde/eth/protocols/eth/protocol.go#L50
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
-
-/// [`MAX_STATUS_SIZE`] is the maximum cap on the size of the initial status message
-pub(crate) const MAX_STATUS_SIZE: usize = 500 * 1024;
 
 /// An un-authenticated [`EthStream`]. This is consumed and returns a [`EthStream`] after the
 /// `Status` handshake is completed.
@@ -59,21 +61,24 @@ where
     /// Consumes the [`UnauthedEthStream`] and returns an [`EthStream`] after the `Status`
     /// handshake is completed successfully. This also returns the `Status` message sent by the
     /// remote peer.
+    ///
+    /// Caution: This expects that the [`UnifiedStatus`] has the proper eth version configured, with
+    /// ETH69 the initial status message changed.
     pub async fn handshake<N: NetworkPrimitives>(
         self,
-        status: Status,
+        status: UnifiedStatus,
         fork_filter: ForkFilter,
-    ) -> Result<(EthStream<S, N>, Status), EthStreamError> {
+    ) -> Result<(EthStream<S, N>, UnifiedStatus), EthStreamError> {
         self.handshake_with_timeout(status, fork_filter, HANDSHAKE_TIMEOUT).await
     }
 
     /// Wrapper around handshake which enforces a timeout.
     pub async fn handshake_with_timeout<N: NetworkPrimitives>(
         self,
-        status: Status,
+        status: UnifiedStatus,
         fork_filter: ForkFilter,
         timeout_limit: Duration,
-    ) -> Result<(EthStream<S, N>, Status), EthStreamError> {
+    ) -> Result<(EthStream<S, N>, UnifiedStatus), EthStreamError> {
         timeout(timeout_limit, Self::handshake_without_timeout(self, status, fork_filter))
             .await
             .map_err(|_| EthStreamError::StreamTimeout)?
@@ -82,20 +87,86 @@ where
     /// Handshake with no timeout
     pub async fn handshake_without_timeout<N: NetworkPrimitives>(
         mut self,
-        status: Status,
+        status: UnifiedStatus,
         fork_filter: ForkFilter,
-    ) -> Result<(EthStream<S, N>, Status), EthStreamError> {
+    ) -> Result<(EthStream<S, N>, UnifiedStatus), EthStreamError> {
         trace!(
-            %status,
+            status = %status.into_message(),
             "sending eth status to peer"
         );
-        EthereumEthHandshake(&mut self.inner).eth_handshake(status, fork_filter).await?;
+        let their_status =
+            EthereumEthHandshake(&mut self.inner).eth_handshake(status, fork_filter).await?;
 
         // now we can create the `EthStream` because the peer has successfully completed
         // the handshake
         let stream = EthStream::new(status.version, self.inner);
 
-        Ok((stream, status))
+        Ok((stream, their_status))
+    }
+}
+
+/// Contains eth protocol specific logic for processing messages
+#[derive(Debug)]
+pub struct EthStreamInner<N> {
+    /// Negotiated eth version
+    version: EthVersion,
+    _pd: std::marker::PhantomData<N>,
+}
+
+impl<N> EthStreamInner<N>
+where
+    N: NetworkPrimitives,
+{
+    /// Creates a new [`EthStreamInner`] with the given eth version
+    pub const fn new(version: EthVersion) -> Self {
+        Self { version, _pd: std::marker::PhantomData }
+    }
+
+    /// Returns the eth version
+    #[inline]
+    pub const fn version(&self) -> EthVersion {
+        self.version
+    }
+
+    /// Decodes incoming bytes into an [`EthMessage`].
+    pub fn decode_message(&self, bytes: BytesMut) -> Result<EthMessage<N>, EthStreamError> {
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(EthStreamError::MessageTooBig(bytes.len()));
+        }
+
+        let msg = match ProtocolMessage::decode_message(self.version, &mut bytes.as_ref()) {
+            Ok(m) => m,
+            Err(err) => {
+                let msg = if bytes.len() > 50 {
+                    format!("{:02x?}...{:x?}", &bytes[..10], &bytes[bytes.len() - 10..])
+                } else {
+                    format!("{bytes:02x?}")
+                };
+                debug!(
+                    version=?self.version,
+                    %msg,
+                    "failed to decode protocol message"
+                );
+                return Err(EthStreamError::InvalidMessage(err));
+            }
+        };
+
+        if matches!(msg.message, EthMessage::Status(_)) {
+            return Err(EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake));
+        }
+
+        Ok(msg.message)
+    }
+
+    /// Encodes an [`EthMessage`] to bytes.
+    ///
+    /// Validates that Status messages are not sent after handshake, enforcing protocol rules.
+    pub fn encode_message(&self, item: EthMessage<N>) -> Result<Bytes, EthStreamError> {
+        if matches!(item, EthMessage::Status(_)) {
+            return Err(EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake));
+        }
+
+        Ok(Bytes::from(alloy_rlp::encode(ProtocolMessage::from(item))))
     }
 }
 
@@ -104,26 +175,24 @@ where
 #[pin_project]
 #[derive(Debug)]
 pub struct EthStream<S, N = EthNetworkPrimitives> {
-    /// Negotiated eth version.
-    version: EthVersion,
+    /// Eth-specific logic
+    eth: EthStreamInner<N>,
     #[pin]
     inner: S,
-
-    _pd: std::marker::PhantomData<N>,
 }
 
-impl<S, N> EthStream<S, N> {
+impl<S, N: NetworkPrimitives> EthStream<S, N> {
     /// Creates a new unauthed [`EthStream`] from a provided stream. You will need
     /// to manually handshake a peer.
     #[inline]
     pub const fn new(version: EthVersion, inner: S) -> Self {
-        Self { version, inner, _pd: std::marker::PhantomData }
+        Self { eth: EthStreamInner::new(version), inner }
     }
 
     /// Returns the eth version.
     #[inline]
     pub const fn version(&self) -> EthVersion {
-        self.version
+        self.eth.version()
     }
 
     /// Returns the underlying stream.
@@ -134,7 +203,7 @@ impl<S, N> EthStream<S, N> {
 
     /// Returns mutable access to the underlying stream.
     #[inline]
-    pub fn inner_mut(&mut self) -> &mut S {
+    pub const fn inner_mut(&mut self) -> &mut S {
         &mut self.inner
     }
 
@@ -185,40 +254,12 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         let res = ready!(this.inner.poll_next(cx));
-        let bytes = match res {
-            Some(Ok(bytes)) => bytes,
-            Some(Err(err)) => return Poll::Ready(Some(Err(err.into()))),
-            None => return Poll::Ready(None),
-        };
 
-        if bytes.len() > MAX_MESSAGE_SIZE {
-            return Poll::Ready(Some(Err(EthStreamError::MessageTooBig(bytes.len()))))
+        match res {
+            Some(Ok(bytes)) => Poll::Ready(Some(this.eth.decode_message(bytes))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            None => Poll::Ready(None),
         }
-
-        let msg = match ProtocolMessage::decode_message(*this.version, &mut bytes.as_ref()) {
-            Ok(m) => m,
-            Err(err) => {
-                let msg = if bytes.len() > 50 {
-                    format!("{:02x?}...{:x?}", &bytes[..10], &bytes[bytes.len() - 10..])
-                } else {
-                    format!("{bytes:02x?}")
-                };
-                debug!(
-                    version=?this.version,
-                    %msg,
-                    "failed to decode protocol message"
-                );
-                return Poll::Ready(Some(Err(EthStreamError::InvalidMessage(err))))
-            }
-        };
-
-        if matches!(msg.message, EthMessage::Status(_)) {
-            return Poll::Ready(Some(Err(EthStreamError::EthHandshakeError(
-                EthHandshakeError::StatusNotInHandshake,
-            ))))
-        }
-
-        Poll::Ready(Some(Ok(msg.message)))
     }
 }
 
@@ -236,15 +277,13 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: EthMessage<N>) -> Result<(), Self::Error> {
         if matches!(item, EthMessage::Status(_)) {
-            // TODO: to disconnect here we would need to do something similar to P2PStream's
-            // start_disconnect, which would ideally be a part of the CanDisconnect trait, or at
-            // least similar.
-            //
-            // Other parts of reth do not yet need traits like CanDisconnect because atm they work
-            // exclusively with EthStream<P2PStream<S>>, where the inner P2PStream is accessible,
-            // allowing for its start_disconnect method to be called.
-            //
-            // self.project().inner.start_disconnect(DisconnectReason::ProtocolBreach);
+            // Attempt to disconnect the peer for protocol breach when trying to send Status
+            // message after handshake is complete
+            let mut this = self.project();
+            // We can't await the disconnect future here since this is a synchronous method,
+            // but we can start the disconnect process. The actual disconnect will be handled
+            // asynchronously by the caller or the stream's poll methods.
+            let _disconnect_future = this.inner.disconnect(DisconnectReason::ProtocolBreach);
             return Err(EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake))
         }
 
@@ -288,14 +327,14 @@ mod tests {
         hello::DEFAULT_TCP_PORT,
         p2pstream::UnauthedP2PStream,
         EthMessage, EthStream, EthVersion, HelloMessageWithProtocols, PassthroughCodec,
-        ProtocolVersion, Status,
+        ProtocolVersion, Status, StatusMessage,
     };
     use alloy_chains::NamedChain;
     use alloy_primitives::{bytes::Bytes, B256, U256};
     use alloy_rlp::Decodable;
     use futures::{SinkExt, StreamExt};
     use reth_ecies::stream::ECIESStream;
-    use reth_eth_wire_types::EthNetworkPrimitives;
+    use reth_eth_wire_types::{EthNetworkPrimitives, UnifiedStatus};
     use reth_ethereum_forks::{ForkFilter, Head};
     use reth_network_peers::pk2id;
     use secp256k1::{SecretKey, SECP256K1};
@@ -317,11 +356,12 @@ mod tests {
             // Pass the current fork id.
             forkid: fork_filter.current(),
         };
+        let unified_status = UnifiedStatus::from_message(StatusMessage::Legacy(status));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let status_clone = status;
+        let status_clone = unified_status;
         let fork_filter_clone = fork_filter.clone();
         let handle = tokio::spawn(async move {
             // roughly based off of the design of tokio::net::TcpListener
@@ -341,12 +381,12 @@ mod tests {
 
         // try to connect
         let (_, their_status) = UnauthedEthStream::new(sink)
-            .handshake::<EthNetworkPrimitives>(status, fork_filter)
+            .handshake::<EthNetworkPrimitives>(unified_status, fork_filter)
             .await
             .unwrap();
 
         // their status is a clone of our status, these should be equal
-        assert_eq!(their_status, status);
+        assert_eq!(their_status, unified_status);
 
         // wait for it to finish
         handle.await.unwrap();
@@ -366,11 +406,12 @@ mod tests {
             // Pass the current fork id.
             forkid: fork_filter.current(),
         };
+        let unified_status = UnifiedStatus::from_message(StatusMessage::Legacy(status));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let status_clone = status;
+        let status_clone = unified_status;
         let fork_filter_clone = fork_filter.clone();
         let handle = tokio::spawn(async move {
             // roughly based off of the design of tokio::net::TcpListener
@@ -390,12 +431,12 @@ mod tests {
 
         // try to connect
         let (_, their_status) = UnauthedEthStream::new(sink)
-            .handshake::<EthNetworkPrimitives>(status, fork_filter)
+            .handshake::<EthNetworkPrimitives>(unified_status, fork_filter)
             .await
             .unwrap();
 
         // their status is a clone of our status, these should be equal
-        assert_eq!(their_status, status);
+        assert_eq!(their_status, unified_status);
 
         // await the other handshake
         handle.await.unwrap();
@@ -415,11 +456,12 @@ mod tests {
             // Pass the current fork id.
             forkid: fork_filter.current(),
         };
+        let unified_status = UnifiedStatus::from_message(StatusMessage::Legacy(status));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let status_clone = status;
+        let status_clone = unified_status;
         let fork_filter_clone = fork_filter.clone();
         let handle = tokio::spawn(async move {
             // roughly based off of the design of tokio::net::TcpListener
@@ -443,7 +485,7 @@ mod tests {
 
         // try to connect
         let handshake_res = UnauthedEthStream::new(sink)
-            .handshake::<EthNetworkPrimitives>(status, fork_filter)
+            .handshake::<EthNetworkPrimitives>(unified_status, fork_filter)
             .await;
 
         // this handshake should also fail due to td too high
@@ -496,7 +538,7 @@ mod tests {
     async fn can_write_and_read_ecies() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
-        let server_key = SecretKey::new(&mut rand::thread_rng());
+        let server_key = SecretKey::new(&mut rand_08::thread_rng());
         let test_msg = EthMessage::<EthNetworkPrimitives>::NewBlockHashes(
             vec![
                 BlockHashNumber { hash: B256::random(), number: 5 },
@@ -520,7 +562,7 @@ mod tests {
         // create the server pubkey
         let server_id = pk2id(&server_key.public_key(SECP256K1));
 
-        let client_key = SecretKey::new(&mut rand::thread_rng());
+        let client_key = SecretKey::new(&mut rand_08::thread_rng());
 
         let outgoing = TcpStream::connect(local_addr).await.unwrap();
         let outgoing = ECIESStream::connect(outgoing, client_key, server_id).await.unwrap();
@@ -538,7 +580,7 @@ mod tests {
         // create tcpstream
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
-        let server_key = SecretKey::new(&mut rand::thread_rng());
+        let server_key = SecretKey::new(&mut rand_08::thread_rng());
         let test_msg = EthMessage::<EthNetworkPrimitives>::NewBlockHashes(
             vec![
                 BlockHashNumber { hash: B256::random(), number: 5 },
@@ -559,8 +601,9 @@ mod tests {
             // Pass the current fork id.
             forkid: fork_filter.current(),
         };
+        let unified_status = UnifiedStatus::from_message(StatusMessage::Legacy(status));
 
-        let status_copy = status;
+        let status_copy = unified_status;
         let fork_filter_clone = fork_filter.clone();
         let test_msg_clone = test_msg.clone();
         let handle = tokio::spawn(async move {
@@ -591,7 +634,7 @@ mod tests {
         // create the server pubkey
         let server_id = pk2id(&server_key.public_key(SECP256K1));
 
-        let client_key = SecretKey::new(&mut rand::thread_rng());
+        let client_key = SecretKey::new(&mut rand_08::thread_rng());
 
         let outgoing = TcpStream::connect(local_addr).await.unwrap();
         let sink = ECIESStream::connect(outgoing, client_key, server_id).await.unwrap();
@@ -607,8 +650,10 @@ mod tests {
         let unauthed_stream = UnauthedP2PStream::new(sink);
         let (p2p_stream, _) = unauthed_stream.handshake(client_hello).await.unwrap();
 
-        let (mut client_stream, _) =
-            UnauthedEthStream::new(p2p_stream).handshake(status, fork_filter).await.unwrap();
+        let (mut client_stream, _) = UnauthedEthStream::new(p2p_stream)
+            .handshake(unified_status, fork_filter)
+            .await
+            .unwrap();
 
         client_stream.send(test_msg).await.unwrap();
 
@@ -630,11 +675,12 @@ mod tests {
             // Pass the current fork id.
             forkid: fork_filter.current(),
         };
+        let unified_status = UnifiedStatus::from_message(StatusMessage::Legacy(status));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let status_clone = status;
+        let status_clone = unified_status;
         let fork_filter_clone = fork_filter.clone();
         let _handle = tokio::spawn(async move {
             // Delay accepting the connection for longer than the client's timeout period
@@ -657,7 +703,7 @@ mod tests {
         // try to connect
         let handshake_result = UnauthedEthStream::new(sink)
             .handshake_with_timeout::<EthNetworkPrimitives>(
-                status,
+                unified_status,
                 fork_filter,
                 Duration::from_secs(1),
             )
@@ -700,6 +746,50 @@ mod tests {
 
         client_stream.start_send_raw(test_msg).unwrap();
         client_stream.inner_mut().flush().await.unwrap();
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_message_after_handshake_triggers_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (incoming, _) = listener.accept().await.unwrap();
+            let stream = PassthroughCodec::default().framed(incoming);
+            let mut stream = EthStream::<_, EthNetworkPrimitives>::new(EthVersion::Eth67, stream);
+
+            // Try to send a Status message after handshake - this should trigger disconnect
+            let status = Status {
+                version: EthVersion::Eth67,
+                chain: NamedChain::Mainnet.into(),
+                total_difficulty: U256::ZERO,
+                blockhash: B256::random(),
+                genesis: B256::random(),
+                forkid: ForkFilter::new(Head::default(), B256::random(), 0, Vec::new()).current(),
+            };
+            let status_message =
+                EthMessage::<EthNetworkPrimitives>::Status(StatusMessage::Legacy(status));
+
+            // This should return an error and trigger disconnect
+            let result = stream.send(status_message).await;
+            assert!(result.is_err());
+            assert!(matches!(
+                result.unwrap_err(),
+                EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake)
+            ));
+        });
+
+        let outgoing = TcpStream::connect(local_addr).await.unwrap();
+        let sink = PassthroughCodec::default().framed(outgoing);
+        let mut client_stream = EthStream::<_, EthNetworkPrimitives>::new(EthVersion::Eth67, sink);
+
+        // Send a valid message to keep the connection alive
+        let test_msg = EthMessage::<EthNetworkPrimitives>::NewBlockHashes(
+            vec![BlockHashNumber { hash: B256::random(), number: 5 }].into(),
+        );
+        client_stream.send(test_msg).await.unwrap();
 
         handle.await.unwrap();
     }

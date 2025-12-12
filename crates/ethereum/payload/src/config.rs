@@ -1,4 +1,5 @@
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
+use alloy_primitives::Bytes;
 use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
 
 /// Settings for the Ethereum builder.
@@ -6,6 +7,15 @@ use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
 pub struct EthereumBuilderConfig {
     /// Desired gas limit.
     pub desired_gas_limit: u64,
+    /// Waits for the first payload to be built if there is no payload built when the payload is
+    /// being resolved.
+    pub await_payload_on_missing: bool,
+    /// Maximum number of blobs to include per block (EIP-7872).
+    ///
+    /// If `None`, defaults to the protocol maximum.
+    pub max_blobs_per_block: Option<u64>,
+    /// Extra data for built blocks.
+    pub extra_data: Bytes,
 }
 
 impl Default for EthereumBuilderConfig {
@@ -17,12 +27,36 @@ impl Default for EthereumBuilderConfig {
 impl EthereumBuilderConfig {
     /// Create new payload builder config.
     pub const fn new() -> Self {
-        Self { desired_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M }
+        Self {
+            desired_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
+            await_payload_on_missing: true,
+            max_blobs_per_block: None,
+            extra_data: Bytes::new(),
+        }
     }
 
     /// Set desired gas limit.
     pub const fn with_gas_limit(mut self, desired_gas_limit: u64) -> Self {
         self.desired_gas_limit = desired_gas_limit;
+        self
+    }
+
+    /// Configures whether the initial payload should be awaited when the payload job is being
+    /// resolved and no payload has been built yet.
+    pub const fn with_await_payload_on_missing(mut self, await_payload_on_missing: bool) -> Self {
+        self.await_payload_on_missing = await_payload_on_missing;
+        self
+    }
+
+    /// Set the maximum number of blobs per block (EIP-7872).
+    pub const fn with_max_blobs_per_block(mut self, max_blobs_per_block: Option<u64>) -> Self {
+        self.max_blobs_per_block = max_blobs_per_block;
+        self
+    }
+
+    /// Set the extra data for built blocks.
+    pub fn with_extra_data(mut self, extra_data: Bytes) -> Self {
+        self.extra_data = extra_data;
         self
     }
 }

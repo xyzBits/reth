@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
-use reth_eth_wire::NetPrimitivesFor;
 
 pub mod drop;
 pub mod dump;
@@ -18,7 +17,7 @@ pub mod unwind;
 #[derive(Debug, Parser)]
 pub struct Command<C: ChainSpecParser> {
     #[command(subcommand)]
-    command: Subcommands<C>,
+    pub command: Subcommands<C>,
 }
 
 /// `reth stage` subcommands
@@ -41,18 +40,32 @@ pub enum Subcommands<C: ChainSpecParser> {
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>> Command<C> {
     /// Execute `stage` command
-    pub async fn execute<N, Comp, F, P>(self, ctx: CliContext, components: F) -> eyre::Result<()>
+    pub async fn execute<N, Comp>(
+        self,
+        ctx: CliContext,
+        components: impl FnOnce(Arc<C::ChainSpec>) -> Comp,
+    ) -> eyre::Result<()>
     where
         N: CliNodeTypes<ChainSpec = C::ChainSpec>,
         Comp: CliNodeComponents<N>,
-        F: FnOnce(Arc<C::ChainSpec>) -> Comp,
-        P: NetPrimitivesFor<N::Primitives>,
     {
         match self.command {
-            Subcommands::Run(command) => command.execute::<N, _, _, P>(ctx, components).await,
+            Subcommands::Run(command) => command.execute::<N, _, _>(ctx, components).await,
             Subcommands::Drop(command) => command.execute::<N>().await,
             Subcommands::Dump(command) => command.execute::<N, _, _>(components).await,
-            Subcommands::Unwind(command) => command.execute::<N>().await,
+            Subcommands::Unwind(command) => command.execute::<N, _, _>(components).await,
+        }
+    }
+}
+
+impl<C: ChainSpecParser> Command<C> {
+    /// Returns the underlying chain being used to run this command
+    pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
+        match self.command {
+            Subcommands::Run(ref command) => command.chain_spec(),
+            Subcommands::Drop(ref command) => command.chain_spec(),
+            Subcommands::Dump(ref command) => command.chain_spec(),
+            Subcommands::Unwind(ref command) => command.chain_spec(),
         }
     }
 }

@@ -74,7 +74,7 @@ impl<P: NodePrimitives> From<CanonStateNotification<P>> for ExExNotification<P> 
 #[cfg(all(feature = "serde", feature = "serde-bincode-compat"))]
 pub(super) mod serde_bincode_compat {
     use reth_execution_types::serde_bincode_compat::Chain;
-    use reth_primitives::{EthPrimitives, NodePrimitives};
+    use reth_primitives_traits::NodePrimitives;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_with::{DeserializeAs, SerializeAs};
     use std::sync::Arc;
@@ -84,27 +84,44 @@ pub(super) mod serde_bincode_compat {
     /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
     /// ```rust
     /// use reth_exex_types::{serde_bincode_compat, ExExNotification};
+    /// use reth_primitives_traits::NodePrimitives;
     /// use serde::{Deserialize, Serialize};
     /// use serde_with::serde_as;
     ///
     /// #[serde_as]
     /// #[derive(Serialize, Deserialize)]
-    /// struct Data {
-    ///     #[serde_as(as = "serde_bincode_compat::ExExNotification")]
-    ///     notification: ExExNotification,
+    /// struct Data<N: NodePrimitives> {
+    ///     #[serde_as(as = "serde_bincode_compat::ExExNotification<'_, N>")]
+    ///     notification: ExExNotification<N>,
     /// }
     /// ```
+    ///
+    /// This enum mirrors [`super::ExExNotification`] but uses borrowed [`Chain`] types
+    /// instead of `Arc<Chain>` for bincode compatibility.
     #[derive(Debug, Serialize, Deserialize)]
-    #[allow(missing_docs)]
     #[serde(bound = "")]
-    #[allow(clippy::large_enum_variant)]
-    pub enum ExExNotification<'a, N = EthPrimitives>
+    #[expect(clippy::large_enum_variant)]
+    pub enum ExExNotification<'a, N>
     where
         N: NodePrimitives,
     {
-        ChainCommitted { new: Chain<'a, N> },
-        ChainReorged { old: Chain<'a, N>, new: Chain<'a, N> },
-        ChainReverted { old: Chain<'a, N> },
+        /// Chain got committed without a reorg, and only the new chain is returned.
+        ChainCommitted {
+            /// The new chain after commit.
+            new: Chain<'a, N>,
+        },
+        /// Chain got reorged, and both the old and the new chains are returned.
+        ChainReorged {
+            /// The old chain before reorg.
+            old: Chain<'a, N>,
+            /// The new chain after reorg.
+            new: Chain<'a, N>,
+        },
+        /// Chain got reverted, and only the old chain is returned.
+        ChainReverted {
+            /// The old chain before reversion.
+            old: Chain<'a, N>,
+        },
     }
 
     impl<'a, N> From<&'a super::ExExNotification<N>> for ExExNotification<'a, N>
@@ -148,9 +165,12 @@ pub(super) mod serde_bincode_compat {
         }
     }
 
-    impl SerializeAs<super::ExExNotification> for ExExNotification<'_> {
+    impl<N> SerializeAs<super::ExExNotification<N>> for ExExNotification<'_, N>
+    where
+        N: NodePrimitives,
+    {
         fn serialize_as<S>(
-            source: &super::ExExNotification,
+            source: &super::ExExNotification<N>,
             serializer: S,
         ) -> Result<S::Ok, S::Error>
         where
@@ -160,8 +180,11 @@ pub(super) mod serde_bincode_compat {
         }
     }
 
-    impl<'de> DeserializeAs<'de, super::ExExNotification> for ExExNotification<'de> {
-        fn deserialize_as<D>(deserializer: D) -> Result<super::ExExNotification, D::Error>
+    impl<'de, N> DeserializeAs<'de, super::ExExNotification<N>> for ExExNotification<'de, N>
+    where
+        N: NodePrimitives,
+    {
+        fn deserialize_as<D>(deserializer: D) -> Result<super::ExExNotification<N>, D::Error>
         where
             D: Deserializer<'de>,
         {
@@ -175,7 +198,7 @@ pub(super) mod serde_bincode_compat {
         use arbitrary::Arbitrary;
         use rand::Rng;
         use reth_execution_types::Chain;
-        use reth_primitives::RecoveredBlock;
+        use reth_primitives_traits::RecoveredBlock;
         use serde::{Deserialize, Serialize};
         use serde_with::serde_as;
         use std::sync::Arc;
@@ -185,12 +208,14 @@ pub(super) mod serde_bincode_compat {
             #[serde_as]
             #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
             struct Data {
-                #[serde_as(as = "serde_bincode_compat::ExExNotification")]
+                #[serde_as(
+                    as = "serde_bincode_compat::ExExNotification<'_, reth_ethereum_primitives::EthPrimitives>"
+                )]
                 notification: ExExNotification,
             }
 
             let mut bytes = [0u8; 1024];
-            rand::thread_rng().fill(bytes.as_mut_slice());
+            rand::rng().fill(bytes.as_mut_slice());
             let data = Data {
                 notification: ExExNotification::ChainReorged {
                     old: Arc::new(Chain::new(

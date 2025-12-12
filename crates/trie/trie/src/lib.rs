@@ -12,7 +12,7 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The implementation of forward-only in-memory cursor.
 pub mod forward_cursor;
@@ -32,16 +32,22 @@ pub mod node_iter;
 /// Merkle proof generation.
 pub mod proof;
 
+/// Merkle proof generation v2 (leaf-only implementation).
+pub mod proof_v2;
+
 /// Trie witness generation.
 pub mod witness;
 
 /// The implementation of the Merkle Patricia Trie.
 mod trie;
-pub use trie::{StateRoot, StorageRoot};
+pub use trie::{StateRoot, StorageRoot, TrieType};
 
 /// Utilities for state root checkpoint progress.
 mod progress;
-pub use progress::{IntermediateStateRootState, StateRootProgress};
+pub use progress::{
+    IntermediateStateRootState, IntermediateStorageRootState, StateRootProgress,
+    StorageRootProgress,
+};
 
 /// Trie calculation stats.
 pub mod stats;
@@ -56,3 +62,10 @@ pub mod metrics;
 /// Collection of trie-related test utilities.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+/// Collection of mock types for testing.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
+
+/// Verification of existing stored trie nodes against state data.
+pub mod verify;

@@ -1,10 +1,12 @@
+use alloc::vec::Vec;
 use alloy_consensus::{proofs::calculate_receipt_root, BlockHeader, TxReceipt};
-use alloy_eips::eip7685::Requests;
-use alloy_primitives::{Bloom, B256};
+use alloy_eips::{eip7685::Requests, Encodable2718};
+use alloy_primitives::{Bloom, Bytes, B256};
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::ConsensusError;
-use reth_primitives::{gas_spent_by_transactions, GotExpected, RecoveredBlock};
-use reth_primitives_traits::{Block, Receipt};
+use reth_primitives_traits::{
+    receipt::gas_spent_by_transactions, Block, GotExpected, Receipt, RecoveredBlock,
+};
 
 /// Validate a block with regard to execution results:
 ///
@@ -35,13 +37,19 @@ where
     // operation as hashing that is required for state root got calculated in every
     // transaction This was replaced with is_success flag.
     // See more about EIP here: https://eips.ethereum.org/EIPS/eip-658
-    if chain_spec.is_byzantium_active_at_block(block.header().number()) {
-        if let Err(error) =
-            verify_receipts(block.header().receipts_root(), block.header().logs_bloom(), receipts)
-        {
-            tracing::debug!(%error, ?receipts, "receipts verification failed");
-            return Err(error)
-        }
+    if chain_spec.is_byzantium_active_at_block(block.header().number()) &&
+        let Err(error) = verify_receipts(
+            block.header().receipts_root(),
+            block.header().logs_bloom(),
+            receipts,
+        )
+    {
+        let receipts = receipts
+            .iter()
+            .map(|r| Bytes::from(r.with_bloom_ref().encoded_2718()))
+            .collect::<Vec<_>>();
+        tracing::debug!(%error, ?receipts, "receipts verification failed");
+        return Err(error)
     }
 
     // Validate that the header requests hash matches the calculated requests hash
@@ -60,7 +68,7 @@ where
     Ok(())
 }
 
-/// Calculate the receipts root, and compare it against against the expected receipts root and logs
+/// Calculate the receipts root, and compare it against the expected receipts root and logs
 /// bloom.
 fn verify_receipts<R: Receipt>(
     expected_receipts_root: B256,
@@ -72,7 +80,7 @@ fn verify_receipts<R: Receipt>(
     let receipts_root = calculate_receipt_root(&receipts_with_bloom);
 
     // Calculate header logs bloom.
-    let logs_bloom = receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom());
+    let logs_bloom = receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
 
     compare_receipts_root_and_logs_bloom(
         receipts_root,
@@ -109,19 +117,18 @@ fn compare_receipts_root_and_logs_bloom(
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::hex;
-    use reth_primitives::Receipt;
-
     use super::*;
+    use alloy_primitives::{b256, hex};
+    use reth_ethereum_primitives::Receipt;
 
     #[test]
     fn test_verify_receipts_success() {
         // Create a vector of 5 default Receipt instances
-        let receipts = vec![Receipt::default(); 5];
+        let receipts: Vec<Receipt> = vec![Receipt::default(); 5];
 
         // Compare against expected values
         assert!(verify_receipts(
-            B256::from(hex!("61353b4fb714dc1fccacbf7eafc4273e62f3d1eed716fe41b2a0cd2e12c63ebc")),
+            b256!("0x61353b4fb714dc1fccacbf7eafc4273e62f3d1eed716fe41b2a0cd2e12c63ebc"),
             Bloom::from(hex!("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")),
             &receipts
         )
@@ -135,7 +142,7 @@ mod tests {
         let expected_logs_bloom = Bloom::random();
 
         // Create a vector of 5 random Receipt instances
-        let receipts = vec![Receipt::default(); 5];
+        let receipts: Vec<Receipt> = vec![Receipt::default(); 5];
 
         assert!(verify_receipts(expected_receipts_root, expected_logs_bloom, &receipts).is_err());
     }

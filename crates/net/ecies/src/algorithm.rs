@@ -2,7 +2,7 @@
 
 use crate::{
     error::ECIESErrorImpl,
-    mac::{HeaderBytes, MAC},
+    mac::MAC,
     util::{hmac_sha256, sha256},
     ECIESError,
 };
@@ -15,7 +15,7 @@ use alloy_rlp::{Encodable, Rlp, RlpEncodable, RlpMaxEncodedLen};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use ctr::Ctr64BE;
 use digest::{crypto_common::KeyIvInit, Digest};
-use rand::{thread_rng, Rng};
+use rand_08::{thread_rng as rng, Rng};
 use reth_network_peers::{id2pk, pk2id};
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
@@ -312,8 +312,9 @@ impl ECIES {
 
     /// Create a new ECIES client with the given static secret key and remote peer ID.
     pub fn new_client(secret_key: SecretKey, remote_id: PeerId) -> Result<Self, ECIESError> {
-        let mut rng = thread_rng();
-        let nonce = rng.gen();
+        // TODO(rand): use rng for nonce
+        let mut rng = rng();
+        let nonce = B256::random();
         let ephemeral_secret_key = SecretKey::new(&mut rng);
         Self::new_static_client(secret_key, remote_id, nonce, ephemeral_secret_key)
     }
@@ -354,19 +355,19 @@ impl ECIES {
 
     /// Create a new ECIES server with the given static secret key.
     pub fn new_server(secret_key: SecretKey) -> Result<Self, ECIESError> {
-        let mut rng = thread_rng();
-        let nonce = rng.gen();
+        let mut rng = rng();
+        let nonce = B256::random();
         let ephemeral_secret_key = SecretKey::new(&mut rng);
         Self::new_static_server(secret_key, nonce, ephemeral_secret_key)
     }
 
     /// Return the contained remote peer ID.
-    pub fn remote_id(&self) -> PeerId {
+    pub const fn remote_id(&self) -> PeerId {
         self.remote_id.unwrap()
     }
 
     fn encrypt_message(&self, data: &[u8], out: &mut BytesMut) {
-        let mut rng = thread_rng();
+        let mut rng = rng();
 
         out.reserve(secp256k1::constants::UNCOMPRESSED_PUBLIC_KEY_SIZE + 16 + data.len() + 32);
 
@@ -382,7 +383,7 @@ impl ECIES {
         let enc_key = B128::from_slice(&key[..16]);
         let mac_key = sha256(&key[16..32]);
 
-        let iv: B128 = rng.gen();
+        let iv = B128::random();
         let mut encryptor = Ctr64BE::<Aes128>::new((&enc_key.0).into(), (&iv.0).into());
 
         let mut encrypted = data.to_vec();
@@ -442,7 +443,7 @@ impl ECIES {
         }
         .encode(&mut out);
 
-        out.resize(out.len() + thread_rng().gen_range(100..=300), 0);
+        out.resize(out.len() + rng().gen_range(100..=300), 0);
         out
     }
 
@@ -498,7 +499,7 @@ impl ECIES {
     }
 
     /// Read and verify an auth message from the input data.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn read_auth(&mut self, data: &mut [u8]) -> Result<(), ECIESError> {
         self.remote_init_msg = Some(Bytes::copy_from_slice(data));
         let unencrypted = self.decrypt_message(data)?;
@@ -531,8 +532,6 @@ impl ECIES {
 
     /// Write an `ack` message to the given buffer.
     pub fn write_ack(&mut self, out: &mut BytesMut) {
-        let unencrypted = self.create_ack_unencrypted();
-
         let mut buf = out.split_off(out.len());
 
         // reserve space for length
@@ -540,7 +539,7 @@ impl ECIES {
 
         // encrypt and append
         let mut encrypted = buf.split_off(buf.len());
-        self.encrypt_message(unencrypted.as_ref(), &mut encrypted);
+        self.encrypt_message(self.create_ack_unencrypted().as_ref(), &mut encrypted);
         let len_bytes = u16::try_from(encrypted.len()).unwrap().to_be_bytes();
         buf.unsplit(encrypted);
 
@@ -572,7 +571,7 @@ impl ECIES {
     }
 
     /// Read and verify an ack message from the input data.
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn read_ack(&mut self, data: &mut [u8]) -> Result<(), ECIESError> {
         self.remote_init_msg = Some(Bytes::copy_from_slice(data));
         let unencrypted = self.decrypt_message(data)?;
@@ -640,7 +639,6 @@ impl ECIES {
         header[..3].copy_from_slice(&buf[..3]);
         header[3..6].copy_from_slice(&[194, 128, 128]);
 
-        let mut header = HeaderBytes::from(header);
         self.egress_aes.as_mut().unwrap().apply_keystream(&mut header);
         self.egress_mac.as_mut().unwrap().update_header(&header);
         let tag = self.egress_mac.as_mut().unwrap().digest();
@@ -661,7 +659,7 @@ impl ECIES {
         }
 
         let (header_bytes, mac_bytes) = split_at_mut(data, 16)?;
-        let header = HeaderBytes::from_mut_slice(header_bytes);
+        let header: &mut [u8; 16] = header_bytes.try_into().unwrap();
         let mac = B128::from_slice(&mac_bytes[..16]);
 
         self.ingress_mac.as_mut().unwrap().update_header(header);
@@ -671,11 +669,11 @@ impl ECIES {
         }
 
         self.ingress_aes.as_mut().unwrap().apply_keystream(header);
-        if header.as_slice().len() < 3 {
+        if header.len() < 3 {
             return Err(ECIESErrorImpl::InvalidHeader.into())
         }
 
-        let body_size = usize::try_from(header.as_slice().read_uint::<BigEndian>(3)?)?;
+        let body_size = usize::try_from((&header[..]).read_uint::<BigEndian>(3)?)?;
 
         self.body_size = Some(body_size);
 
@@ -686,7 +684,7 @@ impl ECIES {
         32
     }
 
-    pub fn body_len(&self) -> usize {
+    pub const fn body_len(&self) -> usize {
         let len = self.body_size.unwrap();
         Self::align_16(len) + 16
     }
@@ -763,7 +761,7 @@ mod tests {
 
     #[test]
     fn communicate() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let server_secret_key = SecretKey::new(&mut rng);
         let server_public_key = PublicKey::from_secret_key(SECP256K1, &server_secret_key);
         let client_secret_key = SecretKey::new(&mut rng);
@@ -852,7 +850,7 @@ mod tests {
         .unwrap();
 
         let client_nonce =
-            b256!("7e968bba13b6c50e2c4cd7f241cc0d64d1ac25c7f5952df231ac6a2bda8ee5d6");
+            b256!("0x7e968bba13b6c50e2c4cd7f241cc0d64d1ac25c7f5952df231ac6a2bda8ee5d6");
 
         let server_id = pk2id(&PublicKey::from_secret_key(SECP256K1, &eip8_test_server_key()));
 
@@ -867,7 +865,7 @@ mod tests {
         .unwrap();
 
         let server_nonce =
-            b256!("559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd");
+            b256!("0x559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd");
 
         ECIES::new_static_server(eip8_test_server_key(), server_nonce, server_ephemeral_key)
             .unwrap()
@@ -970,7 +968,7 @@ mod tests {
         for len in len_range {
             let mut dest = vec![1u8; len];
             kdf(
-                b256!("7000000000000000000000000000000000000000000000000000000000000007"),
+                b256!("0x7000000000000000000000000000000000000000000000000000000000000007"),
                 &[0x01, 0x33, 0x70, 0xbe, 0xef],
                 &mut dest,
             );

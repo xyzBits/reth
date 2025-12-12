@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use http::HeaderMap;
 use jsonrpsee_http_client::HttpResponse;
@@ -31,5 +31,6 @@ pub use jwt_validator::JwtAuthValidator;
 pub trait AuthValidator {
     /// This function is invoked by the [`AuthLayer`] to perform validation on Http headers.
     /// The result conveys validation errors in the form of an Http response.
+    #[expect(clippy::result_large_err)]
     fn validate(&self, headers: &HeaderMap) -> Result<(), HttpResponse>;
 }

@@ -7,10 +7,12 @@ use alloy_primitives::{Bytes, StorageKey, B256, U256};
 use alloy_rpc_types_eth::erc4337::{AccountStorage, TransactionConditional};
 use jsonrpsee_core::RpcResult;
 use reth_optimism_txpool::conditional::MaybeConditionalTransaction;
-use reth_provider::{BlockReaderIdExt, StateProviderFactory};
 use reth_rpc_eth_api::L2EthApiExtServer;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
-use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
+use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
+use reth_transaction_pool::{
+    AddedTransactionOutcome, PoolTransaction, TransactionOrigin, TransactionPool,
+};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -23,7 +25,6 @@ const MAX_CONCURRENT_CONDITIONAL_VALIDATIONS: usize = 3;
 ///
 /// Separate from [`super::OpEthApi`] to allow to enable it conditionally,
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct OpEthExtApi<Pool, Provider> {
     /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
     /// network.
@@ -42,7 +43,7 @@ where
     }
 
     /// Returns the configured sequencer client, if any.
-    fn sequencer_client(&self) -> Option<&SequencerClient> {
+    const fn sequencer_client(&self) -> Option<&SequencerClient> {
         self.sequencer_client.as_ref()
     }
 
@@ -158,7 +159,7 @@ where
         } else {
             // otherwise, add to pool with the appended conditional
             tx.set_conditional(condition);
-            let hash =
+            let AddedTransactionOutcome { hash, .. } =
                 self.pool().add_transaction(TransactionOrigin::Private, tx).await.map_err(|e| {
                     OpEthApiError::Eth(reth_rpc_eth_types::EthApiError::PoolError(e.into()))
                 })?;
@@ -188,12 +189,12 @@ impl<Pool, Provider> OpEthExtApiInner<Pool, Provider> {
     }
 
     #[inline]
-    fn pool(&self) -> &Pool {
+    const fn pool(&self) -> &Pool {
         &self.pool
     }
 
     #[inline]
-    fn provider(&self) -> &Provider {
+    const fn provider(&self) -> &Provider {
         &self.provider
     }
 }

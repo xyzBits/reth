@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use reth_discv4::{Discv4, NatResolver};
 use reth_discv5::Discv5;
 use reth_eth_wire::{
-    DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, NewBlock,
+    BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives,
     NewPooledTransactionHashes, SharedTransactions,
 };
 use reth_ethereum_forks::Head;
@@ -51,7 +51,7 @@ pub struct NetworkHandle<N: NetworkPrimitives = EthNetworkPrimitives> {
 
 impl<N: NetworkPrimitives> NetworkHandle<N> {
     /// Creates a single new instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         num_active_peers: Arc<AtomicUsize>,
         listener_address: Arc<Mutex<SocketAddr>>,
@@ -116,7 +116,7 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
     /// Caution: in `PoS` this is a noop because new blocks are no longer announced over devp2p.
     /// Instead they are sent to the node by CL and can be requested over devp2p.
     /// Broadcasting new blocks is considered a protocol violation.
-    pub fn announce_block(&self, block: NewBlock<N::Block>, hash: B256) {
+    pub fn announce_block(&self, block: N::NewBlockPayload, hash: B256) {
         self.send_message(NetworkHandleMessage::AnnounceBlock(block, hash))
     }
 
@@ -232,9 +232,25 @@ impl<N: NetworkPrimitives> PeersInfo for NetworkHandle<N> {
 
     fn local_node_record(&self) -> NodeRecord {
         if let Some(discv4) = &self.inner.discv4 {
+            // Note: the discv4 services uses the same `nat` so we can directly return the node
+            // record here
             discv4.node_record()
-        } else if let Some(record) = self.inner.discv5.as_ref().and_then(|d| d.node_record()) {
-            record
+        } else if let Some(discv5) = self.inner.discv5.as_ref() {
+            // for disv5 we must check if we have an external ip configured
+            if let Some(external) = self.inner.nat.and_then(|nat| nat.as_external_ip()) {
+                NodeRecord::new((external, discv5.local_port()).into(), *self.peer_id())
+            } else {
+                // use the node record that discv5 tracks or use localhost
+                self.inner.discv5.as_ref().and_then(|d| d.node_record()).unwrap_or_else(|| {
+                    NodeRecord::new(
+                        (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), discv5.local_port())
+                            .into(),
+                        *self.peer_id(),
+                    )
+                })
+            }
+            // also use the tcp port
+            .with_tcp_port(self.inner.listener_address.lock().port())
         } else {
             let external_ip = self.inner.nat.and_then(|nat| nat.as_external_ip());
 
@@ -332,6 +348,9 @@ impl<N: NetworkPrimitives> Peers for NetworkHandle<N> {
 
     /// Sends a message to the [`NetworkManager`](crate::NetworkManager) to connect to the given
     /// peer.
+    ///
+    /// This will add a new entry for the given peer if it isn't tracked yet.
+    /// If it is tracked then the peer is updated with the given information.
     fn connect_peer_kind(
         &self,
         peer_id: PeerId,
@@ -415,6 +434,11 @@ impl<N: NetworkPrimitives> NetworkSyncUpdater for NetworkHandle<N> {
     fn update_status(&self, head: Head) {
         self.send_message(NetworkHandleMessage::StatusUpdate { head });
     }
+
+    /// Updates the advertised block range.
+    fn update_block_range(&self, update: reth_eth_wire::BlockRangeUpdate) {
+        self.send_message(NetworkHandleMessage::InternalBlockRangeUpdate(update));
+    }
 }
 
 impl<N: NetworkPrimitives> BlockDownloaderProvider for NetworkHandle<N> {
@@ -439,7 +463,7 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     secret_key: SecretKey,
     /// The identifier used by this node.
     local_peer_id: PeerId,
-    /// Access to the all the nodes.
+    /// Access to all the nodes.
     peers: PeersHandle,
     /// The mode of the network
     network_mode: NetworkMode,
@@ -479,7 +503,7 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     /// Disconnects a connection to a peer if it exists, optionally providing a disconnect reason.
     DisconnectPeer(PeerId, Option<DisconnectReason>),
     /// Broadcasts an event to announce a new block to all nodes.
-    AnnounceBlock(NewBlock<N::Block>, B256),
+    AnnounceBlock(N::NewBlockPayload, B256),
     /// Sends a list of transactions to the given peer.
     SendTransaction {
         /// The ID of the peer to which the transactions are sent.
@@ -541,4 +565,6 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     AddRlpxSubProtocol(RlpxSubProtocol),
     /// Connect to the given peer.
     ConnectPeer(PeerId, PeerKind, PeerAddr),
+    /// Message to update the node's advertised block range information.
+    InternalBlockRangeUpdate(BlockRangeUpdate),
 }

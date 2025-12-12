@@ -7,10 +7,11 @@ use crate::{
 };
 use alloy_primitives::B256;
 use futures::{Stream, StreamExt};
-use reth_chain_state::ExecutedBlockWithTrieUpdates;
-use reth_engine_primitives::{BeaconConsensusEngineEvent, BeaconEngineMessage, EngineTypes};
+use reth_chain_state::ExecutedBlock;
+use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineEvent};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock};
+use reth_payload_primitives::PayloadTypes;
+use reth_primitives_traits::{Block, NodePrimitives, SealedBlock};
 use std::{
     collections::HashSet,
     fmt::Display,
@@ -59,7 +60,7 @@ impl<T, S, D> EngineHandler<T, S, D> {
     }
 
     /// Returns a mutable reference to the request handler.
-    pub fn handler_mut(&mut self) -> &mut T {
+    pub const fn handler_mut(&mut self) -> &mut T {
         &mut self.handler
     }
 }
@@ -86,7 +87,7 @@ where
                     RequestHandlerEvent::HandlerEvent(ev) => {
                         return match ev {
                             HandlerEvent::BackfillAction(target) => {
-                                // bubble up backfill sync request request
+                                // bubble up backfill sync request
                                 self.downloader.on_action(DownloadAction::Clear);
                                 Poll::Ready(HandlerEvent::BackfillAction(target))
                             }
@@ -190,7 +191,7 @@ impl<Request, N: NodePrimitives> EngineRequestHandler for EngineApiRequestHandle
 where
     Request: Send,
 {
-    type Event = BeaconConsensusEngineEvent<N>;
+    type Event = ConsensusEngineEvent<N>;
     type Request = Request;
     type Block = N::Block;
 
@@ -241,14 +242,14 @@ impl EngineApiKind {
 
 /// The request variants that the engine API handler can receive.
 #[derive(Debug)]
-pub enum EngineApiRequest<T: EngineTypes, N: NodePrimitives> {
+pub enum EngineApiRequest<T: PayloadTypes, N: NodePrimitives> {
     /// A request received from the consensus engine.
     Beacon(BeaconEngineMessage<T>),
     /// Request to insert an already executed block, e.g. via payload building.
-    InsertExecutedBlock(ExecutedBlockWithTrieUpdates<N>),
+    InsertExecutedBlock(ExecutedBlock<N>),
 }
 
-impl<T: EngineTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
+impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Beacon(msg) => msg.fmt(f),
@@ -259,13 +260,13 @@ impl<T: EngineTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
     }
 }
 
-impl<T: EngineTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {
+impl<T: PayloadTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {
     fn from(msg: BeaconEngineMessage<T>) -> Self {
         Self::Beacon(msg)
     }
 }
 
-impl<T: EngineTypes, N: NodePrimitives> From<EngineApiRequest<T, N>>
+impl<T: PayloadTypes, N: NodePrimitives> From<EngineApiRequest<T, N>>
     for FromEngine<EngineApiRequest<T, N>, N::Block>
 {
     fn from(req: EngineApiRequest<T, N>) -> Self {
@@ -278,7 +279,7 @@ impl<T: EngineTypes, N: NodePrimitives> From<EngineApiRequest<T, N>>
 pub enum EngineApiEvent<N: NodePrimitives = EthPrimitives> {
     /// Event from the consensus engine.
     // TODO(mattsse): find a more appropriate name for this variant, consider phasing it out.
-    BeaconConsensus(BeaconConsensusEngineEvent<N>),
+    BeaconConsensus(ConsensusEngineEvent<N>),
     /// Backfill action is needed.
     BackfillAction(BackfillAction),
     /// Block download is needed.
@@ -292,8 +293,8 @@ impl<N: NodePrimitives> EngineApiEvent<N> {
     }
 }
 
-impl<N: NodePrimitives> From<BeaconConsensusEngineEvent<N>> for EngineApiEvent<N> {
-    fn from(event: BeaconConsensusEngineEvent<N>) -> Self {
+impl<N: NodePrimitives> From<ConsensusEngineEvent<N>> for EngineApiEvent<N> {
+    fn from(event: ConsensusEngineEvent<N>) -> Self {
         Self::BeaconConsensus(event)
     }
 }
@@ -306,7 +307,7 @@ pub enum FromEngine<Req, B: Block> {
     /// Request from the engine.
     Request(Req),
     /// Downloaded blocks from the network.
-    DownloadedBlocks(Vec<RecoveredBlock<B>>),
+    DownloadedBlocks(Vec<SealedBlock<B>>),
 }
 
 impl<Req: Display, B: Block> Display for FromEngine<Req, B> {

@@ -1,13 +1,13 @@
 //! `Eth` bundle implementation and helpers.
 
-use alloy_consensus::{EnvKzgSettings, Transaction as _};
-use alloy_eips::eip4844::MAX_DATA_GAS_PER_BLOCK;
-use alloy_primitives::{Keccak256, U256};
+use alloy_consensus::{transaction::TxHashRef, EnvKzgSettings, Transaction as _};
+use alloy_eips::eip7840::BlobParams;
+use alloy_evm::env::BlockEnvironment;
+use alloy_primitives::{uint, Keccak256, U256};
 use alloy_rpc_types_mev::{EthCallBundle, EthCallBundleResponse, EthCallBundleTransactionResult};
 use jsonrpsee::core::RpcResult;
-use reth_evm::{ConfigureEvm, ConfigureEvmEnv, Evm};
-use reth_primitives_traits::SignedTransaction;
-use reth_revm::{database::StateProviderDatabase, db::CacheDB};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
+use reth_evm::{ConfigureEvm, Evm};
 use reth_rpc_eth_api::{
     helpers::{Call, EthTransactions, LoadPendingBlock},
     EthCallBundleApiServer, FromEthApiError, FromEvmError,
@@ -17,7 +17,9 @@ use reth_tasks::pool::BlockingTaskGuard;
 use reth_transaction_pool::{
     EthBlobTransactionSidecar, EthPoolTransaction, PoolPooledTx, PoolTransaction, TransactionPool,
 };
-use revm::{context_interface::result::ResultAndState, DatabaseCommit, DatabaseRef};
+use revm::{
+    context::Block, context_interface::result::ResultAndState, DatabaseCommit, DatabaseRef,
+};
 use std::sync::Arc;
 
 /// `Eth` bundle implementation.
@@ -82,62 +84,67 @@ where
             .into_iter()
             .collect::<Vec<_>>();
 
-        // Validate that the bundle does not contain more than MAX_BLOB_NUMBER_PER_BLOCK blob
-        // transactions.
-        if transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum::<u64>() >
-            MAX_DATA_GAS_PER_BLOCK
-        {
-            return Err(EthApiError::InvalidParams(
-                EthBundleError::Eip4844BlobGasExceeded.to_string(),
-            )
-            .into())
-        }
-
         let block_id: alloy_rpc_types_eth::BlockId = state_block_number.into();
         // Note: the block number is considered the `parent` block: <https://github.com/flashbots/mev-geth/blob/fddf97beec5877483f879a77b7dea2e58a58d653/internal/ethapi/api.go#L2104>
         let (mut evm_env, at) = self.eth_api().evm_env_at(block_id).await?;
 
         if let Some(coinbase) = coinbase {
-            evm_env.block_env.beneficiary = coinbase;
+            evm_env.block_env.inner_mut().beneficiary = coinbase;
         }
 
         // need to adjust the timestamp for the next block
         if let Some(timestamp) = timestamp {
-            evm_env.block_env.timestamp = timestamp;
+            evm_env.block_env.inner_mut().timestamp = U256::from(timestamp);
         } else {
-            evm_env.block_env.timestamp += 12;
+            evm_env.block_env.inner_mut().timestamp += uint!(12_U256);
         }
 
         if let Some(difficulty) = difficulty {
-            evm_env.block_env.difficulty = U256::from(difficulty);
+            evm_env.block_env.inner_mut().difficulty = U256::from(difficulty);
+        }
+
+        // Validate that the bundle does not contain more than MAX_BLOB_NUMBER_PER_BLOCK blob
+        // transactions.
+        let blob_gas_used = transactions.iter().filter_map(|tx| tx.blob_gas_used()).sum::<u64>();
+        if blob_gas_used > 0 {
+            let blob_params = self
+                .eth_api()
+                .provider()
+                .chain_spec()
+                .blob_params_at_timestamp(evm_env.block_env.timestamp().saturating_to())
+                .unwrap_or_else(BlobParams::cancun);
+            if blob_gas_used > blob_params.max_blob_gas_per_block() {
+                return Err(EthApiError::InvalidParams(
+                    EthBundleError::Eip4844BlobGasExceeded(blob_params.max_blob_gas_per_block())
+                        .to_string(),
+                )
+                .into())
+            }
         }
 
         // default to call gas limit unless user requests a smaller limit
-        evm_env.block_env.gas_limit = self.inner.eth_api.call_gas_limit();
+        evm_env.block_env.inner_mut().gas_limit = self.inner.eth_api.call_gas_limit();
         if let Some(gas_limit) = gas_limit {
-            if gas_limit > evm_env.block_env.gas_limit {
+            if gas_limit > evm_env.block_env.gas_limit() {
                 return Err(
                     EthApiError::InvalidTransaction(RpcInvalidTransactionError::GasTooHigh).into()
                 )
             }
-            evm_env.block_env.gas_limit = gas_limit;
+            evm_env.block_env.inner_mut().gas_limit = gas_limit;
         }
 
         if let Some(base_fee) = base_fee {
-            evm_env.block_env.basefee = base_fee.try_into().unwrap_or(u64::MAX);
+            evm_env.block_env.inner_mut().basefee = base_fee.try_into().unwrap_or(u64::MAX);
         }
 
-        let state_block_number = evm_env.block_env.number;
+        let state_block_number = evm_env.block_env.number();
         // use the block number of the request
-        evm_env.block_env.number = block_number;
-
-        let eth_api = self.eth_api().clone();
+        evm_env.block_env.inner_mut().number = U256::from(block_number);
 
         self.eth_api()
-            .spawn_with_state_at_block(at, move |state| {
-                let coinbase = evm_env.block_env.beneficiary;
-                let basefee = evm_env.block_env.basefee;
-                let db = CacheDB::new(StateProviderDatabase::new(state));
+            .spawn_with_state_at_block(at, move |eth_api, db| {
+                let coinbase = evm_env.block_env.beneficiary();
+                let basefee = evm_env.block_env.basefee();
 
                 let initial_coinbase = db
                     .basic_ref(coinbase)
@@ -242,7 +249,7 @@ where
                     eth_sent_to_coinbase,
                     gas_fees: total_gas_fees,
                     results,
-                    state_block_number,
+                    state_block_number: state_block_number.to(),
                     total_gas_used,
                 };
 
@@ -262,13 +269,13 @@ where
     }
 }
 
-/// Container type for  `EthBundle` internals
+/// Container type for `EthBundle` internals
 #[derive(Debug)]
 struct EthBundleInner<Eth> {
     /// Access to commonly used code of the `eth` namespace
     eth_api: Eth,
     // restrict the number of concurrent tracing calls.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     blocking_task_guard: BlockingTaskGuard,
 }
 
@@ -294,6 +301,6 @@ pub enum EthBundleError {
     #[error("bundle missing blockNumber")]
     BundleMissingBlockNumber,
     /// Thrown when the blob gas usage of the blob transactions in a bundle exceed the maximum.
-    #[error("blob gas usage exceeds the limit of {MAX_DATA_GAS_PER_BLOCK} gas per block.")]
-    Eip4844BlobGasExceeded,
+    #[error("blob gas usage exceeds the limit of {0} gas per block.")]
+    Eip4844BlobGasExceeded(u64),
 }

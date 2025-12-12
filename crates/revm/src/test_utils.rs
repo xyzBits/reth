@@ -1,13 +1,11 @@
 use alloc::vec::Vec;
 use alloy_primitives::{
-    keccak256,
-    map::{B256Map, HashMap},
-    Address, BlockNumber, Bytes, StorageKey, B256, U256,
+    keccak256, map::HashMap, Address, BlockNumber, Bytes, StorageKey, B256, U256,
 };
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
-    AccountReader, BlockHashReader, HashedPostStateProvider, StateProofProvider, StateProvider,
-    StateRootProvider, StorageRootProvider,
+    AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
+    StateProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
@@ -141,17 +139,13 @@ impl StateProofProvider for StateProviderTest {
         unimplemented!("proof generation is not supported")
     }
 
-    fn witness(
-        &self,
-        _input: TrieInput,
-        _target: HashedPostState,
-    ) -> ProviderResult<B256Map<Bytes>> {
+    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
         unimplemented!("witness generation is not supported")
     }
 }
 
 impl HashedPostStateProvider for StateProviderTest {
-    fn hashed_post_state(&self, bundle_state: &revm_database::BundleState) -> HashedPostState {
+    fn hashed_post_state(&self, bundle_state: &revm::database::BundleState) -> HashedPostState {
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
     }
 }
@@ -164,7 +158,9 @@ impl StateProvider for StateProviderTest {
     ) -> ProviderResult<Option<alloy_primitives::StorageValue>> {
         Ok(self.accounts.get(&account).and_then(|(storage, _)| storage.get(&storage_key).copied()))
     }
+}
 
+impl BytecodeReader for StateProviderTest {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         Ok(self.contracts.get(code_hash).cloned())
     }

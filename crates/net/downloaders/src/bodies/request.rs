@@ -9,11 +9,9 @@ use reth_network_p2p::{
     priority::Priority,
 };
 use reth_network_peers::{PeerId, WithPeerId};
-use reth_primitives::{BlockBody, GotExpected, SealedBlock, SealedHeader};
-use reth_primitives_traits::{Block, InMemorySize};
+use reth_primitives_traits::{Block, GotExpected, InMemorySize, SealedBlock, SealedHeader};
 use std::{
     collections::VecDeque,
-    mem,
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
@@ -167,11 +165,10 @@ where
     where
         C::Body: InMemorySize,
     {
-        let bodies_capacity = bodies.capacity();
         let bodies_len = bodies.len();
         let mut bodies = bodies.into_iter().peekable();
 
-        let mut total_size = bodies_capacity * mem::size_of::<BlockBody>();
+        let mut total_size = 0;
         while bodies.peek().is_some() {
             let next_header = match self.pending_headers.pop_front() {
                 Some(header) => header,
@@ -179,8 +176,6 @@ where
             };
 
             if next_header.is_empty() {
-                // increment empty block body metric
-                total_size += mem::size_of::<C::Body>();
                 self.buffer.push(BlockResponse::Empty(next_header));
             } else {
                 let next_body = bodies.next().unwrap();
@@ -266,6 +261,7 @@ mod tests {
         test_utils::{generate_bodies, TestBodiesClient},
     };
     use reth_consensus::test_utils::TestConsensus;
+    use reth_ethereum_primitives::Block;
     use reth_testing_utils::{generators, generators::random_header_range};
 
     /// Check if future returns empty bodies without dispatching any requests.
@@ -275,7 +271,7 @@ mod tests {
         let headers = random_header_range(&mut rng, 0..20, B256::ZERO);
 
         let client = Arc::new(TestBodiesClient::default());
-        let fut = BodiesRequestFuture::<reth_primitives::Block, _>::new(
+        let fut = BodiesRequestFuture::<Block, _>::new(
             client.clone(),
             Arc::new(TestConsensus::default()),
             BodyDownloaderMetrics::default(),
@@ -299,7 +295,7 @@ mod tests {
         let client = Arc::new(
             TestBodiesClient::default().with_bodies(bodies.clone()).with_max_batch_size(batch_size),
         );
-        let fut = BodiesRequestFuture::<reth_primitives::Block, _>::new(
+        let fut = BodiesRequestFuture::<Block, _>::new(
             client.clone(),
             Arc::new(TestConsensus::default()),
             BodyDownloaderMetrics::default(),

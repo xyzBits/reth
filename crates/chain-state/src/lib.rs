@@ -6,10 +6,13 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod in_memory;
 pub use in_memory::*;
+
+mod deferred_trie;
+pub use deferred_trie::*;
 
 mod noop;
 
@@ -31,4 +34,4 @@ pub use memory_overlay::{MemoryOverlayStateProvider, MemoryOverlayStateProviderR
 pub mod test_utils;
 
 // todo: remove when generic data prim integration complete
-pub use reth_primitives::EthPrimitives;
+pub use reth_ethereum_primitives::EthPrimitives;

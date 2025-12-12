@@ -3,9 +3,10 @@ use alloy_primitives::{B256, U256};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use proptest_arbitrary_interop::arb;
-use reth_primitives::Account;
+use reth_primitives_traits::Account;
 use reth_provider::{
-    providers::ConsistentDbView, test_utils::create_test_provider_factory, StateWriter, TrieWriter,
+    providers::OverlayStateProviderFactory, test_utils::create_test_provider_factory, StateWriter,
+    TrieWriter,
 };
 use reth_trie::{
     hashed_cursor::HashedPostStateCursorFactory, HashedPostState, HashedStorage, StateRoot,
@@ -21,7 +22,7 @@ pub fn calculate_state_root(c: &mut Criterion) {
 
     for size in [1_000, 3_000, 5_000, 10_000] {
         // Too slow.
-        #[allow(unexpected_cfgs)]
+        #[expect(unexpected_cfgs)]
         if cfg!(codspeed) && size > 3_000 {
             continue;
         }
@@ -33,11 +34,11 @@ pub fn calculate_state_root(c: &mut Criterion) {
             provider_rw.write_hashed_state(&db_state.into_sorted()).unwrap();
             let (_, updates) =
                 StateRoot::from_tx(provider_rw.tx_ref()).root_with_updates().unwrap();
-            provider_rw.write_trie_updates(&updates).unwrap();
+            provider_rw.write_trie_updates(updates).unwrap();
             provider_rw.commit().unwrap();
         }
 
-        let view = ConsistentDbView::new(provider_factory.clone(), None);
+        let factory = OverlayStateProviderFactory::new(provider_factory.clone());
 
         // state root
         group.bench_function(BenchmarkId::new("sync root", size), |b| {
@@ -65,10 +66,8 @@ pub fn calculate_state_root(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("parallel root", size), |b| {
             b.iter_with_setup(
                 || {
-                    ParallelStateRoot::new(
-                        view.clone(),
-                        TrieInput::from_state(updated_state.clone()),
-                    )
+                    let trie_input = TrieInput::from_state(updated_state.clone());
+                    ParallelStateRoot::new(factory.clone(), trie_input.prefix_sets.freeze())
                 },
                 |calculator| calculator.incremental_root(),
             );

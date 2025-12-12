@@ -7,10 +7,11 @@ use futures::StreamExt;
 use itertools::Itertools;
 use metrics::Gauge;
 use reth_chain_state::ForkChoiceStream;
-use reth_evm::execute::BlockExecutorProvider;
+use reth_ethereum_primitives::EthPrimitives;
+use reth_evm::ConfigureEvm;
 use reth_metrics::{metrics::Counter, Metrics};
 use reth_node_api::NodePrimitives;
-use reth_primitives::{EthPrimitives, SealedHeader};
+use reth_primitives_traits::SealedHeader;
 use reth_provider::HeaderProvider;
 use reth_tracing::tracing::{debug, warn};
 use std::{
@@ -93,17 +94,17 @@ impl<N: NodePrimitives> ExExHandle<N> {
     ///
     /// Returns the handle, as well as a [`UnboundedSender`] for [`ExExEvent`]s and a
     /// [`mpsc::Receiver`] for [`ExExNotification`]s that should be given to the `ExEx`.
-    pub fn new<P, E: BlockExecutorProvider<Primitives = N>>(
+    pub fn new<P, E: ConfigureEvm<Primitives = N>>(
         id: String,
         node_head: BlockNumHash,
         provider: P,
-        executor: E,
+        evm_config: E,
         wal_handle: WalHandle<N>,
     ) -> (Self, UnboundedSender<ExExEvent>, ExExNotifications<P, E>) {
         let (notification_tx, notification_rx) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let notifications =
-            ExExNotifications::new(node_head, provider, executor, notification_rx, wal_handle);
+            ExExNotifications::new(node_head, provider, evm_config, notification_rx, wal_handle);
 
         (
             Self {
@@ -369,7 +370,7 @@ where
             .map(|(exex_id, num_hash)| {
                 num_hash.map_or(Ok((exex_id, num_hash, false)), |num_hash| {
                     self.provider
-                        .is_known(&num_hash.hash)
+                        .is_known(num_hash.hash)
                         // Save the ExEx ID, finished height, and whether the hash is canonical
                         .map(|is_canonical| (exex_id, Some(num_hash), is_canonical))
                 })
@@ -500,11 +501,11 @@ where
                 .next_notification_id
                 .checked_sub(this.min_id)
                 .expect("exex expected notification ID outside the manager's range");
-            if let Some(notification) = this.buffer.get(notification_index) {
-                if let Poll::Ready(Err(err)) = exex.send(cx, notification) {
-                    // The channel was closed, which is irrecoverable for the manager
-                    return Poll::Ready(Err(err.into()))
-                }
+            if let Some(notification) = this.buffer.get(notification_index) &&
+                let Poll::Ready(Err(err)) = exex.send(cx, notification)
+            {
+                // The channel was closed, which is irrecoverable for the manager
+                return Poll::Ready(Err(err.into()))
             }
             min_id = min_id.min(exex.next_notification_id);
             this.exex_handles.push(exex);
@@ -662,12 +663,11 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use rand::Rng;
     use reth_db_common::init::init_genesis;
-    use reth_evm::test_utils::MockExecutorProvider;
-    use reth_evm_ethereum::execute::EthExecutorProvider;
-    use reth_primitives::RecoveredBlock;
+    use reth_evm_ethereum::EthEvmConfig;
+    use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{
         providers::BlockchainProvider, test_utils::create_test_provider_factory, BlockReader,
-        BlockWriter, Chain, DatabaseProviderFactory, StorageLocation, TransactionVariant,
+        BlockWriter, Chain, DBProvider, DatabaseProviderFactory, TransactionVariant,
     };
     use reth_testing_utils::generators::{self, random_block, BlockParams};
 
@@ -687,7 +687,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -707,7 +707,7 @@ mod tests {
             "test_exex_1".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -729,7 +729,7 @@ mod tests {
             "test_exex_1".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -757,7 +757,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -766,7 +766,7 @@ mod tests {
             ExExManager::new((), vec![exex_handle], 10, wal, empty_finalized_header_stream());
 
         // Define the notification for testing
-        let mut block1: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block1: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block1.set_hash(B256::new([0x01; 32]));
         block1.set_block_number(10);
 
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(exex_manager.next_id, 1);
 
         // Push another notification
-        let mut block2: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block2: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block2.set_hash(B256::new([0x02; 32]));
         block2.set_block_number(20);
 
@@ -812,7 +812,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -827,7 +827,7 @@ mod tests {
         );
 
         // Push some notifications to fill part of the buffer
-        let mut block1: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block1: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block1.set_hash(B256::new([0x01; 32]));
         block1.set_block_number(10);
 
@@ -863,7 +863,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -918,14 +918,14 @@ mod tests {
             "test_exex1".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
         let (exex_handle2, event_tx2, _) = ExExHandle::new(
             "test_exex2".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -975,14 +975,14 @@ mod tests {
             "test_exex1".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
         let (exex_handle2, event_tx2, _) = ExExHandle::new(
             "test_exex2".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -1038,13 +1038,13 @@ mod tests {
             "test_exex_1".to_string(),
             Default::default(),
             (),
-            MockExecutorProvider::default(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
         // Create an ExExManager with a small max capacity
         let max_capacity = 2;
-        let mut exex_manager = ExExManager::new(
+        let exex_manager = ExExManager::new(
             provider_factory,
             vec![exex_handle_1],
             max_capacity,
@@ -1107,7 +1107,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             provider,
-            EthExecutorProvider::mainnet(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -1116,11 +1116,11 @@ mod tests {
         assert_eq!(exex_handle.next_notification_id, 0);
 
         // Setup two blocks for the chain commit notification
-        let mut block1: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block1: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block1.set_hash(B256::new([0x01; 32]));
         block1.set_block_number(10);
 
-        let mut block2: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block2: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block2.set_hash(B256::new([0x02; 32]));
         block2.set_block_number(11);
 
@@ -1142,7 +1142,7 @@ mod tests {
                 assert_eq!(received_notification, notification);
             }
             Poll::Pending => panic!("Notification send is pending"),
-            Poll::Ready(Err(e)) => panic!("Failed to send notification: {:?}", e),
+            Poll::Ready(Err(e)) => panic!("Failed to send notification: {e:?}"),
         }
 
         // Ensure the notification ID was incremented
@@ -1162,14 +1162,14 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             provider,
-            EthExecutorProvider::mainnet(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
         // Set finished_height to a value higher than the block tip
         exex_handle.finished_height = Some(BlockNumHash::new(15, B256::random()));
 
-        let mut block1: RecoveredBlock<reth_primitives::Block> = Default::default();
+        let mut block1: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
         block1.set_hash(B256::new([0x01; 32]));
         block1.set_block_number(10);
 
@@ -1212,7 +1212,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             provider,
-            EthExecutorProvider::mainnet(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -1255,7 +1255,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             provider,
-            EthExecutorProvider::mainnet(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -1303,7 +1303,7 @@ mod tests {
         .try_recover()
         .unwrap();
         let provider_rw = provider_factory.database_provider_rw().unwrap();
-        provider_rw.insert_block(block.clone(), StorageLocation::Database).unwrap();
+        provider_rw.insert_block(block.clone()).unwrap();
         provider_rw.commit().unwrap();
 
         let provider = BlockchainProvider::new(provider_factory).unwrap();
@@ -1315,7 +1315,7 @@ mod tests {
             "test_exex".to_string(),
             Default::default(),
             provider.clone(),
-            EthExecutorProvider::mainnet(),
+            EthEvmConfig::mainnet(),
             wal.handle(),
         );
 
@@ -1358,7 +1358,7 @@ mod tests {
         // WAL shouldn't contain the genesis notification, because it's finalized
         assert_eq!(
             exex_manager.wal.iter_notifications()?.collect::<WalResult<Vec<_>>>()?,
-            [notification.clone()]
+            std::slice::from_ref(&notification)
         );
 
         finalized_headers_tx.send(Some(block.clone_sealed_header()))?;
@@ -1366,12 +1366,12 @@ mod tests {
         // WAL isn't finalized because the ExEx didn't emit the `FinishedHeight` event
         assert_eq!(
             exex_manager.wal.iter_notifications()?.collect::<WalResult<Vec<_>>>()?,
-            [notification.clone()]
+            std::slice::from_ref(&notification)
         );
 
         // Send a `FinishedHeight` event with a non-canonical block
         events_tx
-            .send(ExExEvent::FinishedHeight((rng.gen::<u64>(), rng.gen::<B256>()).into()))
+            .send(ExExEvent::FinishedHeight((rng.random::<u64>(), rng.random::<B256>()).into()))
             .unwrap();
 
         finalized_headers_tx.send(Some(block.clone_sealed_header()))?;
@@ -1380,7 +1380,7 @@ mod tests {
         // non-canonical block
         assert_eq!(
             exex_manager.wal.iter_notifications()?.collect::<WalResult<Vec<_>>>()?,
-            [notification]
+            std::slice::from_ref(&notification)
         );
 
         // Send a `FinishedHeight` event with a canonical block

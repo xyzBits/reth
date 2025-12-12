@@ -8,7 +8,7 @@ use reth_db_api::{
     RawKey, RawTable, RawValue,
 };
 use reth_etl::Collector;
-use reth_primitives::Account;
+use reth_primitives_traits::Account;
 use reth_provider::{AccountExtReader, DBProvider, HashingWriter, StatsReader};
 use reth_stages_api::{
     AccountHashingCheckpoint, EntitiesCheckpoint, ExecInput, ExecOutput, Stage, StageCheckpoint,
@@ -62,16 +62,16 @@ impl AccountHashingStage {
     pub fn seed<Tx: DbTx + DbTxMut + 'static, N: reth_provider::providers::ProviderNodeTypes>(
         provider: &reth_provider::DatabaseProvider<Tx, N>,
         opts: SeedOpts,
-    ) -> Result<Vec<(alloy_primitives::Address, reth_primitives::Account)>, StageError>
+    ) -> Result<Vec<(alloy_primitives::Address, Account)>, StageError>
     where
-        N::Primitives: reth_primitives_traits::FullNodePrimitives<
-            Block = reth_primitives::Block,
-            BlockHeader = reth_primitives::Header,
+        N::Primitives: reth_primitives_traits::NodePrimitives<
+            Block = reth_ethereum_primitives::Block,
+            BlockHeader = reth_primitives_traits::Header,
         >,
     {
         use alloy_primitives::U256;
         use reth_db_api::models::AccountBeforeTx;
-        use reth_provider::{StaticFileProviderFactory, StaticFileWriter};
+        use reth_provider::{BlockWriter, StaticFileProviderFactory, StaticFileWriter};
         use reth_testing_utils::{
             generators,
             generators::{random_block_range, random_eoa_accounts, BlockRangeParams},
@@ -86,11 +86,11 @@ impl AccountHashingStage {
         );
 
         for block in blocks {
-            provider.insert_historical_block(block.try_recover().unwrap()).unwrap();
+            provider.insert_block(block.try_recover().unwrap()).unwrap();
         }
         provider
             .static_file_provider()
-            .latest_writer(reth_primitives::StaticFileSegment::Headers)
+            .latest_writer(reth_static_file_types::StaticFileSegment::Headers)
             .unwrap()
             .commit()
             .unwrap();
@@ -180,7 +180,7 @@ where
                 });
 
                 // Flush to ETL when channels length reaches MAXIMUM_CHANNELS
-                if !channels.is_empty() && channels.len() % MAXIMUM_CHANNELS == 0 {
+                if !channels.is_empty() && channels.len().is_multiple_of(MAXIMUM_CHANNELS) {
                     collect(&mut channels, &mut collector)?;
                 }
             }
@@ -193,7 +193,7 @@ where
             let total_hashes = collector.len();
             let interval = (total_hashes / 10).max(1);
             for (index, item) in collector.iter()?.enumerate() {
-                if index > 0 && index % interval == 0 {
+                if index > 0 && index.is_multiple_of(interval) {
                     info!(
                         target: "sync::stages::hashing_account",
                         progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
@@ -304,7 +304,7 @@ mod tests {
     };
     use alloy_primitives::U256;
     use assert_matches::assert_matches;
-    use reth_primitives::Account;
+    use reth_primitives_traits::Account;
     use reth_provider::providers::StaticFileWriter;
     use reth_stages_api::StageUnitCheckpoint;
     use test_utils::*;
@@ -344,7 +344,7 @@ mod tests {
                 done: true,
             }) if block_number == previous_stage &&
                 processed == total &&
-                total == runner.db.table::<tables::PlainAccountState>().unwrap().len() as u64
+                total == runner.db.count_entries::<tables::PlainAccountState>().unwrap() as u64
         );
 
         // Validate the stage execution
@@ -369,7 +369,7 @@ mod tests {
                 self.clean_threshold = threshold;
             }
 
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             pub(crate) fn set_commit_threshold(&mut self, threshold: u64) {
                 self.commit_threshold = threshold;
             }
@@ -453,7 +453,7 @@ mod tests {
                 let provider = self.db.factory.database_provider_rw()?;
                 let res = Ok(AccountHashingStage::seed(
                     &provider,
-                    SeedOpts { blocks: 1..=input.target(), accounts: 10, txs: 0..3 },
+                    SeedOpts { blocks: 0..=input.target(), accounts: 10, txs: 0..3 },
                 )
                 .unwrap());
                 provider.commit().expect("failed to commit");

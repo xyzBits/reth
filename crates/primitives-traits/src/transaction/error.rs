@@ -61,6 +61,20 @@ pub enum InvalidTransactionError {
     /// Thrown if the sender of a transaction is a contract.
     #[error("transaction signer has bytecode set")]
     SignerAccountHasBytecode,
+    /// Thrown post Osaka if gas limit is too high.
+    #[error("gas limit too high")]
+    GasLimitTooHigh,
+}
+
+impl InvalidTransactionError {
+    /// Returns true if this is [`InvalidTransactionError::NonceNotConsistent`] and the
+    /// transaction's nonce is lower than the state's.
+    pub fn is_nonce_too_low(&self) -> bool {
+        match self {
+            Self::NonceNotConsistent { tx, state } => tx < state,
+            _ => false,
+        }
+    }
 }
 
 /// Represents error variants that can happen when trying to convert a transaction to pooled

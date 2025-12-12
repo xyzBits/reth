@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, TxNumber};
+use alloy_primitives::{Address, BlockNumber, TxNumber};
 use reth_config::config::SenderRecoveryConfig;
 use reth_consensus::ConsensusError;
 use reth_db::static_file::TransactionMask;
@@ -9,18 +9,18 @@ use reth_db_api::{
     transaction::{DbTx, DbTxMut},
     DbTxUnwindExt, RawValue,
 };
-use reth_primitives::{GotExpected, NodePrimitives, StaticFileSegment};
-use reth_primitives_traits::SignedTransaction;
+use reth_primitives_traits::{GotExpected, NodePrimitives, SignedTransaction};
 use reth_provider::{
-    BlockReader, DBProvider, HeaderProvider, ProviderError, PruneCheckpointReader,
-    StaticFileProviderFactory, StatsReader,
+    BlockReader, DBProvider, EitherWriter, HeaderProvider, ProviderError, PruneCheckpointReader,
+    StaticFileProviderFactory, StatsReader, StorageSettingsCache, TransactionsProvider,
 };
 use reth_prune_types::PruneSegment;
 use reth_stages_api::{
     BlockErrorKind, EntitiesCheckpoint, ExecInput, ExecOutput, Stage, StageCheckpoint, StageError,
     StageId, UnwindInput, UnwindOutput,
 };
-use std::{fmt::Debug, ops::Range, sync::mpsc};
+use reth_static_file_types::StaticFileSegment;
+use std::{fmt::Debug, ops::Range, sync::mpsc, time::Instant};
 use thiserror::Error;
 use tracing::*;
 
@@ -64,7 +64,8 @@ where
         + BlockReader
         + StaticFileProviderFactory<Primitives: NodePrimitives<SignedTx: Value + SignedTransaction>>
         + StatsReader
-        + PruneCheckpointReader,
+        + PruneCheckpointReader
+        + StorageSettingsCache,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -74,48 +75,75 @@ where
     /// Retrieve the range of transactions to iterate over by querying
     /// [`BlockBodyIndices`][reth_db_api::tables::BlockBodyIndices],
     /// collect transactions within that range, recover signer for each transaction and store
-    /// entries in the [`TransactionSenders`][reth_db_api::tables::TransactionSenders] table.
+    /// entries in the [`TransactionSenders`][reth_db_api::tables::TransactionSenders] table or
+    /// static files depending on configuration.
     fn execute(&mut self, provider: &Provider, input: ExecInput) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
             return Ok(ExecOutput::done(input.checkpoint()))
         }
 
-        let (tx_range, block_range, is_final_range) =
-            input.next_block_range_with_transaction_threshold(provider, self.commit_threshold)?;
-        let end_block = *block_range.end();
-
-        // No transactions to walk over
-        if tx_range.is_empty() {
-            info!(target: "sync::stages::sender_recovery", ?tx_range, "Target transaction already reached");
+        let Some(range_output) =
+            input.next_block_range_with_transaction_threshold(provider, self.commit_threshold)?
+        else {
+            info!(target: "sync::stages::sender_recovery", "No transaction senders to recover");
+            EitherWriter::new_senders(
+                provider,
+                provider
+                    .static_file_provider()
+                    .get_highest_static_file_block(StaticFileSegment::TransactionSenders)
+                    .unwrap_or_default(),
+            )?
+            .ensure_at_block(input.target())?;
             return Ok(ExecOutput {
-                checkpoint: StageCheckpoint::new(end_block)
+                checkpoint: StageCheckpoint::new(input.target())
                     .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
-                done: is_final_range,
+                done: true,
             })
-        }
+        };
+        let end_block = *range_output.block_range.end();
 
-        // Acquire the cursor for inserting elements
-        let mut senders_cursor = provider.tx_ref().cursor_write::<tables::TransactionSenders>()?;
+        let mut writer = EitherWriter::new_senders(provider, *range_output.block_range.start())?;
 
-        info!(target: "sync::stages::sender_recovery", ?tx_range, "Recovering senders");
+        info!(target: "sync::stages::sender_recovery", tx_range = ?range_output.tx_range, "Recovering senders");
 
         // Iterate over transactions in batches, recover the senders and append them
-        let batch = tx_range
+        let batch = range_output
+            .tx_range
             .clone()
             .step_by(BATCH_SIZE)
-            .map(|start| start..std::cmp::min(start + BATCH_SIZE as u64, tx_range.end))
+            .map(|start| start..std::cmp::min(start + BATCH_SIZE as u64, range_output.tx_range.end))
             .collect::<Vec<Range<u64>>>();
 
         let tx_batch_sender = setup_range_recovery(provider);
 
+        let start = Instant::now();
+        let block_body_indices =
+            provider.block_body_indices_range(range_output.block_range.clone())?;
+        let block_body_indices_elapsed = start.elapsed();
+        let mut blocks_with_indices = range_output.block_range.zip(block_body_indices).peekable();
+
         for range in batch {
-            recover_range(range, provider, tx_batch_sender.clone(), &mut senders_cursor)?;
+            // Pair each transaction number with its block number
+            let start = Instant::now();
+            let block_numbers = range.clone().fold(Vec::new(), |mut block_numbers, tx| {
+                while let Some((block, index)) = blocks_with_indices.peek() {
+                    if index.contains_tx(tx) {
+                        block_numbers.push(*block);
+                        return block_numbers
+                    }
+                    blocks_with_indices.next();
+                }
+                block_numbers
+            });
+            let fold_elapsed = start.elapsed();
+            debug!(target: "sync::stages::sender_recovery", ?block_body_indices_elapsed, ?fold_elapsed, len = block_numbers.len(), "Calculated block numbers");
+            recover_range(range, block_numbers, provider, tx_batch_sender.clone(), &mut writer)?;
         }
 
         Ok(ExecOutput {
             checkpoint: StageCheckpoint::new(end_block)
                 .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
-            done: is_final_range,
+            done: range_output.is_final_range,
         })
     }
 
@@ -142,15 +170,22 @@ where
 }
 
 fn recover_range<Provider, CURSOR>(
-    tx_range: Range<u64>,
+    tx_range: Range<TxNumber>,
+    block_numbers: Vec<BlockNumber>,
     provider: &Provider,
     tx_batch_sender: mpsc::Sender<Vec<(Range<u64>, RecoveryResultSender)>>,
-    senders_cursor: &mut CURSOR,
+    writer: &mut EitherWriter<'_, CURSOR, Provider::Primitives>,
 ) -> Result<(), StageError>
 where
-    Provider: DBProvider + HeaderProvider + StaticFileProviderFactory,
+    Provider: DBProvider + HeaderProvider + TransactionsProvider + StaticFileProviderFactory,
     CURSOR: DbCursorRW<tables::TransactionSenders>,
 {
+    debug_assert_eq!(
+        tx_range.clone().count(),
+        block_numbers.len(),
+        "Transaction range and block numbers count mismatch"
+    );
+
     debug!(target: "sync::stages::sender_recovery", ?tx_range, "Sending batch for processing");
 
     // Preallocate channels for each chunks in the batch
@@ -172,6 +207,7 @@ where
     debug!(target: "sync::stages::sender_recovery", ?tx_range, "Appending recovered senders to the database");
 
     let mut processed_transactions = 0;
+    let mut block_numbers = block_numbers.into_iter();
     for channel in receivers {
         while let Ok(recovered) = channel.recv() {
             let (tx_id, sender) = match recovered {
@@ -209,7 +245,12 @@ where
                     }
                 }
             };
-            senders_cursor.append(tx_id, &sender)?;
+
+            let new_block_number = block_numbers
+                .next()
+                .expect("block numbers iterator has the same length as the number of transactions");
+            writer.ensure_at_block(new_block_number)?;
+            writer.append_sender(tx_id, &sender)?;
             processed_transactions += 1;
         }
     }
@@ -315,7 +356,7 @@ fn recover_sender<T: SignedTransaction>(
     // value is greater than `secp256k1n / 2` if past EIP-2. There are transactions
     // pre-homestead which have large `s` values, so using [Signature::recover_signer] here
     // would not be backwards-compatible.
-    let sender = tx.recover_signer_unchecked_with_buf(rlp_buf).map_err(|_| {
+    let sender = tx.recover_unchecked_with_buf(rlp_buf).map_err(|_| {
         SenderRecoveryStageError::FailedRecovery(FailedSenderRecoveryError { tx: tx_id })
     })?;
 
@@ -375,8 +416,8 @@ mod tests {
     use alloy_primitives::{BlockNumber, B256};
     use assert_matches::assert_matches;
     use reth_db_api::cursor::DbCursorRO;
-    use reth_primitives::{SealedBlock, TransactionSigned};
-    use reth_primitives_traits::SignedTransaction;
+    use reth_ethereum_primitives::{Block, TransactionSigned};
+    use reth_primitives_traits::{SealedBlock, SignerRecoverable};
     use reth_provider::{
         providers::StaticFileWriter, BlockBodyIndicesProvider, DatabaseProviderFactory,
         PruneCheckpointWriter, StaticFileProviderFactory, TransactionsProvider,
@@ -490,7 +531,7 @@ mod tests {
             ExecOutput {
                 checkpoint: StageCheckpoint::new(expected_progress).with_entities_stage_checkpoint(
                     EntitiesCheckpoint {
-                        processed: runner.db.table::<tables::TransactionSenders>().unwrap().len()
+                        processed: runner.db.count_entries::<tables::TransactionSenders>().unwrap()
                             as u64,
                         total: total_transactions
                     }
@@ -599,7 +640,7 @@ mod tests {
         ///
         /// 1. If there are any entries in the [`tables::TransactionSenders`] table above a given
         ///    block number.
-        /// 2. If the is no requested block entry in the bodies table, but
+        /// 2. If there is no requested block entry in the bodies table, but
         ///    [`tables::TransactionSenders`] is not empty.
         fn ensure_no_senders_by_block(&self, block: BlockNumber) -> Result<(), TestRunnerError> {
             let body_result = self
@@ -635,7 +676,7 @@ mod tests {
     }
 
     impl ExecuteStageTestRunner for SenderRecoveryTestRunner {
-        type Seed = Vec<SealedBlock>;
+        type Seed = Vec<SealedBlock<Block>>;
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
             let mut rng = generators::rng();

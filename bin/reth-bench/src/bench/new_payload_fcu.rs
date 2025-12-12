@@ -9,24 +9,18 @@ use crate::{
             GAS_OUTPUT_SUFFIX,
         },
     },
-    valid_payload::{call_forkchoice_updated, call_new_payload},
+    valid_payload::{block_to_new_payload, call_forkchoice_updated, call_new_payload},
 };
-use alloy_consensus::{Block, BlockBody, Transaction};
-use alloy_primitives::B256;
-use alloy_provider::{
-    network::{AnyHeader, AnyRpcBlock},
-    Provider,
-};
-use alloy_rpc_types::{BlockTransactions, Header as RpcHeader};
-use alloy_rpc_types_engine::{ExecutionPayload, ForkchoiceState};
+use alloy_provider::Provider;
+use alloy_rpc_types_engine::ForkchoiceState;
 use clap::Parser;
 use csv::Writer;
+use eyre::{Context, OptionExt};
+use humantime::parse_duration;
 use reth_cli_runner::CliContext;
 use reth_node_core::args::BenchmarkArgs;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
-
-use super::rpc_transaction::RpcTransaction;
 
 /// `reth benchmark new-payload-fcu` command
 #[derive(Debug, Parser)]
@@ -35,6 +29,20 @@ pub struct Command {
     #[arg(long, value_name = "RPC_URL", verbatim_doc_comment)]
     rpc_url: String,
 
+    /// How long to wait after a forkchoice update before sending the next payload.
+    #[arg(long, value_name = "WAIT_TIME", value_parser = parse_duration, default_value = "250ms", verbatim_doc_comment)]
+    wait_time: Duration,
+
+    /// The size of the block buffer (channel capacity) for prefetching blocks from the RPC
+    /// endpoint.
+    #[arg(
+        long = "rpc-block-buffer-size",
+        value_name = "RPC_BLOCK_BUFFER_SIZE",
+        default_value = "20",
+        verbatim_doc_comment
+    )]
+    rpc_block_buffer_size: usize,
+
     #[command(flatten)]
     benchmark: BenchmarkArgs,
 }
@@ -42,41 +50,63 @@ pub struct Command {
 impl Command {
     /// Execute `benchmark new-payload-fcu` command
     pub async fn execute(self, _ctx: CliContext) -> eyre::Result<()> {
-        let BenchContext { benchmark_mode, block_provider, auth_provider, mut next_block } =
-            BenchContext::new(&self.benchmark, self.rpc_url).await?;
+        let BenchContext {
+            benchmark_mode,
+            block_provider,
+            auth_provider,
+            mut next_block,
+            is_optimism,
+        } = BenchContext::new(&self.benchmark, self.rpc_url).await?;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1000);
+        let buffer_size = self.rpc_block_buffer_size;
+
+        // Use a oneshot channel to propagate errors from the spawned task
+        let (error_sender, mut error_receiver) = tokio::sync::oneshot::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
+
         tokio::task::spawn(async move {
             while benchmark_mode.contains(next_block) {
-                let block_res =
-                    block_provider.get_block_by_number(next_block.into(), true.into()).await;
-                let block = block_res.unwrap().unwrap();
-                let (header, versioned_hashes, payload) = from_any_rpc_block(block).unwrap();
-                let head_block_hash = header.hash;
+                let block_res = block_provider
+                    .get_block_by_number(next_block.into())
+                    .full()
+                    .await
+                    .wrap_err_with(|| format!("Failed to fetch block by number {next_block}"));
+                let block = match block_res.and_then(|opt| opt.ok_or_eyre("Block not found")) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        tracing::error!("Failed to fetch block {next_block}: {e}");
+                        let _ = error_sender.send(e);
+                        break;
+                    }
+                };
+
+                let head_block_hash = block.header.hash;
                 let safe_block_hash = block_provider
-                    .get_block_by_number(header.number.saturating_sub(32).into(), false.into());
+                    .get_block_by_number(block.header.number.saturating_sub(32).into());
 
                 let finalized_block_hash = block_provider
-                    .get_block_by_number(header.number.saturating_sub(64).into(), false.into());
+                    .get_block_by_number(block.header.number.saturating_sub(64).into());
 
                 let (safe, finalized) = tokio::join!(safe_block_hash, finalized_block_hash,);
 
-                let safe_block_hash = safe.unwrap().expect("finalized block exists").header.hash;
-                let finalized_block_hash =
-                    finalized.unwrap().expect("finalized block exists").header.hash;
+                let safe_block_hash = match safe {
+                    Ok(Some(block)) => block.header.hash,
+                    Ok(None) | Err(_) => head_block_hash,
+                };
+
+                let finalized_block_hash = match finalized {
+                    Ok(Some(block)) => block.header.hash,
+                    Ok(None) | Err(_) => head_block_hash,
+                };
 
                 next_block += 1;
-                sender
-                    .send((
-                        header,
-                        versioned_hashes,
-                        payload,
-                        head_block_hash,
-                        safe_block_hash,
-                        finalized_block_hash,
-                    ))
+                if let Err(e) = sender
+                    .send((block, head_block_hash, safe_block_hash, finalized_block_hash))
                     .await
-                    .unwrap();
+                {
+                    tracing::error!("Failed to send block data: {e}");
+                    break;
+                }
             }
         });
 
@@ -85,15 +115,16 @@ impl Command {
         let total_benchmark_duration = Instant::now();
         let mut total_wait_time = Duration::ZERO;
 
-        while let Some((header, versioned_hashes, payload, head, safe, finalized)) = {
+        while let Some((block, head, safe, finalized)) = {
             let wait_start = Instant::now();
             let result = receiver.recv().await;
             total_wait_time += wait_start.elapsed();
             result
         } {
             // just put gas used here
-            let gas_used = header.gas_used;
-            let block_number = header.number;
+            let gas_used = block.header.gas_used;
+            let block_number = block.header.number;
+            let transaction_count = block.transactions.len() as u64;
 
             debug!(target: "reth-bench", ?block_number, "Sending payload",);
 
@@ -104,25 +135,24 @@ impl Command {
                 finalized_block_hash: finalized,
             };
 
+            let (version, params) = block_to_new_payload(block, is_optimism)?;
             let start = Instant::now();
-            let message_version = call_new_payload(
-                &auth_provider,
-                payload,
-                header.parent_beacon_block_root,
-                versioned_hashes,
-            )
-            .await?;
+            call_new_payload(&auth_provider, version, params).await?;
 
             let new_payload_result = NewPayloadResult { gas_used, latency: start.elapsed() };
 
-            call_forkchoice_updated(&auth_provider, message_version, forkchoice_state, None)
-                .await?;
+            call_forkchoice_updated(&auth_provider, version, forkchoice_state, None).await?;
 
             // calculate the total duration and the fcu latency, record
             let total_latency = start.elapsed();
             let fcu_latency = total_latency - new_payload_result.latency;
-            let combined_result =
-                CombinedResult { block_number, new_payload_result, fcu_latency, total_latency };
+            let combined_result = CombinedResult {
+                block_number,
+                transaction_count,
+                new_payload_result,
+                fcu_latency,
+                total_latency,
+            };
 
             // current duration since the start of the benchmark minus the time
             // waiting for blocks
@@ -131,9 +161,18 @@ impl Command {
             // convert gas used to gigagas, then compute gigagas per second
             info!(%combined_result);
 
+            // wait before sending the next payload
+            tokio::time::sleep(self.wait_time).await;
+
             // record the current result
-            let gas_row = TotalGasRow { block_number, gas_used, time: current_duration };
+            let gas_row =
+                TotalGasRow { block_number, transaction_count, gas_used, time: current_duration };
             results.push((gas_row, combined_result));
+        }
+
+        // Check if the spawned task encountered an error
+        if let Ok(error) = error_receiver.try_recv() {
+            return Err(error);
         }
 
         let (gas_output_results, combined_results): (_, Vec<CombinedResult>) =
@@ -163,7 +202,7 @@ impl Command {
         }
 
         // accumulate the results and calculate the overall Ggas/s
-        let gas_output = TotalGasOutput::new(gas_output_results);
+        let gas_output = TotalGasOutput::new(gas_output_results)?;
         info!(
             total_duration=?gas_output.total_duration,
             total_gas_used=?gas_output.total_gas_used,
@@ -174,44 +213,4 @@ impl Command {
 
         Ok(())
     }
-}
-
-// TODO(mattsse): integrate in alloy
-pub(crate) fn from_any_rpc_block(
-    block: AnyRpcBlock,
-) -> eyre::Result<(RpcHeader<AnyHeader>, Vec<B256>, ExecutionPayload)> {
-    let block = block.inner.try_map_transactions(|tx| {
-        // TODO: convert without json roundtrip
-        serde_json::to_value(tx).and_then(serde_json::from_value::<RpcTransaction>)
-    })?;
-
-    let header = block.header.clone();
-
-    // Extract transactions
-    let transactions = match block.transactions {
-        BlockTransactions::Hashes(_) => {
-            return Err(eyre::eyre!("Block must include full transaction data. Send the eth_getBlockByHash request with full: `true`"));
-        }
-        BlockTransactions::Full(txs) => txs,
-        BlockTransactions::Uncle => {
-            return Err(eyre::eyre!("Cannot process uncle blocks"));
-        }
-    };
-
-    // Extract blob versioned hashes
-    let blob_versioned_hashes = transactions
-        .iter()
-        .filter_map(|tx| tx.blob_versioned_hashes().map(|v| v.to_vec()))
-        .flatten()
-        .collect::<Vec<_>>();
-    let execution_payload = ExecutionPayload::from_block_unchecked(
-        block.header.hash,
-        &Block::new(
-            block.header,
-            BlockBody { transactions, ommers: vec![], withdrawals: block.withdrawals },
-        ),
-    )
-    .0;
-
-    Ok((header, blob_versioned_hashes, execution_payload))
 }

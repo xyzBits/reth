@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -86,7 +86,7 @@ pub fn create_receipt_decompressor() -> ReusableDecompressor {
 }
 
 /// Reusable decompressor that uses its own internal buffer.
-#[allow(missing_debug_implementations)]
+#[expect(missing_debug_implementations)]
 pub struct ReusableDecompressor {
     /// The `zstd` decompressor.
     decompressor: Decompressor<'static>,
@@ -118,10 +118,10 @@ impl ReusableDecompressor {
                 // source.
                 if !reserved_upper_bound {
                     reserved_upper_bound = true;
-                    if let Some(upper_bound) = Decompressor::upper_bound(src) {
-                        if let Some(additional) = upper_bound.checked_sub(self.buf.capacity()) {
-                            break 'b additional
-                        }
+                    if let Some(upper_bound) = Decompressor::upper_bound(src) &&
+                        let Some(additional) = upper_bound.checked_sub(self.buf.capacity())
+                    {
+                        break 'b additional
                     }
                 }
 

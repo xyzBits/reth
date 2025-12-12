@@ -5,15 +5,15 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use itertools::Itertools;
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use reth_trie::{
-    hashed_cursor::{noop::NoopHashedStorageCursor, HashedPostStateStorageCursor},
+    hashed_cursor::{noop::NoopHashedCursor, HashedPostStateCursor},
     node_iter::{TrieElement, TrieNodeIter},
-    trie_cursor::{noop::NoopStorageTrieCursor, InMemoryStorageTrieCursor},
+    trie_cursor::{noop::NoopStorageTrieCursor, InMemoryTrieCursor},
     updates::StorageTrieUpdates,
     walker::TrieWalker,
     HashedStorage,
 };
-use reth_trie_common::{HashBuilder, Nibbles};
-use reth_trie_sparse::SparseTrie;
+use reth_trie_common::{updates::TrieUpdatesSorted, HashBuilder, Nibbles};
+use reth_trie_sparse::{provider::DefaultTrieNodeProvider, SerialSparseTrie, SparseTrie};
 
 fn calculate_root_from_leaves(c: &mut Criterion) {
     let mut group = c.benchmark_group("calculate root from leaves");
@@ -21,7 +21,7 @@ fn calculate_root_from_leaves(c: &mut Criterion) {
 
     for size in [1_000, 5_000, 10_000, 100_000] {
         // Too slow.
-        #[allow(unexpected_cfgs)]
+        #[expect(unexpected_cfgs)]
         if cfg!(codspeed) && size > 5_000 {
             continue;
         }
@@ -40,13 +40,15 @@ fn calculate_root_from_leaves(c: &mut Criterion) {
         });
 
         // sparse trie
+        let provider = DefaultTrieNodeProvider;
         group.bench_function(BenchmarkId::new("sparse trie", size), |b| {
-            b.iter_with_setup(SparseTrie::revealed_empty, |mut sparse| {
+            b.iter_with_setup(SparseTrie::<SerialSparseTrie>::revealed_empty, |mut sparse| {
                 for (key, value) in &state {
                     sparse
                         .update_leaf(
                             Nibbles::unpack(key),
                             alloy_rlp::encode_fixed_size(value).to_vec(),
+                            &provider,
                         )
                         .unwrap();
                 }
@@ -63,7 +65,7 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
 
     for init_size in [1_000, 10_000, 100_000] {
         // Too slow.
-        #[allow(unexpected_cfgs)]
+        #[expect(unexpected_cfgs)]
         if cfg!(codspeed) && init_size > 10_000 {
             continue;
         }
@@ -72,7 +74,7 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
 
         for update_size in [100, 1_000, 5_000, 10_000] {
             // Too slow.
-            #[allow(unexpected_cfgs)]
+            #[expect(unexpected_cfgs)]
             if cfg!(codspeed) && update_size > 1_000 {
                 continue;
             }
@@ -84,7 +86,9 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                 // hash builder
                 let benchmark_id = BenchmarkId::new(
                     "hash builder",
-                    format!("init size {init_size} | update size {update_size} | num updates {num_updates}"),
+                    format!(
+                        "init size {init_size} | update size {update_size} | num updates {num_updates}"
+                    ),
                 );
                 group.bench_function(benchmark_id, |b| {
                     b.iter_with_setup(
@@ -129,19 +133,36 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                                         )
                                     };
 
-                                let walker = TrieWalker::new(
-                                    InMemoryStorageTrieCursor::new(
-                                        B256::ZERO,
+                                // Create a TrieUpdatesSorted with just this storage trie
+                                let mut storage_tries = Default::default();
+                                alloy_primitives::map::B256Map::insert(
+                                    &mut storage_tries,
+                                    B256::ZERO,
+                                    trie_updates_sorted.clone(),
+                                );
+                                let full_trie_updates =
+                                    TrieUpdatesSorted::new(Vec::new(), storage_tries);
+
+                                let walker = TrieWalker::<_>::storage_trie(
+                                    InMemoryTrieCursor::new_storage(
                                         NoopStorageTrieCursor::default(),
-                                        Some(&trie_updates_sorted),
+                                        &full_trie_updates,
+                                        B256::ZERO,
                                     ),
                                     prefix_set,
                                 );
-                                let mut node_iter = TrieNodeIter::new(
+                                let hashed_address = B256::ZERO;
+                                let mut storages = alloy_primitives::map::B256Map::default();
+                                storages.insert(hashed_address, storage_sorted.clone());
+                                let hashed_post_state =
+                                    reth_trie::HashedPostStateSorted::new(Vec::new(), storages);
+
+                                let mut node_iter = TrieNodeIter::storage_trie(
                                     walker,
-                                    HashedPostStateStorageCursor::new(
-                                        NoopHashedStorageCursor::default(),
-                                        Some(&storage_sorted),
+                                    HashedPostStateCursor::new_storage(
+                                        NoopHashedCursor::<U256>::default(),
+                                        &hashed_post_state,
+                                        hashed_address,
                                     ),
                                 );
 
@@ -175,19 +196,23 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                 });
 
                 // sparse trie
+                let provider = DefaultTrieNodeProvider;
                 let benchmark_id = BenchmarkId::new(
                     "sparse trie",
-                    format!("init size {init_size} | update size {update_size} | num updates {num_updates}"),
+                    format!(
+                        "init size {init_size} | update size {update_size} | num updates {num_updates}"
+                    ),
                 );
                 group.bench_function(benchmark_id, |b| {
                     b.iter_with_setup(
                         || {
-                            let mut sparse = SparseTrie::revealed_empty();
+                            let mut sparse = SparseTrie::<SerialSparseTrie>::revealed_empty();
                             for (key, value) in &init_state {
                                 sparse
                                     .update_leaf(
                                         Nibbles::unpack(key),
                                         alloy_rlp::encode_fixed_size(value).to_vec(),
+                                        &provider,
                                     )
                                     .unwrap();
                             }
@@ -201,6 +226,7 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                                         .update_leaf(
                                             Nibbles::unpack(key),
                                             alloy_rlp::encode_fixed_size(value).to_vec(),
+                                            &provider,
                                         )
                                         .unwrap();
                                 }

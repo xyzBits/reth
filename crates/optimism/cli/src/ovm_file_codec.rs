@@ -1,5 +1,5 @@
 use alloy_consensus::{
-    transaction::{from_eip155_value, RlpEcdsaTx},
+    transaction::{from_eip155_value, RlpEcdsaDecodableTx, RlpEcdsaEncodableTx},
     Header, TxEip1559, TxEip2930, TxEip7702, TxLegacy,
 };
 use alloy_eips::{
@@ -9,7 +9,7 @@ use alloy_eips::{
 };
 use alloy_primitives::{
     bytes::{Buf, BytesMut},
-    keccak256, PrimitiveSignature as Signature, TxHash, B256, U256,
+    keccak256, Signature, TxHash, B256, U256,
 };
 use alloy_rlp::{Decodable, Error as RlpError, RlpDecodable};
 use derive_more::{AsRef, Deref};
@@ -18,7 +18,7 @@ use reth_downloaders::file_client::FileClientError;
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::Decoder;
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 /// Specific codec for reading raw block bodies from a file
 /// with optimism-specific signature handling
 pub(crate) struct OvmBlockFileCodec;
@@ -251,13 +251,7 @@ impl Encodable2718 for OvmTransactionSigned {
     }
 
     fn encode_2718(&self, out: &mut dyn alloy_rlp::BufMut) {
-        match &self.transaction {
-            OpTypedTransaction::Legacy(tx) => tx.eip2718_encode(&self.signature, out),
-            OpTypedTransaction::Eip2930(tx) => tx.eip2718_encode(&self.signature, out),
-            OpTypedTransaction::Eip1559(tx) => tx.eip2718_encode(&self.signature, out),
-            OpTypedTransaction::Eip7702(tx) => tx.eip2718_encode(&self.signature, out),
-            OpTypedTransaction::Deposit(tx) => tx.encode_2718(out),
-        }
+        self.transaction.eip2718_encode(&self.signature, out)
     }
 }
 
@@ -293,7 +287,7 @@ impl Decodable2718 for OvmTransactionSigned {
 mod tests {
     use crate::ovm_file_codec::OvmTransactionSigned;
     use alloy_consensus::Typed2718;
-    use alloy_primitives::{address, hex, TxKind, B256, U256};
+    use alloy_primitives::{address, b256, hex, TxKind, U256};
     use op_alloy_consensus::OpTypedTransaction;
     const DEPOSIT_FUNCTION_SELECTOR: [u8; 4] = [0xb6, 0xb5, 0x5f, 0x25];
     use alloy_rlp::Decodable;
@@ -302,18 +296,20 @@ mod tests {
     fn test_decode_legacy_transactions() {
         // Test Case 1: contract deposit - regular L2 transaction calling deposit() function
         // tx: https://optimistic.etherscan.io/getRawTx?tx=0x7860252963a2df21113344f323035ef59648638a571eef742e33d789602c7a1c
-        let deposit_tx_bytes = hex!("f88881f0830f481c830c6e4594a75127121d28a9bf848f3b70e7eea26570aa770080a4b6b55f2500000000000000000000000000000000000000000000000000000000000710b238a0d5c622d92ddf37f9c18a3465a572f74d8b1aeaf50c1cfb10b3833242781fd45fa02c4f1d5819bf8b70bf651e7a063b7db63c55bd336799c6ae3e5bc72ad6ef3def");
+        let deposit_tx_bytes = hex!(
+            "f88881f0830f481c830c6e4594a75127121d28a9bf848f3b70e7eea26570aa770080a4b6b55f2500000000000000000000000000000000000000000000000000000000000710b238a0d5c622d92ddf37f9c18a3465a572f74d8b1aeaf50c1cfb10b3833242781fd45fa02c4f1d5819bf8b70bf651e7a063b7db63c55bd336799c6ae3e5bc72ad6ef3def"
+        );
         let deposit_decoded = OvmTransactionSigned::decode(&mut &deposit_tx_bytes[..]).unwrap();
 
         // Verify deposit transaction
         let deposit_tx = match &deposit_decoded.transaction {
-            OpTypedTransaction::Legacy(ref tx) => tx,
+            OpTypedTransaction::Legacy(tx) => tx,
             _ => panic!("Expected legacy transaction for NFT deposit"),
         };
 
         assert_eq!(
             deposit_tx.to,
-            TxKind::Call(address!("a75127121d28a9bf848f3b70e7eea26570aa7700"))
+            TxKind::Call(address!("0xa75127121d28a9bf848f3b70e7eea26570aa7700"))
         );
         assert_eq!(deposit_tx.nonce, 240);
         assert_eq!(deposit_tx.gas_price, 1001500);
@@ -340,14 +336,16 @@ mod tests {
 
         // Test Case 2: pre-bedrock system transaction from block 105235052
         // tx: https://optimistic.etherscan.io/getRawTx?tx=0xe20b11349681dd049f8df32f5cdbb4c68d46b537685defcd86c7fa42cfe75b9e
-        let system_tx_bytes = hex!("f9026c830d899383124f808302a77e94a0cc33dd6f4819d473226257792afe230ec3c67f80b902046c459a280000000000000000000000004d73adb72bc3dd368966edd0f0b2148401a178e2000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000647fac7f00000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000084704316e5000000000000000000000000000000000000000000000000000000000000006e10975631049de3c008989b0d8c19fc720dc556ca01abfbd794c6eb5075dd000d000000000000000000000000000000000000000000000000000000000000001410975631049de3c008989b0d8c19fc720dc556ca01abfbd794c6eb5075dd000d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000082a39325251d44e11f3b6d92f9382438eb6c8b5068d4a488d4f177b26f2ca20db34ae53467322852afcc779f25eafd124c5586f54b9026497ba934403d4c578e3c1b5aa754c918ee2ecd25402df656c2419717e4017a7aecb84af3914fd3c7bf6930369c4e6ff76950246b98e354821775f02d33cdbee5ef6aed06c15b75691692d31c00000000000000000000000000000000000000000000000000000000000038a0e8991e95e66d809f4b6fb0af27c31368ca0f30e657165c428aa681ec5ea25bbea013ed325bd97365087ec713e9817d252b59113ea18430b71a5890c4eeb6b9efc4");
+        let system_tx_bytes = hex!(
+            "f9026c830d899383124f808302a77e94a0cc33dd6f4819d473226257792afe230ec3c67f80b902046c459a280000000000000000000000004d73adb72bc3dd368966edd0f0b2148401a178e2000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000647fac7f00000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000084704316e5000000000000000000000000000000000000000000000000000000000000006e10975631049de3c008989b0d8c19fc720dc556ca01abfbd794c6eb5075dd000d000000000000000000000000000000000000000000000000000000000000001410975631049de3c008989b0d8c19fc720dc556ca01abfbd794c6eb5075dd000d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000082a39325251d44e11f3b6d92f9382438eb6c8b5068d4a488d4f177b26f2ca20db34ae53467322852afcc779f25eafd124c5586f54b9026497ba934403d4c578e3c1b5aa754c918ee2ecd25402df656c2419717e4017a7aecb84af3914fd3c7bf6930369c4e6ff76950246b98e354821775f02d33cdbee5ef6aed06c15b75691692d31c00000000000000000000000000000000000000000000000000000000000038a0e8991e95e66d809f4b6fb0af27c31368ca0f30e657165c428aa681ec5ea25bbea013ed325bd97365087ec713e9817d252b59113ea18430b71a5890c4eeb6b9efc4"
+        );
         let system_decoded = OvmTransactionSigned::decode(&mut &system_tx_bytes[..]).unwrap();
 
         // Verify system transaction
         assert!(system_decoded.is_legacy());
 
         let system_tx = match &system_decoded.transaction {
-            OpTypedTransaction::Legacy(ref tx) => tx,
+            OpTypedTransaction::Legacy(tx) => tx,
             _ => panic!("Expected Legacy transaction"),
         };
 
@@ -356,7 +354,7 @@ mod tests {
         assert_eq!(system_tx.gas_limit, 173950);
         assert_eq!(
             system_tx.to,
-            TxKind::Call(address!("a0cc33dd6f4819d473226257792afe230ec3c67f"))
+            TxKind::Call(address!("0xa0cc33dd6f4819d473226257792afe230ec3c67f"))
         );
         assert_eq!(system_tx.value, U256::ZERO);
         assert_eq!(system_tx.chain_id, Some(10));
@@ -379,7 +377,7 @@ mod tests {
         );
         assert_eq!(
             system_decoded.hash,
-            B256::from(hex!("e20b11349681dd049f8df32f5cdbb4c68d46b537685defcd86c7fa42cfe75b9e"))
+            b256!("0xe20b11349681dd049f8df32f5cdbb4c68d46b537685defcd86c7fa42cfe75b9e")
         );
     }
 }

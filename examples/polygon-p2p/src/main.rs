@@ -1,4 +1,4 @@
-//! Example for how hook into the polygon p2p network
+//! Example for how to hook into the polygon p2p network
 //!
 //! Run with
 //!
@@ -8,16 +8,16 @@
 //!
 //! This launches a regular reth node overriding the engine api payload builder with our custom.
 //!
-//! Credits to: <https://blog.merkle.io/blog/fastest-transaction-network-eth-polygon-bsc>
+//! Credits to: <https://merkle.io/blog/modifying-reth-to-build-the-fastest-transaction-network-on-bsc-and-polygon>
 
 #![warn(unused_crate_dependencies)]
 
 use chain_cfg::{boot_nodes, head, polygon_chain_spec};
 use reth_discv4::Discv4ConfigBuilder;
-use reth_network::{
-    config::NetworkMode, NetworkConfig, NetworkEvent, NetworkEventListenerProvider, NetworkManager,
+use reth_ethereum::network::{
+    api::events::SessionInfo, config::NetworkMode, NetworkConfig, NetworkEvent,
+    NetworkEventListenerProvider, NetworkManager,
 };
-use reth_network_api::events::SessionInfo;
 use reth_tracing::{
     tracing::info, tracing_subscriber::filter::LevelFilter, LayerInfo, LogFormat, RethTracer,
     Tracer,
@@ -67,13 +67,13 @@ async fn main() {
     let net_handle = net_manager.handle();
     let mut events = net_handle.event_listener();
 
-    // NetworkManager is a long running task, let's spawn it
+    // NetworkManager is a long-running task, let's spawn it
     tokio::spawn(net_manager);
     info!("Looking for Polygon peers...");
 
     while let Some(evt) = events.next().await {
         // For the sake of the example we only print the session established event
-        // with the chain specific details
+        // with the chain-specific details
         if let NetworkEvent::ActivePeerSession { info, .. } = evt {
             let SessionInfo { status, client_version, .. } = info;
             let chain = status.chain;
@@ -81,5 +81,5 @@ async fn main() {
         }
         // More events here
     }
-    // We will be disconnected from peers since we are not able to answer to network requests
+    // We will be disconnected from peers since we are not able to respond to network requests
 }

@@ -2,7 +2,10 @@
 
 use crate::{
     config::{LocalTransactionConfig, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER},
-    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolErrorKind},
+    error::{
+        Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
+        PoolError, PoolErrorKind,
+    },
     identifier::{SenderId, TransactionId},
     metrics::{AllTransactionsMetrics, TxPoolMetrics},
     pool::{
@@ -11,7 +14,7 @@ use crate::{
         parked::{BasefeeOrd, ParkedPool, QueuedOrd},
         pending::PendingPool,
         state::{SubPool, TxState},
-        update::{Destination, PoolUpdate},
+        update::{Destination, PoolUpdate, UpdateOutcome},
         AddedPendingTransaction, AddedTransaction, OnNewCanonicalStateOutcome,
     },
     traits::{BestTransactionsAttributes, BlockInfo, PoolSize},
@@ -19,7 +22,7 @@ use crate::{
     ValidPoolTransaction, U256,
 };
 use alloy_consensus::constants::{
-    EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID,
+    EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID, KECCAK_EMPTY,
     LEGACY_TX_TYPE_ID,
 };
 use alloy_eips::{
@@ -37,7 +40,7 @@ use std::{
     ops::Bound::{Excluded, Unbounded},
     sync::Arc,
 };
-use tracing::trace;
+use tracing::{trace, warn};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 // TODO: Inlined diagram due to a bug in aquamarine library, should become an include when it's
@@ -113,8 +116,6 @@ pub struct TxPool<T: TransactionOrdering> {
     all_transactions: AllTransactions<T::Transaction>,
     /// Transaction pool metrics
     metrics: TxPoolMetrics,
-    /// The last update kind that was applied to the pool.
-    latest_update_kind: Option<PoolUpdateKind>,
 }
 
 // === impl TxPool ===
@@ -124,14 +125,16 @@ impl<T: TransactionOrdering> TxPool<T> {
     pub fn new(ordering: T, config: PoolConfig) -> Self {
         Self {
             sender_info: Default::default(),
-            pending_pool: PendingPool::new(ordering),
+            pending_pool: PendingPool::with_buffer(
+                ordering,
+                config.max_new_pending_txs_notifications,
+            ),
             queued_pool: Default::default(),
             basefee_pool: Default::default(),
             blob_pool: Default::default(),
             all_transactions: AllTransactions::new(&config),
             config,
             metrics: Default::default(),
-            latest_update_kind: None,
         }
     }
 
@@ -215,7 +218,14 @@ impl<T: TransactionOrdering> TxPool<T> {
     }
 
     /// Updates the tracked blob fee
-    fn update_blob_fee(&mut self, mut pending_blob_fee: u128, base_fee_update: Ordering) {
+    fn update_blob_fee<F>(
+        &mut self,
+        mut pending_blob_fee: u128,
+        base_fee_update: Ordering,
+        mut on_promoted: F,
+    ) where
+        F: FnMut(&Arc<ValidPoolTransaction<T::Transaction>>),
+    {
         std::mem::swap(&mut self.all_transactions.pending_fees.blob_fee, &mut pending_blob_fee);
         match (self.all_transactions.pending_fees.blob_fee.cmp(&pending_blob_fee), base_fee_update)
         {
@@ -244,15 +254,20 @@ impl<T: TransactionOrdering> TxPool<T> {
                 let removed =
                     self.blob_pool.enforce_pending_fees(&self.all_transactions.pending_fees);
                 for tx in removed {
-                    let to = {
-                        let tx =
+                    let subpool = {
+                        let tx_meta =
                             self.all_transactions.txs.get_mut(tx.id()).expect("tx exists in set");
-                        tx.state.insert(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK);
-                        tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
-                        tx.subpool = tx.state.into();
-                        tx.subpool
+                        tx_meta.state.insert(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK);
+                        tx_meta.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
+                        tx_meta.subpool = tx_meta.state.into();
+                        tx_meta.subpool
                     };
-                    self.add_transaction_to_subpool(to, tx);
+
+                    if subpool == SubPool::Pending {
+                        on_promoted(&tx);
+                    }
+
+                    self.add_transaction_to_subpool(subpool, tx);
                 }
             }
         }
@@ -262,7 +277,10 @@ impl<T: TransactionOrdering> TxPool<T> {
     ///
     /// Depending on the change in direction of the basefee, this will promote or demote
     /// transactions from the basefee pool.
-    fn update_basefee(&mut self, mut pending_basefee: u64) -> Ordering {
+    fn update_basefee<F>(&mut self, mut pending_basefee: u64, mut on_promoted: F) -> Ordering
+    where
+        F: FnMut(&Arc<ValidPoolTransaction<T::Transaction>>),
+    {
         std::mem::swap(&mut self.all_transactions.pending_fees.base_fee, &mut pending_basefee);
         match self.all_transactions.pending_fees.base_fee.cmp(&pending_basefee) {
             Ordering::Equal => {
@@ -287,19 +305,45 @@ impl<T: TransactionOrdering> TxPool<T> {
                 Ordering::Greater
             }
             Ordering::Less => {
-                // decreased base fee: recheck basefee pool and promote all that are now valid
-                let removed =
-                    self.basefee_pool.enforce_basefee(self.all_transactions.pending_fees.base_fee);
-                for tx in removed {
-                    let to = {
-                        let tx =
+                // Base fee decreased: recheck BaseFee and promote.
+                // Invariants:
+                // - BaseFee contains only non-blob txs (blob txs live in Blob) and they already
+                //   have ENOUGH_BLOB_FEE_CAP_BLOCK.
+                // - PENDING_POOL_BITS = BASE_FEE_POOL_BITS | ENOUGH_FEE_CAP_BLOCK |
+                //   ENOUGH_BLOB_FEE_CAP_BLOCK.
+                // With the lower base fee they gain ENOUGH_FEE_CAP_BLOCK, so we can set the bit and
+                // insert directly into Pending (skip generic routing).
+                let current_base_fee = self.all_transactions.pending_fees.base_fee;
+                self.basefee_pool.enforce_basefee_with(current_base_fee, |tx| {
+                    // Update transaction state — guaranteed Pending by the invariants above
+                    let subpool = {
+                        let meta =
                             self.all_transactions.txs.get_mut(tx.id()).expect("tx exists in set");
-                        tx.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
-                        tx.subpool = tx.state.into();
-                        tx.subpool
+                        meta.state.insert(TxState::ENOUGH_FEE_CAP_BLOCK);
+                        meta.subpool = meta.state.into();
+                        meta.subpool
                     };
-                    self.add_transaction_to_subpool(to, tx);
-                }
+
+                    if subpool == SubPool::Pending {
+                        on_promoted(&tx);
+                    }
+
+                    trace!(target: "txpool", hash=%tx.transaction.hash(), pool=?subpool, "Adding transaction to a subpool");
+                    match subpool {
+                        SubPool::Queued => self.queued_pool.add_transaction(tx),
+                        SubPool::Pending => {
+                            self.pending_pool.add_transaction(tx, current_base_fee);
+                        }
+                        SubPool::Blob => {
+                            self.blob_pool.add_transaction(tx);
+                        }
+                        SubPool::BaseFee => {
+                            // This should be unreachable as transactions from BaseFee pool with decreased
+                            // basefee are guaranteed to become Pending
+                            warn!(target: "txpool", "BaseFee transactions should become Pending after basefee decrease");
+                        }
+                    }
+                });
 
                 Ordering::Less
             }
@@ -308,24 +352,15 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Sets the current block info for the pool.
     ///
-    /// This will also apply updates to the pool based on the new base fee
+    /// This will also apply updates to the pool based on the new base fee and blob fee
     pub fn set_block_info(&mut self, info: BlockInfo) {
-        let BlockInfo {
-            block_gas_limit,
-            last_seen_block_hash,
-            last_seen_block_number,
-            pending_basefee,
-            pending_blob_fee,
-        } = info;
-        self.all_transactions.last_seen_block_hash = last_seen_block_hash;
-        self.all_transactions.last_seen_block_number = last_seen_block_number;
-        let basefee_ordering = self.update_basefee(pending_basefee);
-
-        self.all_transactions.block_gas_limit = block_gas_limit;
-
-        if let Some(blob_fee) = pending_blob_fee {
-            self.update_blob_fee(blob_fee, basefee_ordering)
+        // first update the subpools based on the new values
+        let basefee_ordering = self.update_basefee(info.pending_basefee, |_| {});
+        if let Some(blob_fee) = info.pending_blob_fee {
+            self.update_blob_fee(blob_fee, basefee_ordering, |_| {})
         }
+        // then update tracked values
+        self.all_transactions.set_block_info(info);
     }
 
     /// Returns an iterator that yields transactions that are ready to be included in the block with
@@ -353,27 +388,50 @@ impl<T: TransactionOrdering> TxPool<T> {
                 // for EIP-4844 transactions we also need to check if the blob fee is now lower than
                 // what's currently being tracked, if so we need to include transactions from the
                 // blob pool that are valid with the lower blob fee
-                if best_transactions_attributes
-                    .blob_fee
-                    .is_some_and(|fee| fee < self.all_transactions.pending_fees.blob_fee as u64)
-                {
-                    let unlocked_by_blob_fee =
-                        self.blob_pool.satisfy_attributes(best_transactions_attributes);
-
-                    Box::new(self.pending_pool.best_with_unlocked(
-                        unlocked_by_blob_fee,
-                        self.all_transactions.pending_fees.base_fee,
-                    ))
-                } else {
-                    Box::new(self.pending_pool.best())
+                let new_blob_fee = best_transactions_attributes.blob_fee.unwrap_or_default();
+                match new_blob_fee.cmp(&(self.all_transactions.pending_fees.blob_fee as u64)) {
+                    Ordering::Less => {
+                        // it's possible that this swing unlocked more blob transactions
+                        let unlocked =
+                            self.blob_pool.satisfy_attributes(best_transactions_attributes);
+                        Box::new(self.pending_pool.best_with_unlocked_and_attributes(
+                            unlocked,
+                            best_transactions_attributes.basefee,
+                            new_blob_fee,
+                        ))
+                    }
+                    Ordering::Equal => Box::new(self.pending_pool.best()),
+                    Ordering::Greater => {
+                        // no additional transactions unlocked
+                        Box::new(self.pending_pool.best_with_basefee_and_blobfee(
+                            best_transactions_attributes.basefee,
+                            best_transactions_attributes.blob_fee.unwrap_or_default(),
+                        ))
+                    }
                 }
             }
             Ordering::Greater => {
-                // base fee increased, we only need to enforce this on the pending pool
-                Box::new(self.pending_pool.best_with_basefee_and_blobfee(
-                    best_transactions_attributes.basefee,
-                    best_transactions_attributes.blob_fee.unwrap_or_default(),
-                ))
+                // base fee increased, we need to check how the blob fee moved
+                let new_blob_fee = best_transactions_attributes.blob_fee.unwrap_or_default();
+                match new_blob_fee.cmp(&(self.all_transactions.pending_fees.blob_fee as u64)) {
+                    Ordering::Less => {
+                        // it's possible that this swing unlocked more blob transactions
+                        let unlocked =
+                            self.blob_pool.satisfy_attributes(best_transactions_attributes);
+                        Box::new(self.pending_pool.best_with_unlocked_and_attributes(
+                            unlocked,
+                            best_transactions_attributes.basefee,
+                            new_blob_fee,
+                        ))
+                    }
+                    Ordering::Equal | Ordering::Greater => {
+                        // no additional transactions unlocked
+                        Box::new(self.pending_pool.best_with_basefee_and_blobfee(
+                            best_transactions_attributes.basefee,
+                            new_blob_fee,
+                        ))
+                    }
+                }
             }
             Ordering::Less => {
                 // base fee decreased, we need to move transactions from the basefee + blob pool to
@@ -385,10 +443,11 @@ impl<T: TransactionOrdering> TxPool<T> {
                 // also include blob pool transactions that are now unlocked
                 unlocked.extend(self.blob_pool.satisfy_attributes(best_transactions_attributes));
 
-                Box::new(
-                    self.pending_pool
-                        .best_with_unlocked(unlocked, self.all_transactions.pending_fees.base_fee),
-                )
+                Box::new(self.pending_pool.best_with_unlocked_and_attributes(
+                    unlocked,
+                    best_transactions_attributes.basefee,
+                    best_transactions_attributes.blob_fee.unwrap_or_default(),
+                ))
             }
         }
     }
@@ -402,6 +461,11 @@ impl<T: TransactionOrdering> TxPool<T> {
         &self,
     ) -> impl Iterator<Item = Arc<ValidPoolTransaction<T::Transaction>>> + '_ {
         self.pending_pool.all()
+    }
+
+    /// Returns the number of transactions from the pending sub-pool
+    pub(crate) fn pending_transactions_count(&self) -> usize {
+        self.pending_pool.len()
     }
 
     /// Returns all pending transactions filtered by predicate
@@ -430,6 +494,11 @@ impl<T: TransactionOrdering> TxPool<T> {
         &self,
     ) -> impl Iterator<Item = Arc<ValidPoolTransaction<T::Transaction>>> + '_ {
         self.basefee_pool.all().chain(self.queued_pool.all())
+    }
+
+    /// Returns the number of transactions in parked pools
+    pub(crate) fn queued_transactions_count(&self) -> usize {
+        self.basefee_pool.len() + self.queued_pool.len()
     }
 
     /// Returns queued and pending transactions for the specified sender
@@ -494,6 +563,59 @@ impl<T: TransactionOrdering> TxPool<T> {
         self.all_transactions.txs_iter(sender).map(|(_, tx)| Arc::clone(&tx.transaction)).collect()
     }
 
+    /// Updates only the pending fees without triggering subpool updates.
+    /// Returns the previous base fee and blob fee values.
+    const fn update_pending_fees_only(
+        &mut self,
+        mut new_base_fee: u64,
+        new_blob_fee: Option<u128>,
+    ) -> (u64, u128) {
+        std::mem::swap(&mut self.all_transactions.pending_fees.base_fee, &mut new_base_fee);
+
+        let prev_blob_fee = if let Some(mut blob_fee) = new_blob_fee {
+            std::mem::swap(&mut self.all_transactions.pending_fees.blob_fee, &mut blob_fee);
+            blob_fee
+        } else {
+            self.all_transactions.pending_fees.blob_fee
+        };
+
+        (new_base_fee, prev_blob_fee)
+    }
+
+    /// Applies fee-based promotion updates based on the previous fees.
+    ///
+    /// Records promoted transactions based on fee swings.
+    ///
+    /// Caution: This expects that the fees were previously already updated via
+    /// [`Self::update_pending_fees_only`].
+    fn apply_fee_updates(
+        &mut self,
+        prev_base_fee: u64,
+        prev_blob_fee: u128,
+        outcome: &mut UpdateOutcome<T::Transaction>,
+    ) {
+        let new_base_fee = self.all_transactions.pending_fees.base_fee;
+        let new_blob_fee = self.all_transactions.pending_fees.blob_fee;
+
+        if new_base_fee == prev_base_fee && new_blob_fee == prev_blob_fee {
+            // nothing to update
+            return;
+        }
+
+        // IMPORTANT:
+        // Restore previous fees so that the update fee functions correctly handle fee swings
+        self.all_transactions.pending_fees.base_fee = prev_base_fee;
+        self.all_transactions.pending_fees.blob_fee = prev_blob_fee;
+
+        let base_fee_ordering = self.update_basefee(new_base_fee, |tx| {
+            outcome.promoted.push(tx.clone());
+        });
+
+        self.update_blob_fee(new_blob_fee, base_fee_ordering, |tx| {
+            outcome.promoted.push(tx.clone());
+        });
+    }
+
     /// Updates the transactions for the changed senders.
     pub(crate) fn update_accounts(
         &mut self,
@@ -514,18 +636,17 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Updates the entire pool after a new block was mined.
     ///
-    /// This removes all mined transactions, updates according to the new base fee and rechecks
-    /// sender allowance.
+    /// This removes all mined transactions, updates according to the new base fee and blob fee and
+    /// rechecks sender allowance based on the given changed sender infos.
     pub(crate) fn on_canonical_state_change(
         &mut self,
         block_info: BlockInfo,
         mined_transactions: Vec<TxHash>,
         changed_senders: FxHashMap<SenderId, SenderInfo>,
-        update_kind: PoolUpdateKind,
+        _update_kind: PoolUpdateKind,
     ) -> OnNewCanonicalStateOutcome<T::Transaction> {
         // update block info
         let block_hash = block_info.last_seen_block_hash;
-        self.all_transactions.set_block_info(block_info);
 
         // Remove all transaction that were included in the block
         let mut removed_txs_count = 0;
@@ -538,15 +659,32 @@ impl<T: TransactionOrdering> TxPool<T> {
         // Update removed transactions metric
         self.metrics.removed_transactions.increment(removed_txs_count);
 
-        let UpdateOutcome { promoted, discarded } = self.update_accounts(changed_senders);
+        // Update fees internally first without triggering subpool updates based on fee movements
+        // This must happen before we update the changed so that all account updates use the new fee
+        // values, this way all changed accounts remain unaffected by the fee updates that are
+        // performed in next step and we don't collect promotions twice
+        let (prev_base_fee, prev_blob_fee) =
+            self.update_pending_fees_only(block_info.pending_basefee, block_info.pending_blob_fee);
+
+        // Now update accounts with the new fees already set
+        let mut outcome = self.update_accounts(changed_senders);
+
+        // Apply subpool updates based on fee changes
+        // This will record any additional promotions based on fee movements
+        self.apply_fee_updates(prev_base_fee, prev_blob_fee, &mut outcome);
+
+        // Update the rest of block info (without triggering fee updates again)
+        self.all_transactions.set_block_info(block_info);
 
         self.update_transaction_type_metrics();
         self.metrics.performed_state_updates.increment(1);
 
-        // Update the latest update kind
-        self.latest_update_kind = Some(update_kind);
-
-        OnNewCanonicalStateOutcome { block_hash, mined: mined_transactions, promoted, discarded }
+        OnNewCanonicalStateOutcome {
+            block_hash,
+            mined: mined_transactions,
+            promoted: outcome.promoted,
+            discarded: outcome.discarded,
+        }
     }
 
     /// Update sub-pools size metrics.
@@ -570,6 +708,7 @@ impl<T: TransactionOrdering> TxPool<T> {
         let mut eip1559_count = 0;
         let mut eip4844_count = 0;
         let mut eip7702_count = 0;
+        let mut other_count = 0;
 
         for tx in self.all_transactions.transactions_iter() {
             match tx.transaction.ty() {
@@ -578,7 +717,7 @@ impl<T: TransactionOrdering> TxPool<T> {
                 EIP1559_TX_TYPE_ID => eip1559_count += 1,
                 EIP4844_TX_TYPE_ID => eip4844_count += 1,
                 EIP7702_TX_TYPE_ID => eip7702_count += 1,
-                _ => {} // Ignore other types
+                _ => other_count += 1,
             }
         }
 
@@ -587,42 +726,21 @@ impl<T: TransactionOrdering> TxPool<T> {
         self.metrics.total_eip1559_transactions.set(eip1559_count as f64);
         self.metrics.total_eip4844_transactions.set(eip4844_count as f64);
         self.metrics.total_eip7702_transactions.set(eip7702_count as f64);
+        self.metrics.total_other_transactions.set(other_count as f64);
     }
 
-    /// Adds the transaction into the pool.
-    ///
-    /// This pool consists of four sub-pools: `Queued`, `Pending`, `BaseFee`, and `Blob`.
-    ///
-    /// The `Queued` pool contains transactions with gaps in its dependency tree: It requires
-    /// additional transactions that are note yet present in the pool. And transactions that the
-    /// sender can not afford with the current balance.
-    ///
-    /// The `Pending` pool contains all transactions that have no nonce gaps, and can be afforded by
-    /// the sender. It only contains transactions that are ready to be included in the pending
-    /// block. The pending pool contains all transactions that could be listed currently, but not
-    /// necessarily independently. However, this pool never contains transactions with nonce gaps. A
-    /// transaction is considered `ready` when it has the lowest nonce of all transactions from the
-    /// same sender. Which is equals to the chain nonce of the sender in the pending pool.
-    ///
-    /// The `BaseFee` pool contains transactions that currently can't satisfy the dynamic fee
-    /// requirement. With EIP-1559, transactions can become executable or not without any changes to
-    /// the sender's balance or nonce and instead their `feeCap` determines whether the
-    /// transaction is _currently_ (on the current state) ready or needs to be parked until the
-    /// `feeCap` satisfies the block's `baseFee`.
-    ///
-    /// The `Blob` pool contains _blob_ transactions that currently can't satisfy the dynamic fee
-    /// requirement, or blob fee requirement. Transactions become executable only if the
-    /// transaction `feeCap` is greater than the block's `baseFee` and the `maxBlobFee` is greater
-    /// than the block's `blobFee`.
     pub(crate) fn add_transaction(
         &mut self,
         tx: ValidPoolTransaction<T::Transaction>,
         on_chain_balance: U256,
         on_chain_nonce: u64,
+        on_chain_code_hash: Option<B256>,
     ) -> PoolResult<AddedTransaction<T::Transaction>> {
         if self.contains(tx.hash()) {
             return Err(PoolError::new(*tx.hash(), PoolErrorKind::AlreadyImported))
         }
+
+        self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash)?;
 
         // Update sender info with balance and nonce
         self.sender_info
@@ -631,7 +749,7 @@ impl<T: TransactionOrdering> TxPool<T> {
             .update(on_chain_nonce, on_chain_balance);
 
         match self.all_transactions.insert_tx(tx, on_chain_balance, on_chain_nonce) {
-            Ok(InsertOk { transaction, move_to, replaced_tx, updates, .. }) => {
+            Ok(InsertOk { transaction, move_to, replaced_tx, updates, state }) => {
                 // replace the new tx and remove the replaced in the subpool(s)
                 self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
                 // Update inserted transactions metric
@@ -649,7 +767,14 @@ impl<T: TransactionOrdering> TxPool<T> {
                         replaced,
                     })
                 } else {
-                    AddedTransaction::Parked { transaction, subpool: move_to, replaced }
+                    // Determine the specific queued reason based on the transaction state
+                    let queued_reason = state.determine_queued_reason(move_to);
+                    AddedTransaction::Parked {
+                        transaction,
+                        subpool: move_to,
+                        replaced,
+                        queued_reason,
+                    }
                 };
 
                 // Update size metrics after adding and potentially moving transactions.
@@ -715,16 +840,109 @@ impl<T: TransactionOrdering> TxPool<T> {
         }
     }
 
+    /// Determines if the tx sender is delegated or has a  pending delegation, and if so, ensures
+    /// they have at most one configured amount of in-flight **executable** transactions (default at
+    /// most one), e.g. disallow stacked and nonce-gapped transactions from the account.
+    fn check_delegation_limit(
+        &self,
+        transaction: &ValidPoolTransaction<T::Transaction>,
+        on_chain_nonce: u64,
+        on_chain_code_hash: Option<B256>,
+    ) -> Result<(), PoolError> {
+        // Short circuit if the sender has neither delegation nor pending delegation.
+        if (on_chain_code_hash.is_none() || on_chain_code_hash == Some(KECCAK_EMPTY)) &&
+            !self.all_transactions.auths.contains_key(&transaction.sender_id())
+        {
+            return Ok(())
+        }
+
+        let mut txs_by_sender =
+            self.pending_pool.iter_txs_by_sender(transaction.sender_id()).peekable();
+
+        if txs_by_sender.peek().is_none() {
+            // Transaction with gapped nonce is not supported for delegated accounts
+            // but transaction can arrive out of order if more slots are allowed
+            // by default with a slot limit of 1 this will fail if the transaction's nonce >
+            // on_chain
+            let nonce_gap_distance = transaction.nonce().saturating_sub(on_chain_nonce);
+            if nonce_gap_distance >= self.config.max_inflight_delegated_slot_limit as u64 {
+                return Err(PoolError::new(
+                    *transaction.hash(),
+                    PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
+                        Eip7702PoolTransactionError::OutOfOrderTxFromDelegated,
+                    )),
+                ))
+            }
+            return Ok(())
+        }
+
+        let mut count = 0;
+        for id in txs_by_sender {
+            if id == &transaction.transaction_id {
+                // Transaction replacement is supported
+                return Ok(())
+            }
+            count += 1;
+        }
+
+        if count < self.config.max_inflight_delegated_slot_limit {
+            // account still has an available slot
+            return Ok(())
+        }
+
+        Err(PoolError::new(
+            *transaction.hash(),
+            PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
+                Eip7702PoolTransactionError::InflightTxLimitReached,
+            )),
+        ))
+    }
+
+    /// This verifies that the transaction complies with code authorization
+    /// restrictions brought by EIP-7702 transaction type:
+    /// 1. Any account with a deployed delegation or an in-flight authorization to deploy a
+    ///    delegation will only be allowed a certain amount of transaction slots (default 1) instead
+    ///    of the standard limit. This is due to the possibility of the account being sweeped by an
+    ///    unrelated account.
+    /// 2. In case the pool is tracking a pending / queued transaction from a specific account, at
+    ///    most one in-flight transaction is allowed; any additional delegated transactions from
+    ///    that account will be rejected.
+    fn validate_auth(
+        &self,
+        transaction: &ValidPoolTransaction<T::Transaction>,
+        on_chain_nonce: u64,
+        on_chain_code_hash: Option<B256>,
+    ) -> Result<(), PoolError> {
+        // Ensure in-flight limit for delegated accounts or those with a pending authorization.
+        self.check_delegation_limit(transaction, on_chain_nonce, on_chain_code_hash)?;
+
+        if let Some(authority_list) = &transaction.authority_ids {
+            for sender_id in authority_list {
+                // Ensure authority has at most 1 inflight transaction.
+                if self.all_transactions.txs_iter(*sender_id).nth(1).is_some() {
+                    return Err(PoolError::new(
+                        *transaction.hash(),
+                        PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
+                            Eip7702PoolTransactionError::AuthorityReserved,
+                        )),
+                    ))
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Maintenance task to apply a series of updates.
     ///
     /// This will move/discard the given transaction according to the `PoolUpdate`
     fn process_updates(&mut self, updates: Vec<PoolUpdate>) -> UpdateOutcome<T::Transaction> {
         let mut outcome = UpdateOutcome::default();
-        for PoolUpdate { id, hash, current, destination } in updates {
+        for PoolUpdate { id, current, destination } in updates {
             match destination {
                 Destination::Discard => {
                     // remove the transaction from the pool and subpool
-                    if let Some(tx) = self.prune_transaction_by_hash(&hash) {
+                    if let Some(tx) = self.prune_transaction_by_id(&id) {
                         outcome.discarded.push(tx);
                     }
                     self.metrics.removed_transactions.increment(1);
@@ -732,15 +950,16 @@ impl<T: TransactionOrdering> TxPool<T> {
                 Destination::Pool(move_to) => {
                     debug_assert_ne!(&move_to, &current, "destination must be different");
                     let moved = self.move_transaction(current, move_to, &id);
-                    if matches!(move_to, SubPool::Pending) {
-                        if let Some(tx) = moved {
-                            trace!(target: "txpool", hash=%tx.transaction.hash(), "Promoted transaction to pending");
-                            outcome.promoted.push(tx);
-                        }
+                    if matches!(move_to, SubPool::Pending) &&
+                        let Some(tx) = moved
+                    {
+                        trace!(target: "txpool", hash=%tx.transaction.hash(), "Promoted transaction to pending");
+                        outcome.promoted.push(tx);
                     }
                 }
             }
         }
+
         outcome
     }
 
@@ -816,14 +1035,20 @@ impl<T: TransactionOrdering> TxPool<T> {
         self.remove_from_subpool(pool, tx.id())
     }
 
-    /// Remove the transaction from the entire pool via its hash.
+    /// Remove the transaction from the entire pool via its hash. This includes the total set of
+    /// transactions and the subpool it currently resides in.
     ///
-    /// This includes the total set of transactions and the subpool it currently resides in.
+    /// This treats the descendants as if this transaction is discarded and removing the transaction
+    /// reduces a nonce gap.
     fn remove_transaction_by_hash(
         &mut self,
         tx_hash: &B256,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
         let (tx, pool) = self.all_transactions.remove_transaction_by_hash(tx_hash)?;
+
+        // After a tx is removed, its descendants must become parked due to the nonce gap
+        let updates = self.all_transactions.park_descendant_transactions(tx.id());
+        self.process_updates(updates);
         self.remove_from_subpool(pool, tx.id())
     }
 
@@ -831,13 +1056,25 @@ impl<T: TransactionOrdering> TxPool<T> {
     /// subpool.
     ///
     /// This is intended to be used when a transaction is included in a block,
-    /// [`Self::on_canonical_state_change`]
+    /// [`Self::on_canonical_state_change`]. So its descendants will not change from pending to
+    /// parked, just like what we do in `remove_transaction_by_hash`.
     fn prune_transaction_by_hash(
         &mut self,
         tx_hash: &B256,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
         let (tx, pool) = self.all_transactions.remove_transaction_by_hash(tx_hash)?;
-        self.prune_from_subpool(pool, tx.id())
+        self.remove_from_subpool(pool, tx.id())
+    }
+    /// This removes the transaction from the pool and advances any descendant state inside the
+    /// subpool.
+    ///
+    /// This is intended to be used when we call [`Self::process_updates`].
+    fn prune_transaction_by_id(
+        &mut self,
+        tx_id: &TransactionId,
+    ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
+        let (tx, pool) = self.all_transactions.remove_transaction_by_id(tx_id)?;
+        self.remove_from_subpool(pool, tx.id())
     }
 
     /// Removes the transaction from the given pool.
@@ -860,30 +1097,6 @@ impl<T: TransactionOrdering> TxPool<T> {
             // is generic and it would not be possible to distinguish whether a transaction is
             // being removed from the `BaseFee` pool, or the `Queued` pool.
             trace!(target: "txpool", hash=%tx.transaction.hash(), ?pool, "Removed transaction from a subpool");
-        }
-
-        tx
-    }
-
-    /// Removes the transaction from the given pool and advance sub-pool internal state, with the
-    /// expectation that the given transaction is included in a block.
-    fn prune_from_subpool(
-        &mut self,
-        pool: SubPool,
-        tx: &TransactionId,
-    ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let tx = match pool {
-            SubPool::Pending => self.pending_pool.remove_transaction(tx),
-            SubPool::Queued => self.queued_pool.remove_transaction(tx),
-            SubPool::BaseFee => self.basefee_pool.remove_transaction(tx),
-            SubPool::Blob => self.blob_pool.remove_transaction(tx),
-        };
-
-        if let Some(ref tx) = tx {
-            // We trace here instead of in subpool structs directly, because the `ParkedPool` type
-            // is generic and it would not be possible to distinguish whether a transaction is
-            // being pruned from the `BaseFee` pool, or the `Queued` pool.
-            trace!(target: "txpool", hash=%tx.transaction.hash(), ?pool, "Pruned transaction from a subpool");
         }
 
         tx
@@ -929,8 +1142,12 @@ impl<T: TransactionOrdering> TxPool<T> {
             SubPool::Pending => {
                 self.pending_pool.add_transaction(tx, self.all_transactions.pending_fees.base_fee);
             }
-            SubPool::BaseFee => self.basefee_pool.add_transaction(tx),
-            SubPool::Blob => self.blob_pool.add_transaction(tx),
+            SubPool::BaseFee => {
+                self.basefee_pool.add_transaction(tx);
+            }
+            SubPool::Blob => {
+                self.blob_pool.add_transaction(tx);
+            }
         }
     }
 
@@ -1039,7 +1256,11 @@ impl<T: TransactionOrdering> TxPool<T> {
     pub fn assert_invariants(&self) {
         let size = self.size();
         let actual = size.basefee + size.pending + size.queued + size.blob;
-        assert_eq!(size.total, actual, "total size must be equal to the sum of all sub-pools, basefee:{}, pending:{}, queued:{}, blob:{}", size.basefee, size.pending, size.queued, size.blob);
+        assert_eq!(
+            size.total, actual,
+            "total size must be equal to the sum of all sub-pools, basefee:{}, pending:{}, queued:{}, blob:{}",
+            size.basefee, size.pending, size.queued, size.blob
+        );
         self.all_transactions.assert_invariants();
         self.pending_pool.assert_invariants();
         self.basefee_pool.assert_invariants();
@@ -1063,19 +1284,19 @@ impl<T: TransactionOrdering> Drop for TxPool<T> {
     }
 }
 
-// Additional test impls
-#[cfg(any(test, feature = "test-utils"))]
-#[allow(dead_code)]
 impl<T: TransactionOrdering> TxPool<T> {
-    pub(crate) const fn pending(&self) -> &PendingPool<T> {
+    /// Pending subpool
+    pub const fn pending(&self) -> &PendingPool<T> {
         &self.pending_pool
     }
 
-    pub(crate) const fn base_fee(&self) -> &ParkedPool<BasefeeOrd<T::Transaction>> {
+    /// Base fee subpool
+    pub const fn base_fee(&self) -> &ParkedPool<BasefeeOrd<T::Transaction>> {
         &self.basefee_pool
     }
 
-    pub(crate) const fn queued(&self) -> &ParkedPool<QueuedOrd<T::Transaction>> {
+    /// Queued sub pool
+    pub const fn queued(&self) -> &ParkedPool<QueuedOrd<T::Transaction>> {
         &self.queued_pool
     }
 }
@@ -1115,6 +1336,8 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     price_bumps: PriceBumpConfig,
     /// How to handle [`TransactionOrigin::Local`](crate::TransactionOrigin) transactions.
     local_transactions_config: LocalTransactionConfig,
+    /// All accounts with a pooled authorization
+    auths: FxHashMap<SenderId, HashSet<TxHash>>,
     /// All Transactions metrics
     metrics: AllTransactionsMetrics,
 }
@@ -1133,7 +1356,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
     }
 
     /// Returns an iterator over all _unique_ hashes in the pool
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn hashes_iter(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.by_hash.keys().copied()
     }
@@ -1250,16 +1473,14 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     }
                 };
             }
-            // tracks the balance if the sender was changed in the block
-            let mut changed_balance = None;
 
+            // track the balance if the sender was changed in the block
             // check if this is a changed account
-            if let Some(info) = changed_accounts.get(&id.sender) {
+            let changed_balance = if let Some(info) = changed_accounts.get(&id.sender) {
                 // discard all transactions with a nonce lower than the current state nonce
                 if id.nonce < info.state_nonce {
                     updates.push(PoolUpdate {
                         id: *tx.transaction.id(),
-                        hash: *tx.transaction.hash(),
                         current: tx.subpool,
                         destination: Destination::Discard,
                     });
@@ -1280,8 +1501,10 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     }
                 }
 
-                changed_balance = Some(&info.balance);
-            }
+                Some(&info.balance)
+            } else {
+                None
+            };
 
             // If there's a nonce gap, we can shortcircuit, because there's nothing to update yet.
             if tx.state.has_nonce_gap() {
@@ -1306,7 +1529,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             let mut next_nonce_in_line = tx.transaction.nonce().saturating_add(1);
 
             // Update all consecutive transaction of this sender
-            while let Some((peek, ref mut tx)) = iter.peek_mut() {
+            while let Some((peek, tx)) = iter.peek_mut() {
                 if peek.sender != id.sender {
                     // Found the next sender we need to check
                     continue 'transactions
@@ -1369,7 +1592,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
         if current_pool != tx.subpool {
             updates.push(PoolUpdate {
                 id: *tx.transaction.id(),
-                hash: *tx.transaction.hash(),
                 current: current_pool,
                 destination: tx.subpool.into(),
             })
@@ -1403,7 +1625,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
     /// Returns a mutable iterator over all transactions for the given sender, starting with the
     /// lowest nonce
     #[cfg(test)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn txs_iter_mut(
         &mut self,
         sender: SenderId,
@@ -1452,10 +1674,53 @@ impl<T: PoolTransaction> AllTransactions<T> {
     ) -> Option<(Arc<ValidPoolTransaction<T>>, SubPool)> {
         let tx = self.by_hash.remove(tx_hash)?;
         let internal = self.txs.remove(&tx.transaction_id)?;
+        self.remove_auths(&internal);
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
-        self.update_size_metrics();
         Some((tx, internal.subpool))
+    }
+
+    /// Removes a transaction from the set using its id.
+    ///
+    /// This is intended for processing updates after state changes.
+    pub(crate) fn remove_transaction_by_id(
+        &mut self,
+        tx_id: &TransactionId,
+    ) -> Option<(Arc<ValidPoolTransaction<T>>, SubPool)> {
+        let internal = self.txs.remove(tx_id)?;
+        let tx = self.by_hash.remove(internal.transaction.hash())?;
+        self.remove_auths(&internal);
+        // decrement the counter for the sender.
+        self.tx_decr(tx.sender_id());
+        Some((tx, internal.subpool))
+    }
+
+    /// If a tx is removed (_not_ mined), all descendants are set to parked due to the nonce gap
+    pub(crate) fn park_descendant_transactions(
+        &mut self,
+        tx_id: &TransactionId,
+    ) -> Vec<PoolUpdate> {
+        let mut updates = Vec::new();
+
+        for (id, tx) in self.descendant_txs_mut(tx_id) {
+            let current_pool = tx.subpool;
+
+            tx.state.remove(TxState::NO_NONCE_GAPS);
+
+            // update the pool based on the state.
+            tx.subpool = tx.state.into();
+
+            // check if anything changed.
+            if current_pool != tx.subpool {
+                updates.push(PoolUpdate {
+                    id: *id,
+                    current: current_pool,
+                    destination: tx.subpool.into(),
+                })
+            }
+        }
+
+        updates
     }
 
     /// Removes a transaction from the set.
@@ -1475,9 +1740,26 @@ impl<T: PoolTransaction> AllTransactions<T> {
         let result =
             self.by_hash.remove(internal.transaction.hash()).map(|tx| (tx, internal.subpool));
 
-        self.update_size_metrics();
+        self.remove_auths(&internal);
 
         result
+    }
+
+    /// Removes any pending auths for the given transaction.
+    ///
+    /// This is a noop for non EIP-7702 transactions.
+    fn remove_auths(&mut self, tx: &PoolInternalTransaction<T>) {
+        let Some(auths) = &tx.transaction.authority_ids else { return };
+
+        let tx_hash = tx.transaction.hash();
+        for auth in auths {
+            if let Some(list) = self.auths.get_mut(auth) {
+                list.remove(tx_hash);
+                if list.is_empty() {
+                    self.auths.remove(auth);
+                }
+            }
+        }
     }
 
     /// Checks if the given transaction's type conflicts with an existing transaction.
@@ -1570,18 +1852,18 @@ impl<T: PoolTransaction> AllTransactions<T> {
             // overdraft
             let id = new_blob_tx.transaction_id;
             let mut descendants = self.descendant_txs_inclusive(&id).peekable();
-            if let Some((maybe_replacement, _)) = descendants.peek() {
-                if **maybe_replacement == new_blob_tx.transaction_id {
-                    // replacement transaction
-                    descendants.next();
+            if let Some((maybe_replacement, _)) = descendants.peek() &&
+                **maybe_replacement == new_blob_tx.transaction_id
+            {
+                // replacement transaction
+                descendants.next();
 
-                    // check if any of descendant blob transactions should be shifted into overdraft
-                    for (_, tx) in descendants {
-                        cumulative_cost += tx.transaction.cost();
-                        if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
-                            // the transaction would shift
-                            return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
-                        }
+                // check if any of descendant blob transactions should be shifted into overdraft
+                for (_, tx) in descendants {
+                    cumulative_cost += tx.transaction.cost();
+                    if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
+                        // the transaction would shift
+                        return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
                     }
                 }
             }
@@ -1718,8 +2000,18 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 let replaced = entry.insert(pool_tx);
                 self.by_hash.remove(replaced.transaction.hash());
                 self.by_hash.insert(new_hash, new_transaction);
+
+                self.remove_auths(&replaced);
+
                 // also remove the hash
                 replaced_tx = Some((replaced.transaction, replaced.subpool));
+            }
+        }
+
+        if let Some(auths) = &transaction.authority_ids {
+            let tx_hash = transaction.hash();
+            for auth in auths {
+                self.auths.entry(*auth).or_default().insert(*tx_hash);
             }
         }
 
@@ -1779,7 +2071,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     if current_pool != tx.subpool {
                         updates.push(PoolUpdate {
                             id: *id,
-                            hash: *tx.transaction.hash(),
                             current: current_pool,
                             destination: tx.subpool.into(),
                         })
@@ -1815,6 +2106,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn assert_invariants(&self) {
         assert_eq!(self.by_hash.len(), self.txs.len(), "by_hash.len() != txs.len()");
+        assert!(self.auths.len() <= self.txs.len(), "auths.len() > txs.len()");
     }
 }
 
@@ -1842,6 +2134,7 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
             pending_fees: Default::default(),
             price_bumps: Default::default(),
             local_transactions_config: Default::default(),
+            auths: Default::default(),
             metrics: Default::default(),
         }
     }
@@ -1871,7 +2164,7 @@ pub(crate) enum InsertErr<T: PoolTransaction> {
     /// Attempted to replace existing transaction, but was underpriced
     Underpriced {
         transaction: Arc<ValidPoolTransaction<T>>,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         existing: TxHash,
     },
     /// Attempted to insert a blob transaction with a nonce gap
@@ -1905,7 +2198,6 @@ pub(crate) struct InsertOk<T: PoolTransaction> {
     /// Where to move the transaction to.
     move_to: SubPool,
     /// Current state of the inserted tx.
-    #[allow(dead_code)]
     state: TxState,
     /// The transaction that was replaced by this.
     replaced_tx: Option<(Arc<ValidPoolTransaction<T>>, SubPool)>,
@@ -1939,21 +2231,6 @@ impl<T: PoolTransaction> PoolInternalTransaction<T> {
     }
 }
 
-/// Tracks the result after updating the pool
-#[derive(Debug)]
-pub(crate) struct UpdateOutcome<T: PoolTransaction> {
-    /// transactions promoted to the pending pool
-    pub(crate) promoted: Vec<Arc<ValidPoolTransaction<T>>>,
-    /// transaction that failed and were discarded
-    pub(crate) discarded: Vec<Arc<ValidPoolTransaction<T>>>,
-}
-
-impl<T: PoolTransaction> Default for UpdateOutcome<T> {
-    fn default() -> Self {
-        Self { promoted: vec![], discarded: vec![] }
-    }
-}
-
 /// Stores relevant context about a sender.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SenderInfo {
@@ -1967,7 +2244,7 @@ pub(crate) struct SenderInfo {
 
 impl SenderInfo {
     /// Updates the info with the new values.
-    fn update(&mut self, state_nonce: u64, balance: U256) {
+    const fn update(&mut self, state_nonce: u64, balance: U256) {
         *self = Self { state_nonce, balance };
     }
 }
@@ -1980,9 +2257,8 @@ mod tests {
         traits::TransactionOrigin,
         SubPoolLimit,
     };
-    use alloy_consensus::Transaction;
+    use alloy_consensus::{Transaction, TxType};
     use alloy_primitives::address;
-    use reth_primitives::TxType;
 
     #[test]
     fn test_insert_blob() {
@@ -2068,7 +2344,7 @@ mod tests {
 
         let validated = f.validated(tx.clone());
         let id = *validated.id();
-        pool.add_transaction(validated, on_chain_balance, on_chain_nonce).unwrap();
+        pool.add_transaction(validated, on_chain_balance, on_chain_nonce, None).unwrap();
 
         // assert pool lengths
         assert!(pool.blob_pool.is_empty());
@@ -2108,7 +2384,7 @@ mod tests {
 
         let validated = f.validated(tx.clone());
         let id = *validated.id();
-        pool.add_transaction(validated, on_chain_balance, on_chain_nonce).unwrap();
+        pool.add_transaction(validated, on_chain_balance, on_chain_nonce, None).unwrap();
 
         // assert pool lengths
         assert!(pool.pending_pool.is_empty());
@@ -2311,7 +2587,7 @@ mod tests {
 
             let validated = f.validated(tx.clone());
             let id = *validated.id();
-            pool.add_transaction(validated, on_chain_balance, on_chain_nonce).unwrap();
+            pool.add_transaction(validated, on_chain_balance, on_chain_nonce, None).unwrap();
 
             // assert pool lengths
             promotion_test.assert_single_tx_starting_subpool(&pool);
@@ -2406,6 +2682,239 @@ mod tests {
     }
 
     #[test]
+    // Test that on_canonical_state_change doesn't double-process transactions
+    // when both fee and account updates would affect the same transaction
+    fn test_on_canonical_state_change_no_double_processing() {
+        let mut tx_factory = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Setup: Create a sender with a transaction in basefee pool
+        let tx = MockTransaction::eip1559().with_gas_price(50).with_gas_limit(30_000);
+        let sender = tx.sender();
+
+        // Set high base fee initially
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        let validated = tx_factory.validated(tx);
+        pool.add_transaction(validated, U256::from(10_000_000), 0, None).unwrap();
+
+        // Get sender_id after the transaction has been added
+        let sender_id = tx_factory.ids.sender_id(&sender).unwrap();
+
+        assert_eq!(pool.basefee_pool.len(), 1);
+        assert_eq!(pool.pending_pool.len(), 0);
+
+        // Now simulate a canonical state change with:
+        // 1. Lower base fee (would promote tx)
+        // 2. Account balance update (would also evaluate tx)
+        block_info.pending_basefee = 40;
+
+        let mut changed_senders = FxHashMap::default();
+        changed_senders.insert(
+            sender_id,
+            SenderInfo {
+                state_nonce: 0,
+                balance: U256::from(20_000_000), // Increased balance
+            },
+        );
+
+        let outcome = pool.on_canonical_state_change(
+            block_info,
+            vec![], // no mined transactions
+            changed_senders,
+            PoolUpdateKind::Commit,
+        );
+
+        // Transaction should be promoted exactly once
+        assert_eq!(pool.pending_pool.len(), 1, "Transaction should be in pending pool");
+        assert_eq!(pool.basefee_pool.len(), 0, "Transaction should not be in basefee pool");
+        assert_eq!(outcome.promoted.len(), 1, "Should report exactly one promotion");
+    }
+
+    #[test]
+    // Regression test: ensure we don't double-count promotions when base fee
+    // decreases and account is updated. This test would fail before the fix.
+    fn test_canonical_state_change_with_basefee_update_regression() {
+        let mut tx_factory = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Create transactions from different senders to test independently
+        let sender_balance = U256::from(100_000_000);
+
+        // Sender 1: tx will be promoted (gas price 60 > new base fee 50)
+        let tx1 =
+            MockTransaction::eip1559().with_gas_price(60).with_gas_limit(21_000).with_nonce(0);
+        let sender1 = tx1.sender();
+
+        // Sender 2: tx will be promoted (gas price 55 > new base fee 50)
+        let tx2 =
+            MockTransaction::eip1559().with_gas_price(55).with_gas_limit(21_000).with_nonce(0);
+        let sender2 = tx2.sender();
+
+        // Sender 3: tx will NOT be promoted (gas price 45 < new base fee 50)
+        let tx3 =
+            MockTransaction::eip1559().with_gas_price(45).with_gas_limit(21_000).with_nonce(0);
+        let sender3 = tx3.sender();
+
+        // Set high initial base fee (all txs will go to basefee pool)
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 70;
+        pool.set_block_info(block_info);
+
+        // Add all transactions
+        let validated1 = tx_factory.validated(tx1);
+        let validated2 = tx_factory.validated(tx2);
+        let validated3 = tx_factory.validated(tx3);
+
+        pool.add_transaction(validated1, sender_balance, 0, None).unwrap();
+        pool.add_transaction(validated2, sender_balance, 0, None).unwrap();
+        pool.add_transaction(validated3, sender_balance, 0, None).unwrap();
+
+        let sender1_id = tx_factory.ids.sender_id(&sender1).unwrap();
+        let sender2_id = tx_factory.ids.sender_id(&sender2).unwrap();
+        let sender3_id = tx_factory.ids.sender_id(&sender3).unwrap();
+
+        // All should be in basefee pool initially
+        assert_eq!(pool.basefee_pool.len(), 3, "All txs should be in basefee pool");
+        assert_eq!(pool.pending_pool.len(), 0, "No txs should be in pending pool");
+
+        // Now decrease base fee to 50 - this should promote tx1 and tx2 (prices 60 and 55)
+        // but not tx3 (price 45)
+        block_info.pending_basefee = 50;
+
+        // Update all senders' balances (simulating account state changes)
+        let mut changed_senders = FxHashMap::default();
+        changed_senders.insert(
+            sender1_id,
+            SenderInfo { state_nonce: 0, balance: sender_balance + U256::from(1000) },
+        );
+        changed_senders.insert(
+            sender2_id,
+            SenderInfo { state_nonce: 0, balance: sender_balance + U256::from(1000) },
+        );
+        changed_senders.insert(
+            sender3_id,
+            SenderInfo { state_nonce: 0, balance: sender_balance + U256::from(1000) },
+        );
+
+        let outcome = pool.on_canonical_state_change(
+            block_info,
+            vec![],
+            changed_senders,
+            PoolUpdateKind::Commit,
+        );
+
+        // Check final state
+        assert_eq!(pool.pending_pool.len(), 2, "tx1 and tx2 should be promoted");
+        assert_eq!(pool.basefee_pool.len(), 1, "tx3 should remain in basefee");
+
+        // CRITICAL: Should report exactly 2 promotions, not 4 (which would happen with
+        // double-processing)
+        assert_eq!(
+            outcome.promoted.len(),
+            2,
+            "Should report exactly 2 promotions, not double-counted"
+        );
+
+        // Verify the correct transactions were promoted
+        let promoted_prices: Vec<u128> =
+            outcome.promoted.iter().map(|tx| tx.max_fee_per_gas()).collect();
+        assert!(promoted_prices.contains(&60));
+        assert!(promoted_prices.contains(&55));
+    }
+
+    #[test]
+    fn test_basefee_decrease_with_empty_senders() {
+        // Test that fee promotions still occur when basefee decreases
+        // even with no changed_senders
+        let mut tx_factory = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Create transaction that will be promoted when fee drops
+        let tx = MockTransaction::eip1559().with_gas_price(60).with_gas_limit(21_000);
+
+        // Set high initial base fee
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        // Add transaction - should go to basefee pool
+        let validated = tx_factory.validated(tx);
+        pool.add_transaction(validated, U256::from(10_000_000), 0, None).unwrap();
+
+        assert_eq!(pool.basefee_pool.len(), 1);
+        assert_eq!(pool.pending_pool.len(), 0);
+
+        // Decrease base fee with NO changed senders
+        block_info.pending_basefee = 50;
+        let outcome = pool.on_canonical_state_change(
+            block_info,
+            vec![],
+            FxHashMap::default(), // Empty changed_senders!
+            PoolUpdateKind::Commit,
+        );
+
+        // Transaction should still be promoted by fee-driven logic
+        assert_eq!(pool.pending_pool.len(), 1, "Fee decrease should promote tx");
+        assert_eq!(pool.basefee_pool.len(), 0);
+        assert_eq!(outcome.promoted.len(), 1, "Should report promotion from fee update");
+    }
+
+    #[test]
+    fn test_basefee_decrease_account_makes_unfundable() {
+        // Test that when basefee decreases but account update makes tx unfundable,
+        // we don't get transient promote-then-discard double counting
+        let mut tx_factory = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let tx = MockTransaction::eip1559().with_gas_price(60).with_gas_limit(21_000);
+        let sender = tx.sender();
+
+        // High initial base fee
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        let validated = tx_factory.validated(tx);
+        pool.add_transaction(validated, U256::from(10_000_000), 0, None).unwrap();
+        let sender_id = tx_factory.ids.sender_id(&sender).unwrap();
+
+        assert_eq!(pool.basefee_pool.len(), 1);
+
+        // Decrease base fee (would normally promote) but also drain account
+        block_info.pending_basefee = 50;
+        let mut changed_senders = FxHashMap::default();
+        changed_senders.insert(
+            sender_id,
+            SenderInfo {
+                state_nonce: 0,
+                balance: U256::from(100), // Too low to pay for gas!
+            },
+        );
+
+        let outcome = pool.on_canonical_state_change(
+            block_info,
+            vec![],
+            changed_senders,
+            PoolUpdateKind::Commit,
+        );
+
+        // With insufficient balance, transaction goes to queued pool
+        assert_eq!(pool.pending_pool.len(), 0, "Unfunded tx should not be in pending");
+        assert_eq!(pool.basefee_pool.len(), 0, "Tx no longer in basefee pool");
+        assert_eq!(pool.queued_pool.len(), 1, "Unfunded tx should be in queued pool");
+
+        // Transaction is not removed, just moved to queued
+        let tx_count = pool.all_transactions.txs.len();
+        assert_eq!(tx_count, 1, "Transaction should still be in pool (in queued)");
+
+        assert_eq!(outcome.promoted.len(), 0, "Should not report promotion");
+        assert_eq!(outcome.discarded.len(), 0, "Queued tx is not reported as discarded");
+    }
+
+    #[test]
     fn insert_already_imported() {
         let on_chain_balance = U256::ZERO;
         let on_chain_nonce = 0;
@@ -2413,8 +2922,8 @@ mod tests {
         let mut pool = TxPool::new(MockOrdering::default(), Default::default());
         let tx = MockTransaction::eip1559().inc_price().inc_limit();
         let tx = f.validated(tx);
-        pool.add_transaction(tx.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        match pool.add_transaction(tx, on_chain_balance, on_chain_nonce).unwrap_err().kind {
+        pool.add_transaction(tx.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        match pool.add_transaction(tx, on_chain_balance, on_chain_nonce, None).unwrap_err().kind {
             PoolErrorKind::AlreadyImported => {}
             _ => unreachable!(),
         }
@@ -2451,10 +2960,12 @@ mod tests {
 
         let tx = MockTransaction::eip1559().inc_price().inc_limit();
         let first = f.validated(tx.clone());
-        let first_added = pool.add_transaction(first, on_chain_balance, on_chain_nonce).unwrap();
+        let first_added =
+            pool.add_transaction(first, on_chain_balance, on_chain_nonce, None).unwrap();
         let replacement = f.validated(tx.rng_hash().inc_price());
-        let replacement_added =
-            pool.add_transaction(replacement.clone(), on_chain_balance, on_chain_nonce).unwrap();
+        let replacement_added = pool
+            .add_transaction(replacement.clone(), on_chain_balance, on_chain_nonce, None)
+            .unwrap();
 
         // // ensure replaced tx removed
         assert!(!pool.contains(first_added.hash()));
@@ -2746,11 +3257,11 @@ mod tests {
         let tx = MockTransaction::eip1559().inc_price_by(10);
         let validated = f.validated(tx.clone());
         let id = *validated.id();
-        pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+        pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
         assert_eq!(pool.pending_pool.len(), 1);
 
-        pool.update_basefee((tx.max_fee_per_gas() + 1) as u64);
+        pool.update_basefee((tx.max_fee_per_gas() + 1) as u64, |_| {});
 
         assert!(pool.pending_pool.is_empty());
         assert_eq!(pool.basefee_pool.len(), 1);
@@ -2766,7 +3277,7 @@ mod tests {
         let tx = MockTransaction::eip1559().inc_price_by(10);
         let validated = f.validated(tx.clone());
         let id = *validated.id();
-        pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+        pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
         assert_eq!(pool.pending_pool.len(), 1);
 
@@ -2782,6 +3293,261 @@ mod tests {
     }
 
     #[test]
+    fn basefee_decrease_promotes_affordable_and_keeps_unaffordable() {
+        use alloy_primitives::address;
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Create transactions that will be in basefee pool (can't afford initial high fee)
+        // Use different senders to avoid nonce gap issues
+        let sender_a = address!("0x000000000000000000000000000000000000000a");
+        let sender_b = address!("0x000000000000000000000000000000000000000b");
+        let sender_c = address!("0x000000000000000000000000000000000000000c");
+
+        let tx1 = MockTransaction::eip1559()
+            .set_sender(sender_a)
+            .set_nonce(0)
+            .set_max_fee(500)
+            .inc_limit();
+        let tx2 = MockTransaction::eip1559()
+            .set_sender(sender_b)
+            .set_nonce(0)
+            .set_max_fee(600)
+            .inc_limit();
+        let tx3 = MockTransaction::eip1559()
+            .set_sender(sender_c)
+            .set_nonce(0)
+            .set_max_fee(400)
+            .inc_limit();
+
+        // Set high initial basefee so transactions go to basefee pool
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 700;
+        pool.set_block_info(block_info);
+
+        let validated1 = f.validated(tx1);
+        let validated2 = f.validated(tx2);
+        let validated3 = f.validated(tx3);
+        let id1 = *validated1.id();
+        let id2 = *validated2.id();
+        let id3 = *validated3.id();
+
+        // Add transactions - they should go to basefee pool due to high basefee
+        // All transactions have nonce 0 from different senders, so on_chain_nonce should be 0 for
+        // all
+        pool.add_transaction(validated1, U256::from(10_000), 0, None).unwrap();
+        pool.add_transaction(validated2, U256::from(10_000), 0, None).unwrap();
+        pool.add_transaction(validated3, U256::from(10_000), 0, None).unwrap();
+
+        // Debug: Check where transactions ended up
+        println!("Basefee pool len: {}", pool.basefee_pool.len());
+        println!("Pending pool len: {}", pool.pending_pool.len());
+        println!("tx1 subpool: {:?}", pool.all_transactions.txs.get(&id1).unwrap().subpool);
+        println!("tx2 subpool: {:?}", pool.all_transactions.txs.get(&id2).unwrap().subpool);
+        println!("tx3 subpool: {:?}", pool.all_transactions.txs.get(&id3).unwrap().subpool);
+
+        // Verify they're in basefee pool
+        assert_eq!(pool.basefee_pool.len(), 3);
+        assert_eq!(pool.pending_pool.len(), 0);
+        assert_eq!(pool.all_transactions.txs.get(&id1).unwrap().subpool, SubPool::BaseFee);
+        assert_eq!(pool.all_transactions.txs.get(&id2).unwrap().subpool, SubPool::BaseFee);
+        assert_eq!(pool.all_transactions.txs.get(&id3).unwrap().subpool, SubPool::BaseFee);
+
+        // Now decrease basefee to trigger the zero-allocation optimization
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = 450; // tx1 (500) and tx2 (600) can now afford it, tx3 (400) cannot
+        pool.set_block_info(block_info);
+
+        // Verify the optimization worked correctly:
+        // - tx1 and tx2 should be promoted to pending (mathematical certainty)
+        // - tx3 should remain in basefee pool
+        // - All state transitions should be correct
+        assert_eq!(pool.basefee_pool.len(), 1);
+        assert_eq!(pool.pending_pool.len(), 2);
+
+        // tx3 should still be in basefee pool (fee 400 < basefee 450)
+        assert_eq!(pool.all_transactions.txs.get(&id3).unwrap().subpool, SubPool::BaseFee);
+
+        // tx1 and tx2 should be in pending pool with correct state bits
+        let tx1_meta = pool.all_transactions.txs.get(&id1).unwrap();
+        let tx2_meta = pool.all_transactions.txs.get(&id2).unwrap();
+        assert_eq!(tx1_meta.subpool, SubPool::Pending);
+        assert_eq!(tx2_meta.subpool, SubPool::Pending);
+        assert!(tx1_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+        assert!(tx2_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+
+        // Verify that best_transactions returns the promoted transactions
+        let best: Vec<_> = pool.best_transactions().take(3).collect();
+        assert_eq!(best.len(), 2); // Only tx1 and tx2 should be returned
+        assert!(best.iter().any(|tx| tx.id() == &id1));
+        assert!(best.iter().any(|tx| tx.id() == &id2));
+    }
+
+    #[test]
+    fn apply_fee_updates_records_promotions_after_basefee_drop() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let tx = MockTransaction::eip1559()
+            .with_gas_limit(21_000)
+            .with_max_fee(500)
+            .with_priority_fee(1);
+        let validated = f.validated(tx);
+        let id = *validated.id();
+        pool.add_transaction(validated, U256::from(1_000_000), 0, None).unwrap();
+
+        assert_eq!(pool.pending_pool.len(), 1);
+
+        // Raise base fee beyond the transaction's cap so it gets parked in BaseFee pool.
+        pool.update_basefee(600, |_| {});
+        assert!(pool.pending_pool.is_empty());
+        assert_eq!(pool.basefee_pool.len(), 1);
+
+        let prev_base_fee = 600;
+        let prev_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        // Simulate the canonical state path updating pending fees before applying promotions.
+        pool.all_transactions.pending_fees.base_fee = 400;
+
+        let mut outcome = UpdateOutcome::default();
+        pool.apply_fee_updates(prev_base_fee, prev_blob_fee, &mut outcome);
+
+        assert_eq!(pool.pending_pool.len(), 1);
+        assert!(pool.basefee_pool.is_empty());
+        assert_eq!(outcome.promoted.len(), 1);
+        assert_eq!(outcome.promoted[0].id(), &id);
+        assert_eq!(pool.all_transactions.pending_fees.base_fee, 400);
+        assert_eq!(pool.all_transactions.pending_fees.blob_fee, prev_blob_fee);
+
+        let tx_meta = pool.all_transactions.txs.get(&id).unwrap();
+        assert_eq!(tx_meta.subpool, SubPool::Pending);
+        assert!(tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+    }
+
+    #[test]
+    fn apply_fee_updates_records_promotions_after_blob_fee_drop() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let initial_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        let tx = MockTransaction::eip4844().with_blob_fee(initial_blob_fee + 100);
+        let validated = f.validated(tx.clone());
+        let id = *validated.id();
+        pool.add_transaction(validated, U256::from(1_000_000), 0, None).unwrap();
+
+        assert_eq!(pool.pending_pool.len(), 1);
+
+        // Raise blob fee beyond the transaction's cap so it gets parked in Blob pool.
+        let increased_blob_fee = tx.max_fee_per_blob_gas().unwrap() + 200;
+        pool.update_blob_fee(increased_blob_fee, Ordering::Equal, |_| {});
+        assert!(pool.pending_pool.is_empty());
+        assert_eq!(pool.blob_pool.len(), 1);
+
+        let prev_base_fee = pool.all_transactions.pending_fees.base_fee;
+        let prev_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        // Simulate the canonical state path updating pending fees before applying promotions.
+        pool.all_transactions.pending_fees.blob_fee = tx.max_fee_per_blob_gas().unwrap();
+
+        let mut outcome = UpdateOutcome::default();
+        pool.apply_fee_updates(prev_base_fee, prev_blob_fee, &mut outcome);
+
+        assert_eq!(pool.pending_pool.len(), 1);
+        assert!(pool.blob_pool.is_empty());
+        assert_eq!(outcome.promoted.len(), 1);
+        assert_eq!(outcome.promoted[0].id(), &id);
+        assert_eq!(pool.all_transactions.pending_fees.base_fee, prev_base_fee);
+        assert_eq!(pool.all_transactions.pending_fees.blob_fee, tx.max_fee_per_blob_gas().unwrap());
+
+        let tx_meta = pool.all_transactions.txs.get(&id).unwrap();
+        assert_eq!(tx_meta.subpool, SubPool::Pending);
+        assert!(tx_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
+        assert!(tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+    }
+
+    #[test]
+    fn apply_fee_updates_promotes_blob_after_basefee_drop() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let initial_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        let tx = MockTransaction::eip4844()
+            .with_max_fee(500)
+            .with_priority_fee(1)
+            .with_blob_fee(initial_blob_fee + 100);
+        let validated = f.validated(tx);
+        let id = *validated.id();
+        pool.add_transaction(validated, U256::from(1_000_000), 0, None).unwrap();
+
+        assert_eq!(pool.pending_pool.len(), 1);
+
+        // Raise base fee beyond the transaction's cap so it gets parked in Blob pool.
+        let high_base_fee = 600;
+        pool.update_basefee(high_base_fee, |_| {});
+        assert!(pool.pending_pool.is_empty());
+        assert_eq!(pool.blob_pool.len(), 1);
+
+        let prev_base_fee = high_base_fee;
+        let prev_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        // Simulate applying a lower base fee while keeping blob fee unchanged.
+        pool.all_transactions.pending_fees.base_fee = 400;
+
+        let mut outcome = UpdateOutcome::default();
+        pool.apply_fee_updates(prev_base_fee, prev_blob_fee, &mut outcome);
+
+        assert_eq!(pool.pending_pool.len(), 1);
+        assert!(pool.blob_pool.is_empty());
+        assert_eq!(outcome.promoted.len(), 1);
+        assert_eq!(outcome.promoted[0].id(), &id);
+        assert_eq!(pool.all_transactions.pending_fees.base_fee, 400);
+        assert_eq!(pool.all_transactions.pending_fees.blob_fee, prev_blob_fee);
+
+        let tx_meta = pool.all_transactions.txs.get(&id).unwrap();
+        assert_eq!(tx_meta.subpool, SubPool::Pending);
+        assert!(tx_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
+        assert!(tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+    }
+
+    #[test]
+    fn apply_fee_updates_demotes_after_basefee_rise() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let tx = MockTransaction::eip1559()
+            .with_gas_limit(21_000)
+            .with_max_fee(400)
+            .with_priority_fee(1);
+        let validated = f.validated(tx);
+        let id = *validated.id();
+        pool.add_transaction(validated, U256::from(1_000_000), 0, None).unwrap();
+
+        assert_eq!(pool.pending_pool.len(), 1);
+
+        let prev_base_fee = pool.all_transactions.pending_fees.base_fee;
+        let prev_blob_fee = pool.all_transactions.pending_fees.blob_fee;
+
+        // Simulate canonical path raising the base fee beyond the transaction's cap.
+        let new_base_fee = prev_base_fee + 1_000;
+        pool.all_transactions.pending_fees.base_fee = new_base_fee;
+
+        let mut outcome = UpdateOutcome::default();
+        pool.apply_fee_updates(prev_base_fee, prev_blob_fee, &mut outcome);
+
+        assert!(pool.pending_pool.is_empty());
+        assert_eq!(pool.basefee_pool.len(), 1);
+        assert!(outcome.promoted.is_empty());
+        assert_eq!(pool.all_transactions.pending_fees.base_fee, new_base_fee);
+        assert_eq!(pool.all_transactions.pending_fees.blob_fee, prev_blob_fee);
+
+        let tx_meta = pool.all_transactions.txs.get(&id).unwrap();
+        assert_eq!(tx_meta.subpool, SubPool::BaseFee);
+        assert!(!tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK));
+    }
+
+    #[test]
     fn get_highest_transaction_by_sender_and_nonce() {
         // Set up a mock transaction factory and a new transaction pool.
         let mut f = MockTransactionFactory::default();
@@ -2789,14 +3555,14 @@ mod tests {
 
         // Create a mock transaction and add it to the pool.
         let tx = MockTransaction::eip1559();
-        pool.add_transaction(f.validated(tx.clone()), U256::from(1_000), 0).unwrap();
+        pool.add_transaction(f.validated(tx.clone()), U256::from(1_000), 0, None).unwrap();
 
         // Create another mock transaction with an incremented price.
         let tx1 = tx.inc_price().next();
 
         // Validate the second mock transaction and add it to the pool.
         let tx1_validated = f.validated(tx1.clone());
-        pool.add_transaction(tx1_validated, U256::from(1_000), 0).unwrap();
+        pool.add_transaction(tx1_validated, U256::from(1_000), 0, None).unwrap();
 
         // Ensure that the calculated next nonce for the sender matches the expected value.
         assert_eq!(
@@ -2828,7 +3594,7 @@ mod tests {
             mock_tx.set_nonce(nonce);
 
             let validated_tx = f.validated(mock_tx);
-            pool.add_transaction(validated_tx, U256::from(1000), 0).unwrap();
+            pool.add_transaction(validated_tx, U256::from(1000), 0, None).unwrap();
         }
 
         // Get last consecutive transaction
@@ -2862,11 +3628,11 @@ mod tests {
         let tx = MockTransaction::eip1559().inc_price_by(10);
         let validated = f.validated(tx.clone());
         let id = *validated.id();
-        pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+        pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
         let next = tx.next();
         let validated = f.validated(next.clone());
-        pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+        pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
         assert_eq!(pool.pending_pool.len(), 2);
 
@@ -2892,7 +3658,7 @@ mod tests {
 
         // create a chain of transactions by sender A
         // make sure they are all one over half the limit
-        let a_sender = address!("000000000000000000000000000000000000000a");
+        let a_sender = address!("0x000000000000000000000000000000000000000a");
 
         // set the base fee of the pool
         let mut block_info = pool.block_info();
@@ -2914,7 +3680,7 @@ mod tests {
 
         // add all the transactions to the parked pool
         for tx in a_txs {
-            pool.add_transaction(f.validated(tx), U256::from(1_000), 0).unwrap();
+            pool.add_transaction(f.validated(tx), U256::from(1_000), 0, None).unwrap();
         }
 
         // truncate the pool, it should remove at least one transaction
@@ -2934,11 +3700,11 @@ mod tests {
 
         // create a chain of transactions by sender A
         // make sure they are all one over half the limit
-        let a_sender = address!("000000000000000000000000000000000000000a");
+        let a_sender = address!("0x000000000000000000000000000000000000000a");
 
         // set the base fee of the pool
         let pool_base_fee = 100;
-        pool.update_basefee(pool_base_fee);
+        pool.update_basefee(pool_base_fee, |_| {});
 
         // 2 txs, that should put the pool over the size limit but not max txs
         let a_txs = MockTransactionSet::dependent(a_sender, 0, 3, TxType::Eip1559)
@@ -2952,7 +3718,7 @@ mod tests {
 
         // add all the transactions to the parked pool
         for tx in a_txs {
-            pool.add_transaction(f.validated(tx), U256::from(1_000), 0).unwrap();
+            pool.add_transaction(f.validated(tx), U256::from(1_000), 0, None).unwrap();
         }
 
         // truncate the pool, it should remove at least one transaction
@@ -2972,7 +3738,7 @@ mod tests {
             let tx = MockTransaction::eip1559().inc_price_by(10).inc_nonce();
             let validated = f.validated(tx.clone());
             let _id = *validated.id();
-            pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+            pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
         }
 
         let size = pool.size();
@@ -2982,7 +3748,7 @@ mod tests {
             let tx = MockTransaction::eip1559().inc_price_by(10).inc_nonce();
             let validated = f.validated(tx.clone());
             let _id = *validated.id();
-            pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+            pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
             pool.discard_worst();
             pool.assert_invariants();
@@ -3002,7 +3768,7 @@ mod tests {
             let tx = MockTransaction::eip4844().inc_price_by(100).with_blob_fee(100);
             let validated = f.validated(tx.clone());
             let _id = *validated.id();
-            pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+            pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
         }
 
         let size = pool.size();
@@ -3012,12 +3778,57 @@ mod tests {
             let tx = MockTransaction::eip4844().inc_price_by(100).with_blob_fee(100);
             let validated = f.validated(tx.clone());
             let _id = *validated.id();
-            pool.add_transaction(validated, U256::from(1_000), 0).unwrap();
+            pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
             pool.discard_worst();
             pool.assert_invariants();
             assert!(pool.size().blob <= blob_limit.max_txs);
         }
+    }
+
+    #[test]
+    fn account_updates_sender_balance() {
+        let mut on_chain_balance = U256::from(100);
+        let on_chain_nonce = 0;
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let tx_0 = MockTransaction::eip1559().set_gas_price(100).inc_limit();
+        let tx_1 = tx_0.next();
+        let tx_2 = tx_1.next();
+
+        // Create 3 transactions
+        let v0 = f.validated(tx_0);
+        let v1 = f.validated(tx_1);
+        let v2 = f.validated(tx_2);
+
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce, None).unwrap();
+
+        // The sender does not have enough balance to put all txs into pending.
+        assert_eq!(1, pool.pending_transactions().len());
+        assert_eq!(2, pool.queued_transactions().len());
+
+        // Simulate new block arrival - and chain balance increase.
+        let mut updated_accounts = HashMap::default();
+        on_chain_balance = U256::from(300);
+        updated_accounts.insert(
+            v0.sender_id(),
+            SenderInfo { state_nonce: on_chain_nonce, balance: on_chain_balance },
+        );
+        pool.update_accounts(updated_accounts.clone());
+
+        assert_eq!(3, pool.pending_transactions().len());
+        assert!(pool.queued_transactions().is_empty());
+
+        // Simulate new block arrival - and chain balance decrease.
+        updated_accounts.entry(v0.sender_id()).and_modify(|v| v.balance = U256::from(1));
+        pool.update_accounts(updated_accounts);
+
+        assert!(pool.pending_transactions().is_empty());
+        assert_eq!(3, pool.queued_transactions().len());
     }
 
     #[test]
@@ -3031,27 +3842,28 @@ mod tests {
         let tx_1 = tx_0.next();
         let tx_2 = tx_1.next();
 
-        // Create 4 transactions
+        // Create 3 transactions
         let v0 = f.validated(tx_0);
         let v1 = f.validated(tx_1);
         let v2 = f.validated(tx_2);
 
         // Add first 2 to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert!(pool.queued_transactions().is_empty());
         assert_eq!(2, pool.pending_transactions().len());
 
-        // Remove first (nonce 0) - simulating that it was taken to be a part of the block.
-        pool.prune_transaction_by_hash(v0.hash());
+        // Remove first (nonce 0)
+        pool.remove_transaction_by_hash(v0.hash());
 
         // Now add transaction with nonce 2
-        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce).unwrap();
+        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce, None).unwrap();
 
-        // v2 is in the queue now. v1 is still in 'pending'.
-        assert_eq!(1, pool.queued_transactions().len());
-        assert_eq!(1, pool.pending_transactions().len());
+        // v1 and v2 should both be in the queue now.
+        assert_eq!(2, pool.queued_transactions().len());
+        assert!(pool.pending_transactions().is_empty());
 
         // Simulate new block arrival - and chain nonce increasing.
         let mut updated_accounts = HashMap::default();
@@ -3081,8 +3893,10 @@ mod tests {
         let v1 = f.validated(tx_1);
 
         // Add them to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(2, pool.pending_transactions().len());
@@ -3112,20 +3926,66 @@ mod tests {
         let v3 = f.validated(tx_3);
 
         // Add them to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v3.clone(), on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v3.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(4, pool.pending_transactions().len());
 
         pool.remove_transactions(vec![*v0.hash(), *v2.hash()]);
 
-        assert_eq!(0, pool.queued_transactions().len());
-        assert_eq!(2, pool.pending_transactions().len());
+        assert_eq!(2, pool.queued_transactions().len());
+        assert!(pool.pending_transactions().is_empty());
         assert!(pool.contains(v1.hash()));
         assert!(pool.contains(v3.hash()));
+    }
+
+    #[test]
+    fn test_remove_transactions_middle_pending_hash() {
+        let on_chain_balance = U256::from(10_000);
+        let on_chain_nonce = 0;
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let tx_0 = MockTransaction::eip1559().set_gas_price(100).inc_limit();
+        let tx_1 = tx_0.next();
+        let tx_2 = tx_1.next();
+        let tx_3 = tx_2.next();
+
+        // Create 4 transactions
+        let v0 = f.validated(tx_0);
+        let v1 = f.validated(tx_1);
+        let v2 = f.validated(tx_2);
+        let v3 = f.validated(tx_3);
+
+        // Add them to the pool
+        let _res = pool.add_transaction(v0, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce, None).unwrap();
+
+        assert_eq!(0, pool.queued_transactions().len());
+        assert_eq!(4, pool.pending_transactions().len());
+
+        let mut removed_txs = pool.remove_transactions(vec![*v1.hash()]);
+        assert_eq!(1, removed_txs.len());
+
+        assert_eq!(2, pool.queued_transactions().len());
+        assert_eq!(1, pool.pending_transactions().len());
+
+        // reinsert
+        let removed_tx = removed_txs.pop().unwrap();
+        let v1 = f.validated(removed_tx.transaction.clone());
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
+        assert_eq!(0, pool.queued_transactions().len());
+        assert_eq!(4, pool.pending_transactions().len());
     }
 
     #[test]
@@ -3149,11 +4009,13 @@ mod tests {
         let v4 = f.validated(tx_4);
 
         // Add them to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v4, on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v4, on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(5, pool.pending_transactions().len());
@@ -3181,11 +4043,12 @@ mod tests {
         let v2 = f.validated(tx_2);
         let v3 = f.validated(tx_3);
 
-        // Add them to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce).unwrap();
+        // Add them to the  pool
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(4, pool.pending_transactions().len());
@@ -3219,11 +4082,14 @@ mod tests {
         let v4 = f.validated(tx_4);
 
         // Add them to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v4, on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v1.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res =
+            pool.add_transaction(v2.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v4, on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(5, pool.pending_transactions().len());
@@ -3254,8 +4120,9 @@ mod tests {
         let v3 = f.validated(tx_3);
 
         // Add first 2 to the pool
-        let _res = pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce).unwrap();
-        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce).unwrap();
+        let _res =
+            pool.add_transaction(v0.clone(), on_chain_balance, on_chain_nonce, None).unwrap();
+        let _res = pool.add_transaction(v1, on_chain_balance, on_chain_nonce, None).unwrap();
 
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(2, pool.pending_transactions().len());
@@ -3264,7 +4131,7 @@ mod tests {
         pool.remove_transaction(v0.id());
 
         // Now add transaction with nonce 2
-        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce).unwrap();
+        let _res = pool.add_transaction(v2, on_chain_balance, on_chain_nonce, None).unwrap();
 
         // v2 is in the queue now. v1 is still in 'pending'.
         assert_eq!(1, pool.queued_transactions().len());
@@ -3285,7 +4152,7 @@ mod tests {
         assert_eq!(2, pool.pending_transactions().len());
 
         // Add transaction v3 - it 'unclogs' everything.
-        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce).unwrap();
+        let _res = pool.add_transaction(v3, on_chain_balance, on_chain_nonce, None).unwrap();
         assert_eq!(0, pool.queued_transactions().len());
         assert_eq!(3, pool.pending_transactions().len());
 
@@ -3295,6 +4162,132 @@ mod tests {
             pool.best_transactions().map(|x| x.id().nonce).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn test_best_with_attributes() {
+        let on_chain_balance = U256::MAX;
+        let on_chain_nonce = 0;
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let base_fee: u128 = 100;
+        let blob_fee: u128 = 100;
+
+        // set base fee and blob fee.
+        let mut block_info = pool.block_info();
+        block_info.pending_basefee = base_fee as u64;
+        block_info.pending_blob_fee = Some(blob_fee);
+        pool.set_block_info(block_info);
+
+        // Insert transactions with varying max_fee_per_gas and max_fee_per_blob_gas.
+        let tx1 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(1))
+            .with_max_fee(base_fee + 10)
+            .with_blob_fee(blob_fee + 10);
+        let tx2 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(2))
+            .with_max_fee(base_fee + 10)
+            .with_blob_fee(blob_fee);
+        let tx3 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(3))
+            .with_max_fee(base_fee)
+            .with_blob_fee(blob_fee + 10);
+        let tx4 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(4))
+            .with_max_fee(base_fee)
+            .with_blob_fee(blob_fee);
+        let tx5 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(5))
+            .with_max_fee(base_fee)
+            .with_blob_fee(blob_fee - 10);
+        let tx6 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(6))
+            .with_max_fee(base_fee - 10)
+            .with_blob_fee(blob_fee);
+        let tx7 = MockTransaction::eip4844()
+            .with_sender(Address::with_last_byte(7))
+            .with_max_fee(base_fee - 10)
+            .with_blob_fee(blob_fee - 10);
+
+        for tx in vec![
+            tx1.clone(),
+            tx2.clone(),
+            tx3.clone(),
+            tx4.clone(),
+            tx5.clone(),
+            tx6.clone(),
+            tx7.clone(),
+        ] {
+            pool.add_transaction(f.validated(tx.clone()), on_chain_balance, on_chain_nonce, None)
+                .unwrap();
+        }
+
+        let base_fee = base_fee as u64;
+        let blob_fee = blob_fee as u64;
+
+        let cases = vec![
+            // 1. Base fee increase, blob fee increase
+            (BestTransactionsAttributes::new(base_fee + 5, Some(blob_fee + 5)), vec![tx1.clone()]),
+            // 2. Base fee increase, blob fee not change
+            (
+                BestTransactionsAttributes::new(base_fee + 5, Some(blob_fee)),
+                vec![tx1.clone(), tx2.clone()],
+            ),
+            // 3. Base fee increase, blob fee decrease
+            (
+                BestTransactionsAttributes::new(base_fee + 5, Some(blob_fee - 5)),
+                vec![tx1.clone(), tx2.clone()],
+            ),
+            // 4. Base fee not change, blob fee increase
+            (
+                BestTransactionsAttributes::new(base_fee, Some(blob_fee + 5)),
+                vec![tx1.clone(), tx3.clone()],
+            ),
+            // 5. Base fee not change, blob fee not change
+            (
+                BestTransactionsAttributes::new(base_fee, Some(blob_fee)),
+                vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone()],
+            ),
+            // 6. Base fee not change, blob fee decrease
+            (
+                BestTransactionsAttributes::new(base_fee, Some(blob_fee - 10)),
+                vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone(), tx5.clone()],
+            ),
+            // 7. Base fee decrease, blob fee increase
+            (
+                BestTransactionsAttributes::new(base_fee - 5, Some(blob_fee + 5)),
+                vec![tx1.clone(), tx3.clone()],
+            ),
+            // 8. Base fee decrease, blob fee not change
+            (
+                BestTransactionsAttributes::new(base_fee - 10, Some(blob_fee)),
+                vec![tx1.clone(), tx2.clone(), tx3.clone(), tx4.clone(), tx6.clone()],
+            ),
+            // 9. Base fee decrease, blob fee decrease
+            (
+                BestTransactionsAttributes::new(base_fee - 10, Some(blob_fee - 10)),
+                vec![tx1, tx2, tx5, tx3, tx4, tx6, tx7],
+            ),
+        ];
+
+        for (idx, (attribute, expected)) in cases.into_iter().enumerate() {
+            let mut best = pool.best_transactions_with_attributes(attribute);
+
+            for (tx_idx, expected_tx) in expected.into_iter().enumerate() {
+                let tx = best.next().expect("Transaction should be returned");
+                assert_eq!(
+                    tx.transaction,
+                    expected_tx,
+                    "Failed tx {} in case {}",
+                    tx_idx + 1,
+                    idx + 1
+                );
+            }
+
+            // No more transactions should be returned
+            assert!(best.next().is_none());
+        }
     }
 
     #[test]
@@ -3309,11 +4302,11 @@ mod tests {
         let v1 = f.validated(tx_1);
 
         // nonce gap, tx should be queued
-        pool.add_transaction(v0.clone(), U256::MAX, 0).unwrap();
+        pool.add_transaction(v0.clone(), U256::MAX, 0, None).unwrap();
         assert_eq!(1, pool.queued_transactions().len());
 
         // nonce gap is closed on-chain, both transactions should be moved to pending
-        pool.add_transaction(v1, U256::MAX, 1).unwrap();
+        pool.add_transaction(v1, U256::MAX, 1, None).unwrap();
 
         assert_eq!(2, pool.pending_transactions().len());
         assert_eq!(0, pool.queued_transactions().len());
@@ -3342,7 +4335,7 @@ mod tests {
         for tx_nonce in 40..48 {
             let tx = f.validated(template.clone().with_nonce(tx_nonce).rng_hash());
             submitted_txs.push(*tx.id());
-            pool.add_transaction(tx, on_chain_balance, on_chain_nonce).unwrap();
+            pool.add_transaction(tx, on_chain_balance, on_chain_nonce, None).unwrap();
         }
 
         // A block is mined with two txs (so nonce is changed from 40 to 42).
@@ -3358,6 +4351,7 @@ mod tests {
                 f.validated(template.clone().with_nonce(tx_nonce).rng_hash()),
                 on_chain_balance,
                 on_chain_nonce,
+                None,
             )
             .unwrap();
         }
@@ -3366,5 +4360,169 @@ mod tests {
         assert_eq!(best_txs.len(), 10); // 8 - 2 + 4 = 10
 
         assert_eq!(pool.pending_pool.independent().len(), 1);
+    }
+
+    #[test]
+    fn test_insertion_disorder() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let sender = address!("0x1234567890123456789012345678901234567890");
+        let tx0 = f.validated_arc(
+            MockTransaction::legacy().with_sender(sender).with_nonce(0).with_gas_price(10),
+        );
+        let tx1 = f.validated_arc(
+            MockTransaction::eip1559()
+                .with_sender(sender)
+                .with_nonce(1)
+                .with_gas_limit(1000)
+                .with_gas_price(10),
+        );
+        let tx2 = f.validated_arc(
+            MockTransaction::legacy().with_sender(sender).with_nonce(2).with_gas_price(10),
+        );
+        let tx3 = f.validated_arc(
+            MockTransaction::legacy().with_sender(sender).with_nonce(3).with_gas_price(10),
+        );
+
+        // tx0 should be put in the pending subpool
+        pool.add_transaction((*tx0).clone(), U256::from(1000), 0, None).unwrap();
+        let mut best = pool.best_transactions();
+        let t0 = best.next().expect("tx0 should be put in the pending subpool");
+        assert_eq!(t0.id(), tx0.id());
+        // tx1 should be put in the queued subpool due to insufficient sender balance
+        pool.add_transaction((*tx1).clone(), U256::from(1000), 0, None).unwrap();
+        let mut best = pool.best_transactions();
+        let t0 = best.next().expect("tx0 should be put in the pending subpool");
+        assert_eq!(t0.id(), tx0.id());
+        assert!(best.next().is_none());
+
+        // tx2 should be put in the pending subpool, and tx1 should be promoted to pending
+        pool.add_transaction((*tx2).clone(), U256::MAX, 0, None).unwrap();
+
+        let mut best = pool.best_transactions();
+
+        let t0 = best.next().expect("tx0 should be put in the pending subpool");
+        let t1 = best.next().expect("tx1 should be put in the pending subpool");
+        let t2 = best.next().expect("tx2 should be put in the pending subpool");
+        assert_eq!(t0.id(), tx0.id());
+        assert_eq!(t1.id(), tx1.id());
+        assert_eq!(t2.id(), tx2.id());
+
+        // tx3 should be put in the pending subpool,
+        pool.add_transaction((*tx3).clone(), U256::MAX, 0, None).unwrap();
+        let mut best = pool.best_transactions();
+        let t0 = best.next().expect("tx0 should be put in the pending subpool");
+        let t1 = best.next().expect("tx1 should be put in the pending subpool");
+        let t2 = best.next().expect("tx2 should be put in the pending subpool");
+        let t3 = best.next().expect("tx3 should be put in the pending subpool");
+        assert_eq!(t0.id(), tx0.id());
+        assert_eq!(t1.id(), tx1.id());
+        assert_eq!(t2.id(), tx2.id());
+        assert_eq!(t3.id(), tx3.id());
+    }
+
+    #[test]
+    fn test_non_4844_blob_fee_bit_invariant() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let non_4844_tx = MockTransaction::eip1559().set_max_fee(200).inc_limit();
+        let validated = f.validated(non_4844_tx.clone());
+
+        assert!(!non_4844_tx.is_eip4844());
+        pool.add_transaction(validated.clone(), U256::from(10_000), 0, None).unwrap();
+
+        // Core invariant: Non-4844 transactions must ALWAYS have ENOUGH_BLOB_FEE_CAP_BLOCK bit
+        let tx_meta = pool.all_transactions.txs.get(validated.id()).unwrap();
+        assert!(tx_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
+        assert_eq!(tx_meta.subpool, SubPool::Pending);
+    }
+
+    #[test]
+    fn test_blob_fee_enforcement_only_applies_to_eip4844() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Set blob fee higher than EIP-4844 tx can afford
+        let mut block_info = pool.block_info();
+        block_info.pending_blob_fee = Some(160);
+        block_info.pending_basefee = 100;
+        pool.set_block_info(block_info);
+
+        let eip4844_tx = MockTransaction::eip4844()
+            .with_sender(address!("0x000000000000000000000000000000000000000a"))
+            .with_max_fee(200)
+            .with_blob_fee(150) // Less than block blob fee (160)
+            .inc_limit();
+
+        let non_4844_tx = MockTransaction::eip1559()
+            .with_sender(address!("0x000000000000000000000000000000000000000b"))
+            .set_max_fee(200)
+            .inc_limit();
+
+        let validated_4844 = f.validated(eip4844_tx);
+        let validated_non_4844 = f.validated(non_4844_tx);
+
+        pool.add_transaction(validated_4844.clone(), U256::from(10_000), 0, None).unwrap();
+        pool.add_transaction(validated_non_4844.clone(), U256::from(10_000), 0, None).unwrap();
+
+        let tx_4844_meta = pool.all_transactions.txs.get(validated_4844.id()).unwrap();
+        let tx_non_4844_meta = pool.all_transactions.txs.get(validated_non_4844.id()).unwrap();
+
+        // EIP-4844: blob fee enforcement applies - insufficient blob fee removes bit
+        assert!(!tx_4844_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
+        assert_eq!(tx_4844_meta.subpool, SubPool::Blob);
+
+        // Non-4844: blob fee enforcement does NOT apply - bit always remains true
+        assert!(tx_non_4844_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK));
+        assert_eq!(tx_non_4844_meta.subpool, SubPool::Pending);
+    }
+
+    #[test]
+    fn test_basefee_decrease_preserves_non_4844_blob_fee_bit() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        // Create non-4844 transaction with fee that initially can't afford high basefee
+        let non_4844_tx = MockTransaction::eip1559()
+            .with_sender(address!("0x000000000000000000000000000000000000000a"))
+            .set_max_fee(500) // Can't afford basefee of 600
+            .inc_limit();
+
+        // Set high basefee so transaction goes to BaseFee pool initially
+        pool.update_basefee(600, |_| {});
+
+        let validated = f.validated(non_4844_tx);
+        let tx_id = *validated.id();
+        pool.add_transaction(validated, U256::from(10_000), 0, None).unwrap();
+
+        // Initially should be in BaseFee pool but STILL have blob fee bit (critical invariant)
+        let tx_meta = pool.all_transactions.txs.get(&tx_id).unwrap();
+        assert_eq!(tx_meta.subpool, SubPool::BaseFee);
+        assert!(
+            tx_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK),
+            "Non-4844 tx in BaseFee pool must retain ENOUGH_BLOB_FEE_CAP_BLOCK bit"
+        );
+
+        // Decrease basefee - transaction should be promoted to Pending
+        // This is where PR #18215 bug would manifest: blob fee bit incorrectly removed
+        pool.update_basefee(400, |_| {});
+
+        // After basefee decrease: should be promoted to Pending with blob fee bit preserved
+        let tx_meta = pool.all_transactions.txs.get(&tx_id).unwrap();
+        assert_eq!(
+            tx_meta.subpool,
+            SubPool::Pending,
+            "Non-4844 tx should be promoted from BaseFee to Pending after basefee decrease"
+        );
+        assert!(
+            tx_meta.state.contains(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK),
+            "Non-4844 tx must NEVER lose ENOUGH_BLOB_FEE_CAP_BLOCK bit during basefee promotion"
+        );
+        assert!(
+            tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK),
+            "Non-4844 tx should gain ENOUGH_FEE_CAP_BLOCK bit after basefee decrease"
+        );
     }
 }

@@ -1,17 +1,15 @@
 //! Executor for mixed I/O and CPU workloads.
 
-use rayon::ThreadPool as RayonPool;
-use std::sync::{Arc, OnceLock};
+use std::{sync::OnceLock, time::Duration};
 use tokio::{
-    runtime::{Handle, Runtime},
+    runtime::{Builder, Handle, Runtime},
     task::JoinHandle,
 };
 
 /// An executor for mixed I/O and CPU workloads.
 ///
-/// This type has access to its own rayon pool and uses tokio to spawn blocking tasks.
-///
-/// It will reuse an existing tokio runtime if available or create its own.
+/// This type uses tokio to spawn blocking tasks and will reuse an existing tokio
+/// runtime if available or create its own.
 #[derive(Debug, Clone)]
 pub struct WorkloadExecutor {
     inner: WorkloadExecutorInner,
@@ -19,73 +17,57 @@ pub struct WorkloadExecutor {
 
 impl Default for WorkloadExecutor {
     fn default() -> Self {
-        Self { inner: WorkloadExecutorInner::new(rayon::ThreadPoolBuilder::new().build().unwrap()) }
+        Self { inner: WorkloadExecutorInner::new() }
     }
 }
 
 impl WorkloadExecutor {
-    /// Creates a new executor with the given number of threads for cpu bound work (rayon).
-    #[allow(unused)]
-    pub(super) fn with_num_cpu_threads(cpu_threads: usize) -> Self {
-        Self {
-            inner: WorkloadExecutorInner::new(
-                rayon::ThreadPoolBuilder::new().num_threads(cpu_threads).build().unwrap(),
-            ),
-        }
-    }
-
     /// Returns the handle to the tokio runtime
-    pub(super) fn handle(&self) -> &Handle {
+    pub(super) const fn handle(&self) -> &Handle {
         &self.inner.handle
     }
 
     /// Shorthand for [`Runtime::spawn_blocking`]
     #[track_caller]
-    pub(super) fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
+    pub fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         self.inner.handle.spawn_blocking(func)
     }
-
-    /// Returns access to the rayon pool
-    pub(super) fn rayon_pool(&self) -> &Arc<rayon::ThreadPool> {
-        &self.inner.rayon_pool
-    }
 }
 
 #[derive(Debug, Clone)]
 struct WorkloadExecutorInner {
     handle: Handle,
-    rayon_pool: Arc<RayonPool>,
 }
 
 impl WorkloadExecutorInner {
-    fn new(rayon_pool: rayon::ThreadPool) -> Self {
+    fn new() -> Self {
         fn get_runtime_handle() -> Handle {
             Handle::try_current().unwrap_or_else(|_| {
-                // Create a new runtime if now runtime is available
+                // Create a new runtime if no runtime is available
                 static RT: OnceLock<Runtime> = OnceLock::new();
 
-                let rt = RT.get_or_init(|| Runtime::new().unwrap());
+                let rt = RT.get_or_init(|| {
+                    Builder::new_multi_thread()
+                        .enable_all()
+                        // Keep the threads alive for at least the block time, which is 12 seconds
+                        // at the time of writing, plus a little extra.
+                        //
+                        // This is to prevent the costly process of spawning new threads on every
+                        // new block, and instead reuse the existing
+                        // threads.
+                        .thread_keep_alive(Duration::from_secs(15))
+                        .build()
+                        .unwrap()
+                });
 
                 rt.handle().clone()
             })
         }
 
-        Self { handle: get_runtime_handle(), rayon_pool: Arc::new(rayon_pool) }
+        Self { handle: get_runtime_handle() }
     }
-}
-
-/// Determines if the host has enough parallelism to run the payload processor.
-///
-/// It requires at least 5 parallel threads:
-/// - Engine in main thread that spawns the state root task.
-/// - Multiproof task in [`super::multiproof::MultiProofTask::run`]
-/// - Sparse Trie task in [`super::sparse_trie::SparseTrieTask::run`]
-/// - Multiproof computation spawned in [`super::multiproof::MultiproofManager::spawn_multiproof`]
-/// - Storage root computation spawned in [`reth_trie_parallel::proof::ParallelProof::multiproof`]
-pub(crate) fn has_enough_parallelism() -> bool {
-    std::thread::available_parallelism().is_ok_and(|num| num.get() >= 5)
 }

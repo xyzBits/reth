@@ -5,30 +5,38 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloy_consensus::BlockHeader;
-use alloy_evm::FromRecoveredTx;
-use alloy_op_evm::OpEvmFactory;
-use alloy_primitives::U256;
+use alloy_consensus::{BlockHeader, Header};
+use alloy_eips::Decodable2718;
+use alloy_evm::{EvmFactory, FromRecoveredTx, FromTxWithEncoded};
+use alloy_op_evm::block::{receipt_builder::OpReceiptBuilder, OpTxEnv};
+use alloy_primitives::{Bytes, U256};
 use core::fmt::Debug;
 use op_alloy_consensus::EIP1559ParamError;
-use op_revm::{OpHaltReason, OpSpecId, OpTransaction};
+use op_alloy_rpc_types_engine::OpExecutionData;
+use op_revm::{OpSpecId, OpTransaction};
 use reth_chainspec::EthChainSpec;
-use reth_evm::{ConfigureEvm, ConfigureEvmEnv, EvmEnv};
+use reth_evm::{
+    eth::NextEvmEnvAttributes, precompiles::PrecompilesMap, ConfigureEngineEvm, ConfigureEvm,
+    EvmEnv, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor, TransactionEnv,
+};
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_consensus::next_block_base_fee;
 use reth_optimism_forks::OpHardforks;
-use reth_optimism_primitives::OpPrimitives;
-use reth_primitives_traits::NodePrimitives;
+use reth_optimism_primitives::{DepositReceipt, OpPrimitives};
+use reth_primitives_traits::{
+    NodePrimitives, SealedBlock, SealedHeader, SignedTransaction, TxTy, WithEncoded,
+};
+use reth_storage_errors::any::AnyError;
 use revm::{
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
-    specification::hardfork::SpecId,
+    primitives::hardfork::SpecId,
 };
 
 mod config;
@@ -45,143 +53,227 @@ pub use build::OpBlockAssembler;
 mod error;
 pub use error::OpBlockExecutionError;
 
+pub use alloy_op_evm::{OpBlockExecutionCtx, OpBlockExecutorFactory, OpEvm, OpEvmFactory};
+
 /// Optimism-related EVM configuration.
 #[derive(Debug)]
-pub struct OpEvmConfig<ChainSpec = OpChainSpec, N: NodePrimitives = OpPrimitives> {
-    chain_spec: Arc<ChainSpec>,
-    evm_factory: OpEvmFactory,
-    receipt_builder: Arc<dyn OpReceiptBuilder<N::SignedTx, OpHaltReason, Receipt = N::Receipt>>,
-    block_assembler: OpBlockAssembler<ChainSpec>,
+pub struct OpEvmConfig<
+    ChainSpec = OpChainSpec,
+    N: NodePrimitives = OpPrimitives,
+    R = OpRethReceiptBuilder,
+    EvmFactory = OpEvmFactory,
+> {
+    /// Inner [`OpBlockExecutorFactory`].
+    pub executor_factory: OpBlockExecutorFactory<R, Arc<ChainSpec>, EvmFactory>,
+    /// Optimism block assembler.
+    pub block_assembler: OpBlockAssembler<ChainSpec>,
+    #[doc(hidden)]
+    pub _pd: core::marker::PhantomData<N>,
 }
 
-impl<ChainSpec, N: NodePrimitives> Clone for OpEvmConfig<ChainSpec, N> {
+impl<ChainSpec, N: NodePrimitives, R: Clone, EvmFactory: Clone> Clone
+    for OpEvmConfig<ChainSpec, N, R, EvmFactory>
+{
     fn clone(&self) -> Self {
         Self {
-            chain_spec: self.chain_spec.clone(),
-            evm_factory: OpEvmFactory::default(),
-            receipt_builder: self.receipt_builder.clone(),
+            executor_factory: self.executor_factory.clone(),
             block_assembler: self.block_assembler.clone(),
+            _pd: self._pd,
         }
     }
 }
 
-impl<ChainSpec> OpEvmConfig<ChainSpec> {
+impl<ChainSpec: OpHardforks> OpEvmConfig<ChainSpec> {
     /// Creates a new [`OpEvmConfig`] with the given chain spec for OP chains.
     pub fn optimism(chain_spec: Arc<ChainSpec>) -> Self {
-        Self::new(chain_spec, BasicOpReceiptBuilder::default())
+        Self::new(chain_spec, OpRethReceiptBuilder::default())
     }
 }
 
-impl<ChainSpec, N: NodePrimitives> OpEvmConfig<ChainSpec, N> {
+impl<ChainSpec: OpHardforks, N: NodePrimitives, R> OpEvmConfig<ChainSpec, N, R> {
     /// Creates a new [`OpEvmConfig`] with the given chain spec.
-    pub fn new(
-        chain_spec: Arc<ChainSpec>,
-        receipt_builder: impl OpReceiptBuilder<N::SignedTx, OpHaltReason, Receipt = N::Receipt>,
-    ) -> Self {
+    pub fn new(chain_spec: Arc<ChainSpec>, receipt_builder: R) -> Self {
         Self {
             block_assembler: OpBlockAssembler::new(chain_spec.clone()),
-            chain_spec,
-            evm_factory: OpEvmFactory::default(),
-            receipt_builder: Arc::new(receipt_builder),
+            executor_factory: OpBlockExecutorFactory::new(
+                receipt_builder,
+                chain_spec,
+                OpEvmFactory::default(),
+            ),
+            _pd: core::marker::PhantomData,
         }
-    }
-
-    /// Returns the chain spec associated with this configuration.
-    pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
-        &self.chain_spec
     }
 }
 
-impl<ChainSpec, N> ConfigureEvmEnv for OpEvmConfig<ChainSpec, N>
+impl<ChainSpec, N, R, EvmFactory> OpEvmConfig<ChainSpec, N, R, EvmFactory>
 where
-    ChainSpec: EthChainSpec + OpHardforks,
+    ChainSpec: OpHardforks,
     N: NodePrimitives,
-    OpTransaction<TxEnv>: FromRecoveredTx<N::SignedTx>,
 {
-    type Header = N::BlockHeader;
-    type Transaction = N::SignedTx;
+    /// Returns the chain spec associated with this configuration.
+    pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
+        self.executor_factory.spec()
+    }
+}
+
+impl<ChainSpec, N, R, EvmF> ConfigureEvm for OpEvmConfig<ChainSpec, N, R, EvmF>
+where
+    ChainSpec: EthChainSpec<Header = Header> + OpHardforks,
+    N: NodePrimitives<
+        Receipt = R::Receipt,
+        SignedTx = R::Transaction,
+        BlockHeader = Header,
+        BlockBody = alloy_consensus::BlockBody<R::Transaction>,
+        Block = alloy_consensus::Block<R::Transaction>,
+    >,
+    OpTransaction<TxEnv>: FromRecoveredTx<N::SignedTx> + FromTxWithEncoded<N::SignedTx>,
+    R: OpReceiptBuilder<Receipt: DepositReceipt, Transaction: SignedTransaction>,
+    EvmF: EvmFactory<
+            Tx: FromRecoveredTx<R::Transaction>
+                    + FromTxWithEncoded<R::Transaction>
+                    + TransactionEnv
+                    + OpTxEnv,
+            Precompiles = PrecompilesMap,
+            Spec = OpSpecId,
+            BlockEnv = BlockEnv,
+        > + Debug,
+    Self: Send + Sync + Unpin + Clone + 'static,
+{
+    type Primitives = N;
     type Error = EIP1559ParamError;
-    type TxEnv = OpTransaction<TxEnv>;
-    type Spec = OpSpecId;
     type NextBlockEnvCtx = OpNextBlockEnvAttributes;
+    type BlockExecutorFactory = OpBlockExecutorFactory<R, Arc<ChainSpec>, EvmF>;
+    type BlockAssembler = OpBlockAssembler<ChainSpec>;
 
-    fn evm_env(&self, header: &Self::Header) -> EvmEnv<Self::Spec> {
-        let spec = config::revm_spec(self.chain_spec(), header);
+    fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+        &self.executor_factory
+    }
 
-        let cfg_env = CfgEnv::new().with_chain_id(self.chain_spec.chain().id()).with_spec(spec);
+    fn block_assembler(&self) -> &Self::BlockAssembler {
+        &self.block_assembler
+    }
 
-        let block_env = BlockEnv {
-            number: header.number(),
-            beneficiary: header.beneficiary(),
-            timestamp: header.timestamp(),
-            difficulty: if spec.into_eth_spec() >= SpecId::MERGE {
-                U256::ZERO
-            } else {
-                header.difficulty()
-            },
-            prevrandao: if spec.into_eth_spec() >= SpecId::MERGE {
-                header.mix_hash()
-            } else {
-                None
-            },
-            gas_limit: header.gas_limit(),
-            basefee: header.base_fee_per_gas().unwrap_or_default(),
-            // EIP-4844 excess blob gas of this block, introduced in Cancun
-            blob_excess_gas_and_price: header.excess_blob_gas().map(|excess_blob_gas| {
-                BlobExcessGasAndPrice::new(excess_blob_gas, spec.into_eth_spec() >= SpecId::PRAGUE)
-            }),
-        };
-
-        EvmEnv { cfg_env, block_env }
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<OpSpecId>, Self::Error> {
+        Ok(EvmEnv::for_op_block(header, self.chain_spec(), self.chain_spec().chain().id()))
     }
 
     fn next_evm_env(
         &self,
-        parent: &Self::Header,
+        parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
-    ) -> Result<EvmEnv<Self::Spec>, Self::Error> {
-        // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_after_bedrock(&self.chain_spec, attributes.timestamp);
+    ) -> Result<EvmEnv<OpSpecId>, Self::Error> {
+        Ok(EvmEnv::for_op_next_block(
+            parent,
+            NextEvmEnvAttributes {
+                timestamp: attributes.timestamp,
+                suggested_fee_recipient: attributes.suggested_fee_recipient,
+                prev_randao: attributes.prev_randao,
+                gas_limit: attributes.gas_limit,
+            },
+            self.chain_spec().next_block_base_fee(parent, attributes.timestamp).unwrap_or_default(),
+            self.chain_spec(),
+            self.chain_spec().chain().id(),
+        ))
+    }
 
-        // configure evm env based on parent block
-        let cfg_env = CfgEnv::new().with_chain_id(self.chain_spec.chain().id()).with_spec(spec_id);
+    fn context_for_block(
+        &self,
+        block: &'_ SealedBlock<N::Block>,
+    ) -> Result<OpBlockExecutionCtx, Self::Error> {
+        Ok(OpBlockExecutionCtx {
+            parent_hash: block.header().parent_hash(),
+            parent_beacon_block_root: block.header().parent_beacon_block_root(),
+            extra_data: block.header().extra_data().clone(),
+        })
+    }
 
-        // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
-        // cancun now, we need to set the excess blob gas to the default value(0)
-        let blob_excess_gas_and_price = parent
-            .maybe_next_block_excess_blob_gas(
-                self.chain_spec().blob_params_at_timestamp(attributes.timestamp),
-            )
-            .or_else(|| (spec_id.into_eth_spec().is_enabled_in(SpecId::CANCUN)).then_some(0))
-            .map(|gas| BlobExcessGasAndPrice::new(gas, false));
+    fn context_for_next_block(
+        &self,
+        parent: &SealedHeader<N::BlockHeader>,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> Result<OpBlockExecutionCtx, Self::Error> {
+        Ok(OpBlockExecutionCtx {
+            parent_hash: parent.hash(),
+            parent_beacon_block_root: attributes.parent_beacon_block_root,
+            extra_data: attributes.extra_data,
+        })
+    }
+}
+
+impl<ChainSpec, N, R> ConfigureEngineEvm<OpExecutionData> for OpEvmConfig<ChainSpec, N, R>
+where
+    ChainSpec: EthChainSpec<Header = Header> + OpHardforks,
+    N: NodePrimitives<
+        Receipt = R::Receipt,
+        SignedTx = R::Transaction,
+        BlockHeader = Header,
+        BlockBody = alloy_consensus::BlockBody<R::Transaction>,
+        Block = alloy_consensus::Block<R::Transaction>,
+    >,
+    OpTransaction<TxEnv>: FromRecoveredTx<N::SignedTx> + FromTxWithEncoded<N::SignedTx>,
+    R: OpReceiptBuilder<Receipt: DepositReceipt, Transaction: SignedTransaction>,
+    Self: Send + Sync + Unpin + Clone + 'static,
+{
+    fn evm_env_for_payload(
+        &self,
+        payload: &OpExecutionData,
+    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let timestamp = payload.payload.timestamp();
+        let block_number = payload.payload.block_number();
+
+        let spec = revm_spec_by_timestamp_after_bedrock(self.chain_spec(), timestamp);
+
+        let cfg_env = CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+
+        let blob_excess_gas_and_price = spec
+            .into_eth_spec()
+            .is_enabled_in(SpecId::CANCUN)
+            .then_some(BlobExcessGasAndPrice { excess_blob_gas: 0, blob_gasprice: 1 });
 
         let block_env = BlockEnv {
-            number: parent.number() + 1,
-            beneficiary: attributes.suggested_fee_recipient,
-            timestamp: attributes.timestamp,
-            difficulty: U256::ZERO,
-            prevrandao: Some(attributes.prev_randao),
-            gas_limit: attributes.gas_limit,
-            // calculate basefee based on parent block's gas usage
-            basefee: next_block_base_fee(&self.chain_spec, parent, attributes.timestamp)?,
-            // calculate excess gas based on parent block's blob gas usage
+            number: U256::from(block_number),
+            beneficiary: payload.payload.as_v1().fee_recipient,
+            timestamp: U256::from(timestamp),
+            difficulty: if spec.into_eth_spec() >= SpecId::MERGE {
+                U256::ZERO
+            } else {
+                payload.payload.as_v1().prev_randao.into()
+            },
+            prevrandao: (spec.into_eth_spec() >= SpecId::MERGE)
+                .then(|| payload.payload.as_v1().prev_randao),
+            gas_limit: payload.payload.as_v1().gas_limit,
+            basefee: payload.payload.as_v1().base_fee_per_gas.to(),
+            // EIP-4844 excess blob gas of this block, introduced in Cancun
             blob_excess_gas_and_price,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
     }
-}
 
-impl<ChainSpec, N> ConfigureEvm for OpEvmConfig<ChainSpec, N>
-where
-    ChainSpec: EthChainSpec + OpHardforks,
-    N: NodePrimitives,
-    OpTransaction<TxEnv>: FromRecoveredTx<N::SignedTx>,
-{
-    type EvmFactory = OpEvmFactory;
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a OpExecutionData,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        Ok(OpBlockExecutionCtx {
+            parent_hash: payload.parent_hash(),
+            parent_beacon_block_root: payload.sidecar.parent_beacon_block_root(),
+            extra_data: payload.payload.as_v1().extra_data.clone(),
+        })
+    }
 
-    fn evm_factory(&self) -> &Self::EvmFactory {
-        &self.evm_factory
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &OpExecutionData,
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        let transactions = payload.payload.transactions().clone().into_iter();
+        let convert = |encoded: Bytes| {
+            let tx = TxTy::<Self::Primitives>::decode_2718_exact(encoded.as_ref())
+                .map_err(AnyError::new)?;
+            let signer = tx.try_recover().map_err(AnyError::new)?;
+            Ok::<_, AnyError>(WithEncoded::new(encoded, tx.with_signer(signer)))
+        };
+
+        Ok((transactions, convert))
     }
 }
 
@@ -198,12 +290,16 @@ mod tests {
     use reth_execution_types::{
         AccountRevertInit, BundleStateInit, Chain, ExecutionOutcome, RevertsInit,
     };
-    use reth_optimism_chainspec::BASE_MAINNET;
+    use reth_optimism_chainspec::{OpChainSpec, BASE_MAINNET};
     use reth_optimism_primitives::{OpBlock, OpPrimitives, OpReceipt};
     use reth_primitives_traits::{Account, RecoveredBlock};
-    use revm::{database_interface::EmptyDBTyped, inspector::NoOpInspector, state::AccountInfo};
-    use revm_database::{BundleState, CacheDB};
-    use revm_primitives::Log;
+    use revm::{
+        database::{BundleState, CacheDB},
+        database_interface::EmptyDBTyped,
+        inspector::NoOpInspector,
+        primitives::Log,
+        state::AccountInfo,
+    };
     use std::sync::Arc;
 
     fn test_evm_config() -> OpEvmConfig {
@@ -229,7 +325,8 @@ mod tests {
         // Header, and total difficulty
         let EvmEnv { cfg_env, .. } =
             OpEvmConfig::optimism(Arc::new(OpChainSpec { inner: chain_spec.clone() }))
-                .evm_env(&header);
+                .evm_env(&header)
+                .unwrap();
 
         // Assert that the chain ID in the `cfg_env` is correctly set to the chain ID of the
         // ChainSpec
@@ -274,8 +371,12 @@ mod tests {
         let db = CacheDB::<EmptyDBTyped<ProviderError>>::default();
 
         // Create customs block and tx env
-        let block =
-            BlockEnv { basefee: 1000, gas_limit: 10_000_000, number: 42, ..Default::default() };
+        let block = BlockEnv {
+            basefee: 1000,
+            gas_limit: 10_000_000,
+            number: U256::from(42),
+            ..Default::default()
+        };
 
         let evm_env = EvmEnv { block_env: block, ..Default::default() };
 
@@ -335,8 +436,12 @@ mod tests {
         let db = CacheDB::<EmptyDBTyped<ProviderError>>::default();
 
         // Create custom block and tx environment
-        let block =
-            BlockEnv { basefee: 1000, gas_limit: 10_000_000, number: 42, ..Default::default() };
+        let block = BlockEnv {
+            basefee: 1000,
+            gas_limit: 10_000_000,
+            number: U256::from(42),
+            ..Default::default()
+        };
         let evm_env = EvmEnv { block_env: block, ..Default::default() };
 
         let evm = evm_config.evm_with_env_and_inspector(db, evm_env.clone(), NoOpInspector {});
@@ -381,14 +486,14 @@ mod tests {
         block2.set_hash(block2_hash);
 
         // Create a random receipt object, receipt1
-        let receipt1 = OpReceipt::Legacy(Receipt {
+        let receipt1 = OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),
         });
 
         // Create another random receipt object, receipt2
-        let receipt2 = OpReceipt::Legacy(Receipt {
+        let receipt2 = OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 1325345,
             logs: vec![],
             status: true.into(),
@@ -430,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_initialisation() {
+    fn test_initialization() {
         // Create a new BundleState object with initial data
         let bundle = BundleState::new(
             vec![(Address::new([2; 20]), None, Some(AccountInfo::default()), HashMap::default())],
@@ -439,7 +544,7 @@ mod tests {
         );
 
         // Create a Receipts object with a vector of receipt vectors
-        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt {
+        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),
@@ -497,7 +602,7 @@ mod tests {
     #[test]
     fn test_block_number_to_index() {
         // Create a Receipts object with a vector of receipt vectors
-        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt {
+        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),
@@ -518,7 +623,7 @@ mod tests {
         // Test before the first block
         assert_eq!(exec_res.block_number_to_index(12), None);
 
-        // Test after after the first block but index larger than receipts length
+        // Test after the first block but index larger than receipts length
         assert_eq!(exec_res.block_number_to_index(133), None);
 
         // Test after the first block
@@ -528,7 +633,7 @@ mod tests {
     #[test]
     fn test_get_logs() {
         // Create a Receipts object with a vector of receipt vectors
-        let receipts = vec![vec![OpReceipt::Legacy(Receipt {
+        let receipts = vec![vec![OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![Log::<LogData>::default()],
             status: true.into(),
@@ -556,7 +661,7 @@ mod tests {
     #[test]
     fn test_receipts_by_block() {
         // Create a Receipts object with a vector of receipt vectors
-        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt {
+        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![Log::<LogData>::default()],
             status: true.into(),
@@ -580,7 +685,7 @@ mod tests {
         // Assert that the receipts for block number 123 match the expected receipts
         assert_eq!(
             receipts_by_block,
-            vec![&Some(OpReceipt::Legacy(Receipt {
+            vec![&Some(OpReceipt::Legacy(Receipt::<Log> {
                 cumulative_gas_used: 46913,
                 logs: vec![Log::<LogData>::default()],
                 status: true.into(),
@@ -591,7 +696,7 @@ mod tests {
     #[test]
     fn test_receipts_len() {
         // Create a Receipts object with a vector of receipt vectors
-        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt {
+        let receipts = vec![vec![Some(OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![Log::<LogData>::default()],
             status: true.into(),
@@ -636,7 +741,7 @@ mod tests {
     #[test]
     fn test_revert_to() {
         // Create a random receipt object
-        let receipt = OpReceipt::Legacy(Receipt {
+        let receipt = OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),
@@ -681,7 +786,7 @@ mod tests {
     #[test]
     fn test_extend_execution_outcome() {
         // Create a Receipt object with specific attributes.
-        let receipt = OpReceipt::Legacy(Receipt {
+        let receipt = OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),
@@ -721,7 +826,7 @@ mod tests {
     #[test]
     fn test_split_at_execution_outcome() {
         // Create a random receipt object
-        let receipt = OpReceipt::Legacy(Receipt {
+        let receipt = OpReceipt::Legacy(Receipt::<Log> {
             cumulative_gas_used: 46913,
             logs: vec![],
             status: true.into(),

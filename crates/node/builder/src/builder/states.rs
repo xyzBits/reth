@@ -10,13 +10,14 @@ use crate::{
     hooks::NodeHooks,
     launch::LaunchNode,
     rpc::{RethRpcAddOns, RethRpcServerHandles, RpcContext},
-    AddOns, FullNode,
+    AddOns, ComponentsFor, FullNode,
 };
+
 use reth_exex::ExExContext;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes};
 use reth_node_core::node_config::NodeConfig;
 use reth_tasks::TaskExecutor;
-use std::{fmt, future::Future};
+use std::{fmt, fmt::Debug, future::Future};
 
 /// A node builder that also has the configured types.
 pub struct NodeBuilderWithTypes<T: FullNodeTypes> {
@@ -72,7 +73,8 @@ impl<T: FullNodeTypes> fmt::Debug for NodeTypesAdapter<T> {
 
 /// Container for the node's types and the components and other internals that can be used by
 /// addons of the node.
-pub struct NodeAdapter<T: FullNodeTypes, C: NodeComponents<T>> {
+#[derive(Debug)]
+pub struct NodeAdapter<T: FullNodeTypes, C: NodeComponents<T> = ComponentsFor<T>> {
     /// The components of the node.
     pub components: C,
     /// The task executor for the node.
@@ -90,7 +92,6 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeTypes for NodeAdapter<T, C>
 impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<T, C> {
     type Pool = C::Pool;
     type Evm = C::Evm;
-    type Executor = C::Executor;
     type Consensus = C::Consensus;
     type Network = C::Network;
 
@@ -100,10 +101,6 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
 
     fn evm_config(&self) -> &Self::Evm {
         self.components.evm_config()
-    }
-
-    fn block_executor(&self) -> &Self::Executor {
-        self.components.block_executor()
     }
 
     fn consensus(&self) -> &Self::Consensus {
@@ -117,7 +114,7 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
     fn payload_builder_handle(
         &self,
     ) -> &reth_payload_builder::PayloadBuilderHandle<
-        <Self::Types as reth_node_api::NodeTypesWithEngine>::Engine,
+        <Self::Types as reth_node_api::NodeTypes>::Payload,
     > {
         self.components.payload_builder_handle()
     }
@@ -238,6 +235,27 @@ where
     }
 
     /// Modifies the addons with the given closure.
+    ///
+    /// This method provides access to methods on the addons type that don't have
+    /// direct builder methods. It's useful for advanced configuration scenarios
+    /// where you need to call addon-specific methods.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use tower::layer::util::Identity;
+    ///
+    /// let builder = NodeBuilder::new(config)
+    ///     .with_types::<EthereumNode>()
+    ///     .with_components(EthereumNode::components())
+    ///     .with_add_ons(EthereumAddOns::default())
+    ///     .map_add_ons(|addons| addons.with_rpc_middleware(Identity::default()));
+    /// ```
+    ///
+    /// # See also
+    ///
+    /// - [`NodeAddOns`] trait for available addon types
+    /// - [`crate::NodeBuilderWithComponents::extend_rpc_modules`] for RPC module configuration
     pub fn map_add_ons<F>(mut self, f: F) -> Self
     where
         F: FnOnce(AO) -> AO,
@@ -254,11 +272,11 @@ where
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>,
 {
     /// Launches the node with the given launcher.
-    pub async fn launch_with<L>(self, launcher: L) -> eyre::Result<L::Node>
+    pub fn launch_with<L>(self, launcher: L) -> L::Future
     where
         L: LaunchNode<Self>,
     {
-        launcher.launch_node(self).await
+        launcher.launch_node(self)
     }
 
     /// Sets the hook that is run once the rpc server is started.
@@ -288,5 +306,53 @@ where
             add_ons.hooks_mut().set_extend_rpc_modules(hook);
             add_ons
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::components::Components;
+    use reth_consensus::noop::NoopConsensus;
+    use reth_db_api::mock::DatabaseMock;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_evm::noop::NoopEvmConfig;
+    use reth_evm_ethereum::MockEvmConfig;
+    use reth_network::EthNetworkPrimitives;
+    use reth_network_api::noop::NoopNetwork;
+    use reth_node_api::FullNodeTypesAdapter;
+    use reth_node_ethereum::EthereumNode;
+    use reth_payload_builder::PayloadBuilderHandle;
+    use reth_provider::noop::NoopProvider;
+    use reth_tasks::TaskManager;
+    use reth_transaction_pool::noop::NoopTransactionPool;
+
+    #[test]
+    fn test_noop_components() {
+        let components = Components::<
+            FullNodeTypesAdapter<EthereumNode, DatabaseMock, NoopProvider>,
+            NoopNetwork<EthNetworkPrimitives>,
+            _,
+            NoopEvmConfig<MockEvmConfig>,
+            _,
+        > {
+            transaction_pool: NoopTransactionPool::default(),
+            evm_config: NoopEvmConfig::default(),
+            consensus: NoopConsensus::default(),
+            network: NoopNetwork::default(),
+            payload_builder_handle: PayloadBuilderHandle::<EthEngineTypes>::noop(),
+        };
+
+        let task_executor = {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let handle = runtime.handle().clone();
+            let manager = TaskManager::new(handle);
+            manager.executor()
+        };
+
+        let node = NodeAdapter { components, task_executor, provider: NoopProvider::default() };
+
+        // test that node implements `FullNodeComponents``
+        <NodeAdapter<_, _> as FullNodeComponents>::pool(&node);
     }
 }

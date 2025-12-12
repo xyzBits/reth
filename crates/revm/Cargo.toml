@@ -23,13 +23,10 @@ alloy-primitives.workspace = true
 
 # revm
 revm.workspace = true
-revm-database.workspace = true
-revm-inspector.workspace = true
 
 [dev-dependencies]
 reth-trie.workspace = true
 reth-ethereum-forks.workspace = true
-alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 
 [features]
@@ -40,8 +37,6 @@ std = [
     "revm/std",
     "alloy-consensus/std",
     "reth-ethereum-forks/std",
-    "revm-database/std",
-    "revm-inspector/std",
     "reth-storage-api/std",
     "reth-storage-errors/std",
 ]
@@ -50,7 +45,6 @@ test-utils = [
     "dep:reth-trie",
     "reth-primitives-traits/test-utils",
     "reth-trie?/test-utils",
-    "revm/test-utils",
 ]
 serde = [
     "revm/serde",
@@ -58,7 +52,20 @@ serde = [
     "alloy-consensus/serde",
     "reth-trie?/serde",
     "reth-ethereum-forks/serde",
-    "revm-database/serde",
     "reth-primitives-traits/serde",
-    "revm-inspector/serde",
+    "reth-storage-api/serde",
 ]
+portable = ["revm/portable"]
+optional-balance-check = ["revm/optional_balance_check"]
+optional-block-gas-limit = ["revm/optional_block_gas_limit"]
+optional-eip3541 = ["revm/optional_eip3541"]
+optional-eip3607 = ["revm/optional_eip3607"]
+optional-no-base-fee = ["revm/optional_no_base_fee"]
+optional-checks = [
+    "optional-balance-check",
+    "optional-block-gas-limit",
+    "optional-eip3541",
+    "optional-eip3607",
+    "optional-no-base-fee",
+]
+memory_limit = ["revm/memory_limit"]

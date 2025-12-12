@@ -1,74 +1,31 @@
 //! Support for building a pending block with transactions from local view of mempool.
 
-use alloy_consensus::BlockHeader;
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::{execute::BlockExecutionStrategyFactory, NextBlockEnvAttributes};
-use reth_node_api::NodePrimitives;
-use reth_primitives::SealedHeader;
-use reth_provider::{
-    BlockReader, BlockReaderIdExt, ChainSpecProvider, ProviderBlock, ProviderHeader,
-    ProviderReceipt, ProviderTx, StateProviderFactory,
-};
+use crate::EthApi;
+use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{
-    helpers::{LoadPendingBlock, SpawnBlocking},
-    types::RpcTypes,
+    helpers::{pending_block::PendingEnvBuilder, LoadPendingBlock},
     FromEvmError, RpcNodeCore,
 };
-use reth_rpc_eth_types::PendingBlock;
-use reth_transaction_pool::{PoolTransaction, TransactionPool};
-use revm_primitives::B256;
+use reth_rpc_eth_types::{builder::config::PendingBlockKind, EthApiError, PendingBlock};
 
-use crate::EthApi;
-
-impl<Provider, Pool, Network, EvmConfig> LoadPendingBlock
-    for EthApi<Provider, Pool, Network, EvmConfig>
+impl<N, Rpc> LoadPendingBlock for EthApi<N, Rpc>
 where
-    Self: SpawnBlocking<
-            NetworkTypes: RpcTypes<Header = alloy_rpc_types_eth::Header>,
-            Error: FromEvmError<Self::Evm>,
-        > + RpcNodeCore<
-            Provider: BlockReaderIdExt<
-                Transaction = reth_primitives::TransactionSigned,
-                Block = reth_primitives::Block,
-                Receipt = reth_primitives::Receipt,
-                Header = reth_primitives::Header,
-            > + ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
-                          + StateProviderFactory,
-            Pool: TransactionPool<
-                Transaction: PoolTransaction<Consensus = ProviderTx<Self::Provider>>,
-            >,
-            Evm: BlockExecutionStrategyFactory<
-                Primitives: NodePrimitives<
-                    BlockHeader = ProviderHeader<Self::Provider>,
-                    SignedTx = ProviderTx<Self::Provider>,
-                    Receipt = ProviderReceipt<Self::Provider>,
-                    Block = ProviderBlock<Self::Provider>,
-                >,
-                NextBlockEnvCtx = NextBlockEnvAttributes,
-            >,
-        >,
-    Provider: BlockReader<Block = reth_primitives::Block, Receipt = reth_primitives::Receipt>,
+    N: RpcNodeCore,
+    EthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
     #[inline]
-    fn pending_block(
-        &self,
-    ) -> &tokio::sync::Mutex<
-        Option<PendingBlock<ProviderBlock<Self::Provider>, ProviderReceipt<Self::Provider>>>,
-    > {
+    fn pending_block(&self) -> &tokio::sync::Mutex<Option<PendingBlock<Self::Primitives>>> {
         self.inner.pending_block()
     }
 
-    fn next_env_attributes(
-        &self,
-        parent: &SealedHeader<ProviderHeader<Self::Provider>>,
-    ) -> Result<<Self::Evm as reth_evm::ConfigureEvmEnv>::NextBlockEnvCtx, Self::Error> {
-        Ok(NextBlockEnvAttributes {
-            timestamp: parent.timestamp().saturating_add(12),
-            suggested_fee_recipient: parent.beneficiary(),
-            prev_randao: B256::random(),
-            gas_limit: parent.gas_limit(),
-            parent_beacon_block_root: parent.parent_beacon_block_root(),
-            withdrawals: None,
-        })
+    #[inline]
+    fn pending_env_builder(&self) -> &dyn PendingEnvBuilder<Self::Evm> {
+        self.inner.pending_env_builder()
+    }
+
+    #[inline]
+    fn pending_block_kind(&self) -> PendingBlockKind {
+        self.inner.pending_block_kind()
     }
 }

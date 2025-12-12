@@ -11,6 +11,7 @@ exclude_crates=(
   # The following require investigation if they can be fixed
   reth-basic-payload-builder
   reth-bench
+  reth-bench-compare
   reth-cli
   reth-cli-commands
   reth-cli-runner
@@ -32,7 +33,6 @@ exclude_crates=(
   reth-exex-test-utils
   reth-ipc
   reth-net-nat
-  reth-network-ress
   reth-network
   reth-node-api
   reth-node-builder
@@ -41,36 +41,47 @@ exclude_crates=(
   reth-node-events
   reth-node-metrics
   reth-optimism-cli
+  reth-optimism-flashblocks
   reth-optimism-node
   reth-optimism-payload-builder
   reth-optimism-rpc
   reth-optimism-storage
-  reth-optimism-chain-registry
   reth-rpc
   reth-rpc-api
   reth-rpc-api-testing-util
   reth-rpc-builder
+  reth-rpc-convert
+  reth-rpc-e2e-tests
   reth-rpc-engine-api
   reth-rpc-eth-api
   reth-rpc-eth-types
   reth-rpc-layer
   reth-stages
   reth-engine-local
+  reth-ress-protocol
+  reth-ress-provider
   # The following are not supposed to be working
   reth # all of the crates below
+  reth-storage-rpc-provider
   reth-invalid-block-hooks # reth-provider
   reth-libmdbx # mdbx
   reth-mdbx-sys # mdbx
   reth-payload-builder # reth-metrics
   reth-provider # tokio
   reth-prune # tokio
+  reth-prune-static-files # reth-provider
   reth-stages-api # reth-provider, reth-prune
   reth-static-file # tokio
   reth-transaction-pool # c-kzg
   reth-payload-util # reth-transaction-pool
   reth-trie-parallel # tokio
+  reth-trie-sparse-parallel # rayon
   reth-testing-utils
   reth-optimism-txpool # reth-transaction-pool
+  reth-era-downloader # tokio
+  reth-era-utils # tokio
+  reth-tracing-otlp
+  reth-node-ethstats
 )
 
 # Array to hold the results

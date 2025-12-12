@@ -12,17 +12,15 @@ use crate::{
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use futures::Future;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_cli_util::get_secret_key;
 use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
-use reth_engine_tree::tree::TreeConfig;
 use reth_exex::ExExContext;
 use reth_network::{
-    transactions::TransactionsManagerConfig, NetworkBuilder, NetworkConfig, NetworkConfigBuilder,
-    NetworkHandle, NetworkManager, NetworkPrimitives,
+    transactions::{TransactionPropagationPolicy, TransactionsManagerConfig},
+    NetworkBuilder, NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager,
+    NetworkPrimitives,
 };
 use reth_node_api::{
-    FullNodePrimitives, FullNodeTypes, FullNodeTypesAdapter, NodeAddOns, NodeTypes,
-    NodeTypesWithDBAdapter, NodeTypesWithEngine,
+    FullNodeTypes, FullNodeTypesAdapter, NodeAddOns, NodeTypes, NodeTypesWithDBAdapter,
 };
 use reth_node_core::{
     cli::config::{PayloadBuilderConfig, RethTransactionPoolConfig},
@@ -50,7 +48,7 @@ pub use states::*;
 pub type RethFullAdapter<DB, Types> =
     FullNodeTypesAdapter<Types, DB, BlockchainProvider<NodeTypesWithDBAdapter<Types, DB>>>;
 
-#[allow(clippy::doc_markdown)]
+#[expect(clippy::doc_markdown)]
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Declaratively construct a node.
 ///
@@ -61,7 +59,8 @@ pub type RethFullAdapter<DB, Types> =
 ///
 /// Configuring a node starts out with a [`NodeConfig`] (this can be obtained from cli arguments for
 /// example) and then proceeds to configure the core static types of the node:
-/// [`NodeTypesWithEngine`], these include the node's primitive types and the node's engine types.
+/// [`NodeTypes`], these include the node's primitive types and the node's engine
+/// types.
 ///
 /// Next all stateful components of the node are configured, these include all the
 /// components of the node that are downstream of those types, these include:
@@ -127,10 +126,10 @@ pub type RethFullAdapter<DB, Types> =
 ///
 /// ## Internals
 ///
-/// The node builder is fully type safe, it uses the [`NodeTypesWithEngine`] trait to enforce that
+/// The node builder is fully type safe, it uses the [`NodeTypes`] trait to enforce that
 /// all components are configured with the correct types. However the database types and with that
 /// the provider trait implementations are currently created by the builder itself during the launch
-/// process, hence the database type is not part of the [`NodeTypesWithEngine`] trait and the node's
+/// process, hence the database type is not part of the [`NodeTypes`] trait and the node's
 /// components, that depend on the database, are configured separately. In order to have a nice
 /// trait that encapsulates the entire node the
 /// [`FullNodeComponents`](reth_node_api::FullNodeComponents) trait was introduced. This
@@ -159,6 +158,48 @@ impl<ChainSpec> NodeBuilder<(), ChainSpec> {
     pub const fn new(config: NodeConfig<ChainSpec>) -> Self {
         Self { config, database: () }
     }
+}
+
+impl<DB, ChainSpec> NodeBuilder<DB, ChainSpec> {
+    /// Returns a reference to the node builder's config.
+    pub const fn config(&self) -> &NodeConfig<ChainSpec> {
+        &self.config
+    }
+
+    /// Returns a mutable reference to the node builder's config.
+    pub const fn config_mut(&mut self) -> &mut NodeConfig<ChainSpec> {
+        &mut self.config
+    }
+
+    /// Returns a reference to the node's database
+    pub const fn db(&self) -> &DB {
+        &self.database
+    }
+
+    /// Returns a mutable reference to the node's database
+    pub const fn db_mut(&mut self) -> &mut DB {
+        &mut self.database
+    }
+
+    /// Applies a fallible function to the builder.
+    pub fn try_apply<F, R>(self, f: F) -> Result<Self, R>
+    where
+        F: FnOnce(Self) -> Result<Self, R>,
+    {
+        f(self)
+    }
+
+    /// Applies a fallible function to the builder, if the condition is `true`.
+    pub fn try_apply_if<F, R>(self, cond: bool, f: F) -> Result<Self, R>
+    where
+        F: FnOnce(Self) -> Result<Self, R>,
+    {
+        if cond {
+            f(self)
+        } else {
+            Ok(self)
+        }
+    }
 
     /// Apply a function to the builder
     pub fn apply<F>(self, f: F) -> Self
@@ -181,18 +222,6 @@ impl<ChainSpec> NodeBuilder<(), ChainSpec> {
     }
 }
 
-impl<DB, ChainSpec> NodeBuilder<DB, ChainSpec> {
-    /// Returns a reference to the node builder's config.
-    pub const fn config(&self) -> &NodeConfig<ChainSpec> {
-        &self.config
-    }
-
-    /// Returns a mutable reference to the node builder's config.
-    pub fn config_mut(&mut self) -> &mut NodeConfig<ChainSpec> {
-        &mut self.config
-    }
-}
-
 impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     /// Configures the underlying database that the node will use.
     pub fn with_database<D>(self, database: D) -> NodeBuilder<D, ChainSpec> {
@@ -209,14 +238,25 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     /// Creates an _ephemeral_ preconfigured node for testing purposes.
     #[cfg(feature = "test-utils")]
     pub fn testing_node(
-        mut self,
+        self,
         task_executor: TaskExecutor,
     ) -> WithLaunchContext<
         NodeBuilder<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>, ChainSpec>,
     > {
-        let path = reth_node_core::dirs::MaybePlatformPath::<DataDirPath>::from(
-            reth_db::test_utils::tempdir_path(),
-        );
+        let path = reth_db::test_utils::tempdir_path();
+        self.testing_node_with_datadir(task_executor, path)
+    }
+
+    /// Creates a preconfigured node for testing purposes with a specific datadir.
+    #[cfg(feature = "test-utils")]
+    pub fn testing_node_with_datadir(
+        mut self,
+        task_executor: TaskExecutor,
+        datadir: impl Into<std::path::PathBuf>,
+    ) -> WithLaunchContext<
+        NodeBuilder<Arc<reth_db::test_utils::TempDatabase<reth_db::DatabaseEnv>>, ChainSpec>,
+    > {
+        let path = reth_node_core::dirs::MaybePlatformPath::<DataDirPath>::from(datadir.into());
         self.config = self.config.with_datadir_args(reth_node_core::args::DatadirArgs {
             datadir: path.clone(),
             ..Default::default()
@@ -239,7 +279,7 @@ where
     /// Configures the types of the node.
     pub fn with_types<T>(self) -> NodeBuilderWithTypes<RethFullAdapter<DB, T>>
     where
-        T: NodeTypesWithEngine<ChainSpec = ChainSpec> + NodeTypesForProvider,
+        T: NodeTypesForProvider<ChainSpec = ChainSpec>,
     {
         self.with_types_and_provider()
     }
@@ -249,7 +289,7 @@ where
         self,
     ) -> NodeBuilderWithTypes<FullNodeTypesAdapter<T, DB, P>>
     where
-        T: NodeTypesWithEngine<ChainSpec = ChainSpec> + NodeTypesForProvider,
+        T: NodeTypesForProvider<ChainSpec = ChainSpec>,
         P: FullProvider<NodeTypesWithDBAdapter<T, DB>>,
     {
         NodeBuilderWithTypes::new(self.config, self.database)
@@ -269,7 +309,7 @@ where
     }
 }
 
-/// A [`NodeBuilder`] with it's launch context already configured.
+/// A [`NodeBuilder`] with its launch context already configured.
 ///
 /// This exposes the same methods as [`NodeBuilder`] but with the launch context already configured,
 /// See [`WithLaunchContext::launch`]
@@ -290,6 +330,11 @@ impl<DB, ChainSpec> WithLaunchContext<NodeBuilder<DB, ChainSpec>> {
     pub const fn config(&self) -> &NodeConfig<ChainSpec> {
         self.builder.config()
     }
+
+    /// Returns a mutable reference to the node builder's config.
+    pub const fn config_mut(&mut self) -> &mut NodeConfig<ChainSpec> {
+        self.builder.config_mut()
+    }
 }
 
 impl<DB, ChainSpec> WithLaunchContext<NodeBuilder<DB, ChainSpec>>
@@ -300,7 +345,7 @@ where
     /// Configures the types of the node.
     pub fn with_types<T>(self) -> WithLaunchContext<NodeBuilderWithTypes<RethFullAdapter<DB, T>>>
     where
-        T: NodeTypesWithEngine<ChainSpec = ChainSpec> + NodeTypesForProvider,
+        T: NodeTypesForProvider<ChainSpec = ChainSpec>,
     {
         WithLaunchContext { builder: self.builder.with_types(), task_executor: self.task_executor }
     }
@@ -310,7 +355,7 @@ where
         self,
     ) -> WithLaunchContext<NodeBuilderWithTypes<FullNodeTypesAdapter<T, DB, P>>>
     where
-        T: NodeTypesWithEngine<ChainSpec = ChainSpec> + NodeTypesForProvider,
+        T: NodeTypesForProvider<ChainSpec = ChainSpec>,
         P: FullProvider<NodeTypesWithDBAdapter<T, DB>>,
     {
         WithLaunchContext {
@@ -355,7 +400,6 @@ where
                 <N::ComponentsBuilder as NodeComponentsBuilder<RethFullAdapter<DB, N>>>::Components,
             >,
         >,
-        N::Primitives: FullNodePrimitives,
         EngineNodeLauncher: LaunchNode<
             NodeBuilderWithComponents<RethFullAdapter<DB, N>, N::ComponentsBuilder, N::AddOns>,
         >,
@@ -412,6 +456,41 @@ where
         &self.builder.config
     }
 
+    /// Returns a mutable reference to the node builder's config.
+    pub const fn config_mut(&mut self) -> &mut NodeConfig<<T::Types as NodeTypes>::ChainSpec> {
+        &mut self.builder.config
+    }
+
+    /// Returns a reference to node's database.
+    pub const fn db(&self) -> &T::DB {
+        &self.builder.adapter.database
+    }
+
+    /// Returns a mutable reference to node's database.
+    pub const fn db_mut(&mut self) -> &mut T::DB {
+        &mut self.builder.adapter.database
+    }
+
+    /// Applies a fallible function to the builder.
+    pub fn try_apply<F, R>(self, f: F) -> Result<Self, R>
+    where
+        F: FnOnce(Self) -> Result<Self, R>,
+    {
+        f(self)
+    }
+
+    /// Applies a fallible function to the builder, if the condition is `true`.
+    pub fn try_apply_if<F, R>(self, cond: bool, f: F) -> Result<Self, R>
+    where
+        F: FnOnce(Self) -> Result<Self, R>,
+    {
+        if cond {
+            f(self)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Apply a function to the builder
     pub fn apply<F>(self, f: F) -> Self
     where
@@ -454,6 +533,27 @@ where
     }
 
     /// Modifies the addons with the given closure.
+    ///
+    /// This method provides access to methods on the addons type that don't have
+    /// direct builder methods. It's useful for advanced configuration scenarios
+    /// where you need to call addon-specific methods.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use tower::layer::util::Identity;
+    ///
+    /// let builder = NodeBuilder::new(config)
+    ///     .with_types::<EthereumNode>()
+    ///     .with_components(EthereumNode::components())
+    ///     .with_add_ons(EthereumAddOns::default())
+    ///     .map_add_ons(|addons| addons.with_rpc_middleware(Identity::default()));
+    /// ```
+    ///
+    /// # See also
+    ///
+    /// - [`NodeAddOns`] trait for available addon types
+    /// - [`crate::NodeBuilderWithComponents::extend_rpc_modules`] for RPC module configuration
     pub fn map_add_ons<F>(self, f: F) -> Self
     where
         F: FnOnce(AO) -> AO,
@@ -475,6 +575,39 @@ where
     }
 
     /// Sets the hook that is run to configure the rpc modules.
+    ///
+    /// This hook can obtain the node's components (txpool, provider, etc.) and can modify the
+    /// modules that the RPC server installs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    ///
+    /// #[derive(Clone)]
+    /// struct CustomApi<Pool> { pool: Pool }
+    ///
+    /// #[rpc(server, namespace = "custom")]
+    /// impl CustomApi {
+    ///     #[method(name = "hello")]
+    ///     async fn hello(&self) -> RpcResult<String> {
+    ///         Ok("World".to_string())
+    ///     }
+    /// }
+    ///
+    /// let node = NodeBuilder::new(config)
+    ///     .node(EthereumNode::default())
+    ///     .extend_rpc_modules(|ctx| {
+    ///         // Access node components, so they can used by the CustomApi
+    ///         let pool = ctx.pool().clone();
+    ///
+    ///         // Add custom RPC namespace
+    ///         ctx.modules.merge_configured(CustomApi { pool }.into_rpc())?;
+    ///
+    ///         Ok(())
+    ///     })
+    ///     .build()?;
+    /// ```
     pub fn extend_rpc_modules<F>(self, hook: F) -> Self
     where
         F: FnOnce(RpcContext<'_, NodeAdapter<T, CB::Components>, AO::EthApi>) -> eyre::Result<()>
@@ -549,52 +682,42 @@ where
     where
         EngineNodeLauncher: LaunchNode<NodeBuilderWithComponents<T, CB, AO>>,
     {
-        let Self { builder, task_executor } = self;
-
-        let engine_tree_config = TreeConfig::default()
-            .with_persistence_threshold(builder.config.engine.persistence_threshold)
-            .with_memory_block_buffer_target(builder.config.engine.memory_block_buffer_target)
-            .with_legacy_state_root(builder.config.engine.legacy_state_root_task_enabled)
-            .with_caching_and_prewarming(builder.config.engine.caching_and_prewarming_enabled)
-            .with_always_compare_trie_updates(builder.config.engine.state_root_task_compare_updates)
-            .with_cross_block_cache_size(
-                builder.config.engine.cross_block_cache_size * 1024 * 1024,
-            );
-
-        let launcher =
-            EngineNodeLauncher::new(task_executor, builder.config.datadir(), engine_tree_config);
-        builder.launch_with(launcher).await
+        let launcher = self.engine_api_launcher();
+        self.builder.launch_with(launcher).await
     }
 
     /// Launches the node with the [`DebugNodeLauncher`].
     ///
     /// This is equivalent to [`WithLaunchContext::launch`], but will enable the debugging features,
     /// if they are configured.
-    pub async fn launch_with_debug_capabilities(
+    pub fn launch_with_debug_capabilities(
         self,
-    ) -> eyre::Result<<DebugNodeLauncher as LaunchNode<NodeBuilderWithComponents<T, CB, AO>>>::Node>
+    ) -> <DebugNodeLauncher as LaunchNode<NodeBuilderWithComponents<T, CB, AO>>>::Future
     where
         T::Types: DebugNode<NodeAdapter<T, CB::Components>>,
         DebugNodeLauncher: LaunchNode<NodeBuilderWithComponents<T, CB, AO>>,
     {
         let Self { builder, task_executor } = self;
 
-        let engine_tree_config = TreeConfig::default()
-            .with_persistence_threshold(builder.config.engine.persistence_threshold)
-            .with_memory_block_buffer_target(builder.config.engine.memory_block_buffer_target)
-            .with_legacy_state_root(builder.config.engine.legacy_state_root_task_enabled)
-            .with_caching_and_prewarming(builder.config.engine.caching_and_prewarming_enabled)
-            .with_always_compare_trie_updates(builder.config.engine.state_root_task_compare_updates)
-            .with_cross_block_cache_size(
-                builder.config.engine.cross_block_cache_size * 1024 * 1024,
-            );
+        let engine_tree_config = builder.config.engine.tree_config();
 
         let launcher = DebugNodeLauncher::new(EngineNodeLauncher::new(
             task_executor,
             builder.config.datadir(),
             engine_tree_config,
         ));
-        builder.launch_with(launcher).await
+        builder.launch_with(launcher)
+    }
+
+    /// Returns an [`EngineNodeLauncher`] that can be used to launch the node with engine API
+    /// support.
+    pub fn engine_api_launcher(&self) -> EngineNodeLauncher {
+        let engine_tree_config = self.builder.config.engine.tree_config();
+        EngineNodeLauncher::new(
+            self.task_executor.clone(),
+            self.builder.config.datadir(),
+            engine_tree_config,
+        )
     }
 }
 
@@ -634,6 +757,11 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
     /// Returns the config of the node.
     pub const fn config(&self) -> &NodeConfig<<Node::Types as NodeTypes>::ChainSpec> {
         &self.config_container.config
+    }
+
+    /// Returns a mutable reference to the config of the node.
+    pub const fn config_mut(&mut self) -> &mut NodeConfig<<Node::Types as NodeTypes>::ChainSpec> {
+        &mut self.config_container.config
     }
 
     /// Returns the loaded reh.toml config.
@@ -693,20 +821,26 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
             + 'static,
         Node::Provider: BlockReaderFor<N>,
     {
-        self.start_network_with(builder, pool, Default::default())
+        self.start_network_with(
+            builder,
+            pool,
+            self.config().network.transactions_manager_config(),
+            self.config().network.tx_propagation_policy,
+        )
     }
 
     /// Convenience function to start the network tasks.
     ///
-    /// Accepts the config for the transaction task.
+    /// Accepts the config for the transaction task and the policy for propagation.
     ///
     /// Spawns the configured network and associated tasks and returns the [`NetworkHandle`]
     /// connected to that network.
-    pub fn start_network_with<Pool, N>(
+    pub fn start_network_with<Pool, N, Policy>(
         &self,
         builder: NetworkBuilder<(), (), N>,
         pool: Pool,
         tx_config: TransactionsManagerConfig,
+        propagation_policy: Policy,
     ) -> NetworkHandle<N>
     where
         N: NetworkPrimitives,
@@ -718,21 +852,22 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
             > + Unpin
             + 'static,
         Node::Provider: BlockReaderFor<N>,
+        Policy: TransactionPropagationPolicy<N>,
     {
         let (handle, network, txpool, eth) = builder
-            .transactions(pool, tx_config)
+            .transactions_with_policy(pool, tx_config, propagation_policy)
             .request_handler(self.provider().clone())
             .split_with_handle();
 
-        self.executor.spawn_critical("p2p txpool", txpool);
-        self.executor.spawn_critical("p2p eth request handler", eth);
+        self.executor.spawn_critical_blocking("p2p txpool", Box::pin(txpool));
+        self.executor.spawn_critical_blocking("p2p eth request handler", Box::pin(eth));
 
         let default_peers_path = self.config().datadir().known_peers();
         let known_peers_file = self.config().network.persistent_peers_file(default_peers_path);
         self.executor.spawn_critical_with_graceful_shutdown_signal(
             "p2p network task",
             |shutdown| {
-                network.run_until_graceful_shutdown(shutdown, |network| {
+                Box::pin(network.run_until_graceful_shutdown(shutdown, |network| {
                     if let Some(peers_file) = known_peers_file {
                         let num_known_peers = network.num_known_peers();
                         trace!(target: "reth::cli", peers_file=?peers_file, num_peers=%num_known_peers, "Saving current peers");
@@ -745,7 +880,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                             }
                         }
                     }
-                })
+                }))
             },
         );
 
@@ -754,9 +889,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
 
     /// Get the network secret from the given data dir
     fn network_secret(&self, data_dir: &ChainPath<DataDirPath>) -> eyre::Result<SecretKey> {
-        let network_secret_path =
-            self.config().network.p2p_secret_key.clone().unwrap_or_else(|| data_dir.p2p_secret());
-        let secret_key = get_secret_key(&network_secret_path)?;
+        let secret_key = self.config().network.secret_key(data_dir.p2p_secret())?;
         Ok(secret_key)
     }
 

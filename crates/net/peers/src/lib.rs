@@ -51,7 +51,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     #[cfg(feature = "secp256k1")]
     fn pk2id2pk() {
-        let prikey = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let prikey = secp256k1::SecretKey::new(&mut rand_08::thread_rng());
         let pubkey = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &prikey);
         assert_eq!(pubkey, id2pk(pk2id(&pubkey)).unwrap());
     }

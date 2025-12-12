@@ -19,11 +19,15 @@ cond_mod!(
     header,
     log,
     signature,
-    transaction,
     trie,
     txkind,
     withdrawal
 );
+
+#[cfg(all(feature = "op", feature = "std"))]
+pub mod optimism;
+
+pub mod transaction;
 
 #[cfg(test)]
 mod tests {

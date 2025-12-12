@@ -1,9 +1,9 @@
 use crate::BlockProvider;
-use alloy_consensus::BlockHeader;
-use alloy_provider::{Network, Provider, ProviderBuilder};
-use futures::StreamExt;
+use alloy_provider::{ConnectionConfig, Network, Provider, ProviderBuilder, WebSocketConfig};
+use alloy_transport::TransportResult;
+use futures::{Stream, StreamExt};
 use reth_node_api::Block;
-use reth_tracing::tracing::warn;
+use reth_tracing::tracing::{debug, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
@@ -26,15 +26,43 @@ impl<N: Network, PrimitiveBlock> RpcBlockProvider<N, PrimitiveBlock> {
     ) -> eyre::Result<Self> {
         Ok(Self {
             provider: Arc::new(
-                ProviderBuilder::new()
-                    .disable_recommended_fillers()
-                    .network::<N>()
-                    .on_builtin(rpc_url)
+                ProviderBuilder::default()
+                    .connect_with_config(
+                        rpc_url,
+                        ConnectionConfig::default().with_max_retries(u32::MAX).with_ws_config(
+                            WebSocketConfig::default()
+                                // allow larger messages/frames for big blocks
+                                .max_frame_size(Some(128 * 1024 * 1024))
+                                .max_message_size(Some(128 * 1024 * 1024)),
+                        ),
+                    )
                     .await?,
             ),
             url: rpc_url.to_string(),
             convert: Arc::new(convert),
         })
+    }
+
+    /// Obtains a full block stream.
+    ///
+    /// This first attempts to obtain an `eth_subscribe` subscription, if that fails because the
+    /// connection is not a websocket, this falls back to poll based subscription.
+    async fn full_block_stream(
+        &self,
+    ) -> TransportResult<impl Stream<Item = TransportResult<N::BlockResponse>>> {
+        // first try to obtain a regular subscription
+        match self.provider.subscribe_full_blocks().full().into_stream().await {
+            Ok(sub) => Ok(sub.left_stream()),
+            Err(err) => {
+                debug!(
+                    target: "consensus::debug-client",
+                    %err,
+                    url=%self.url,
+                    "Failed to establish block subscription",
+                );
+                Ok(self.provider.watch_full_blocks().await?.full().into_stream().right_stream())
+            }
+        }
     }
 }
 
@@ -45,42 +73,50 @@ where
     type Block = PrimitiveBlock;
 
     async fn subscribe_blocks(&self, tx: Sender<Self::Block>) {
-        let mut stream = match self.provider.subscribe_blocks().await {
-            Ok(sub) => sub.into_stream(),
-            Err(err) => {
+        loop {
+            let Ok(mut stream) = self.full_block_stream().await.inspect_err(|err| {
                 warn!(
                     target: "consensus::debug-client",
                     %err,
                     url=%self.url,
                     "Failed to subscribe to blocks",
                 );
-                return;
-            }
-        };
-        while let Some(header) = stream.next().await {
-            match self.get_block(header.number()).await {
-                Ok(block) => {
-                    if tx.send(block).await.is_err() {
-                        // Channel closed.
-                        break;
+            }) else {
+                return
+            };
+
+            while let Some(res) = stream.next().await {
+                match res {
+                    Ok(block) => {
+                        if tx.send((self.convert)(block)).await.is_err() {
+                            // Channel closed.
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "consensus::debug-client",
+                            %err,
+                            url=%self.url,
+                            "Failed to fetch a block",
+                        );
                     }
                 }
-                Err(err) => {
-                    warn!(
-                        target: "consensus::debug-client",
-                        %err,
-                        url=%self.url,
-                        "Failed to fetch a block",
-                    );
-                }
             }
+            // if stream terminated we want to re-establish it again
+            debug!(
+                target: "consensus::debug-client",
+                url=%self.url,
+                "Re-estbalishing block subscription",
+            );
         }
     }
 
     async fn get_block(&self, block_number: u64) -> eyre::Result<Self::Block> {
         let block = self
             .provider
-            .get_block_by_number(block_number.into(), true.into())
+            .get_block_by_number(block_number.into())
+            .full()
             .await?
             .ok_or_else(|| eyre::eyre!("block not found by number {}", block_number))?;
         Ok((self.convert)(block))

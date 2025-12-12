@@ -16,7 +16,6 @@
 //! # use reth_downloaders::bodies::bodies::BodiesDownloaderBuilder;
 //! # use reth_downloaders::headers::reverse_headers::ReverseHeadersDownloaderBuilder;
 //! # use reth_network_p2p::test_utils::{TestBodiesClient, TestHeadersClient};
-//! # use reth_evm_ethereum::execute::EthExecutorProvider;
 //! # use alloy_primitives::B256;
 //! # use reth_chainspec::MAINNET;
 //! # use reth_prune_types::PruneModes;
@@ -35,23 +34,24 @@
 //! # use reth_consensus::FullConsensus;
 //! #
 //! # let chain_spec = MAINNET.clone();
-//! # let consensus: Arc<dyn FullConsensus<reth_primitives::EthPrimitives, Error = ConsensusError>> = Arc::new(TestConsensus::default());
+//! # let consensus: Arc<dyn FullConsensus<reth_ethereum_primitives::EthPrimitives, Error = ConsensusError>> = Arc::new(TestConsensus::default());
 //! # let headers_downloader = ReverseHeadersDownloaderBuilder::default().build(
 //! #    Arc::new(TestHeadersClient::default()),
-//! #    consensus.clone().as_header_validator()
+//! #    consensus.clone()
 //! # );
 //! # let provider_factory = create_test_provider_factory();
 //! # let bodies_downloader = BodiesDownloaderBuilder::default().build(
 //! #    Arc::new(TestBodiesClient { responder: |_| Ok((PeerId::ZERO, vec![]).into()) }),
-//! #    consensus.clone().as_consensus(),
+//! #    consensus.clone(),
 //! #    provider_factory.clone()
 //! # );
 //! # let (tip_tx, tip_rx) = watch::channel(B256::default());
-//! # let executor_provider = EthExecutorProvider::mainnet();
+//! # let executor_provider = EthEvmConfig::mainnet();
 //! # let static_file_producer = StaticFileProducer::new(
 //! #    provider_factory.clone(),
 //! #    PruneModes::default()
 //! # );
+//! # let era_import_source = None;
 //! // Create a pipeline that can fully sync
 //! # let pipeline =
 //! Pipeline::<MockNodeTypesWithDB>::builder()
@@ -65,6 +65,7 @@
 //!         executor_provider,
 //!         StageConfig::default(),
 //!         PruneModes::default(),
+//!         era_import_source,
 //!     ))
 //!     .build(provider_factory, static_file_producer);
 //! ```
@@ -78,10 +79,10 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 

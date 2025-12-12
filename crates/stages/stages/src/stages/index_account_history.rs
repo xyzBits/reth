@@ -67,23 +67,22 @@ where
                 )
             })
             .transpose()?
-            .flatten()
+            .flatten() &&
+            target_prunable_block > input.checkpoint().block_number
         {
-            if target_prunable_block > input.checkpoint().block_number {
-                input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
+            input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
 
-                // Save prune checkpoint only if we don't have one already.
-                // Otherwise, pruner may skip the unpruned range of blocks.
-                if provider.get_prune_checkpoint(PruneSegment::AccountHistory)?.is_none() {
-                    provider.save_prune_checkpoint(
-                        PruneSegment::AccountHistory,
-                        PruneCheckpoint {
-                            block_number: Some(target_prunable_block),
-                            tx_number: None,
-                            prune_mode,
-                        },
-                    )?;
-                }
+            // Save prune checkpoint only if we don't have one already.
+            // Otherwise, pruner may skip the unpruned range of blocks.
+            if provider.get_prune_checkpoint(PruneSegment::AccountHistory)?.is_none() {
+                provider.save_prune_checkpoint(
+                    PruneSegment::AccountHistory,
+                    PruneCheckpoint {
+                        block_number: Some(target_prunable_block),
+                        tx_number: None,
+                        prune_mode,
+                    },
+                )?;
             }
         }
 
@@ -165,7 +164,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    const ADDRESS: Address = address!("0000000000000000000000000000000000000001");
+    const ADDRESS: Address = address!("0x0000000000000000000000000000000000000001");
 
     const LAST_BLOCK_IN_FULL_SHARD: BlockNumber = NUM_OF_INDICES_IN_SHARD as BlockNumber;
     const MAX_BLOCK: BlockNumber = NUM_OF_INDICES_IN_SHARD as BlockNumber + 2;

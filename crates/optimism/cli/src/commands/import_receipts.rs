@@ -1,8 +1,7 @@
 //! Command that imports OP mainnet receipts from Bedrock datadir, exported via
 //! <https://github.com/testinprod-io/op-geth/pull/1>.
 
-use std::path::{Path, PathBuf};
-
+use crate::receipt_file_codec::OpGethReceiptFileCodec;
 use clap::Parser;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
@@ -13,20 +12,22 @@ use reth_downloaders::{
 };
 use reth_execution_types::ExecutionOutcome;
 use reth_node_builder::ReceiptTy;
-use reth_node_core::version::SHORT_VERSION;
+use reth_node_core::version::version_metadata;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_primitives::{bedrock::is_dup_tx, OpPrimitives, OpReceipt};
-use reth_primitives::NodePrimitives;
+use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    providers::ProviderNodeTypes, writer::UnifiedStorageWriter, DatabaseProviderFactory,
-    OriginalValuesKnown, ProviderFactory, StageCheckpointReader, StageCheckpointWriter,
-    StateWriter, StaticFileProviderFactory, StatsReader, StorageLocation,
+    providers::ProviderNodeTypes, DBProvider, DatabaseProviderFactory, OriginalValuesKnown,
+    ProviderFactory, StageCheckpointReader, StageCheckpointWriter, StateWriter,
+    StaticFileProviderFactory, StatsReader,
 };
 use reth_stages::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::{debug, info, trace, warn};
-
-use crate::receipt_file_codec::OpGethReceiptFileCodec;
 
 /// Initializes the database with the genesis block.
 #[derive(Debug, Parser)]
@@ -51,7 +52,7 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportReceiptsOpCommand<C> {
     pub async fn execute<N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = OpPrimitives>>(
         self,
     ) -> eyre::Result<()> {
-        info!(target: "reth::cli", "reth {} starting", SHORT_VERSION);
+        info!(target: "reth::cli", "reth {} starting", version_metadata().short_version);
 
         debug!(target: "reth::cli",
             chunk_byte_len=self.chunk_len.unwrap_or(DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE),
@@ -77,6 +78,13 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> ImportReceiptsOpCommand<C> {
             },
         )
         .await
+    }
+}
+
+impl<C: ChainSpecParser> ImportReceiptsOpCommand<C> {
+    /// Returns the underlying chain being used to run this command
+    pub const fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
+        Some(&self.env.chain)
     }
 }
 
@@ -133,11 +141,10 @@ where
 
     // Ensure that receipts hasn't been initialized apart from `init_genesis`.
     if let Some(num_receipts) =
-        static_file_provider.get_highest_static_file_tx(StaticFileSegment::Receipts)
+        static_file_provider.get_highest_static_file_tx(StaticFileSegment::Receipts) &&
+        num_receipts > 0
     {
-        if num_receipts > 0 {
-            eyre::bail!("Expected no receipts in storage, but found {num_receipts}.");
-        }
+        eyre::bail!("Expected no receipts in storage, but found {num_receipts}.");
     }
     match static_file_provider.get_highest_static_file_block(StaticFileSegment::Receipts) {
         Some(receipts_block) => {
@@ -146,7 +153,9 @@ where
             }
         }
         None => {
-            eyre::bail!("Receipts was not initialized. Please import blocks and transactions before calling this command.");
+            eyre::bail!(
+                "Receipts was not initialized. Please import blocks and transactions before calling this command."
+            );
         }
     }
 
@@ -215,18 +224,11 @@ where
         // Update total_receipts after all filtering
         total_receipts += receipts.iter().map(|v| v.len()).sum::<usize>();
 
-        // We're reusing receipt writing code internal to
-        // `UnifiedStorageWriter::append_receipts_from_blocks`, so we just use a default empty
-        // `BundleState`.
         let execution_outcome =
             ExecutionOutcome::new(Default::default(), receipts, first_block, Default::default());
 
         // finally, write the receipts
-        provider.write_state(
-            &execution_outcome,
-            OriginalValuesKnown::Yes,
-            StorageLocation::StaticFiles,
-        )?;
+        provider.write_state(&execution_outcome, OriginalValuesKnown::Yes)?;
     }
 
     // Only commit if we have imported as many receipts as the number of transactions.
@@ -235,19 +237,23 @@ where
         .expect("transaction static files must exist before importing receipts");
 
     if total_receipts != total_imported_txns {
-        eyre::bail!("Number of receipts ({total_receipts}) inconsistent with transactions {total_imported_txns}")
+        eyre::bail!(
+            "Number of receipts ({total_receipts}) inconsistent with transactions {total_imported_txns}"
+        )
     }
 
     // Only commit if the receipt block height matches the one from transactions.
     if highest_block_receipts != highest_block_transactions {
-        eyre::bail!("Receipt block height ({highest_block_receipts}) inconsistent with transactions' {highest_block_transactions}")
+        eyre::bail!(
+            "Receipt block height ({highest_block_receipts}) inconsistent with transactions' {highest_block_transactions}"
+        )
     }
 
     // Required or any access-write provider factory will attempt to unwind to 0.
     provider
         .save_stage_checkpoint(StageId::Execution, StageCheckpoint::new(highest_block_receipts))?;
 
-    UnifiedStorageWriter::commit(provider)?;
+    provider.commit()?;
 
     Ok(ImportReceiptsResult { total_decoded_receipts, total_filtered_out_dup_txns })
 }
@@ -295,13 +301,13 @@ mod test {
         f.flush().await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
 
-        let reader =
-            ChunkedFileReader::from_file(f, DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE).await.unwrap();
+        let reader = ChunkedFileReader::from_file(f, DEFAULT_BYTE_LEN_CHUNK_CHAIN_FILE, false)
+            .await
+            .unwrap();
 
         let db = TestStageDB::default();
         init_genesis(&db.factory).unwrap();
 
-        // todo: where does import command init receipts ? probably somewhere in pipeline
         let provider_factory =
             create_test_provider_factory_with_node_types::<OpNode>(OP_MAINNET.clone());
         let ImportReceiptsResult { total_decoded_receipts, total_filtered_out_dup_txns } =

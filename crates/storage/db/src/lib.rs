@@ -1,6 +1,6 @@
 //! MDBX implementation for reth's database abstraction layer.
 //!
-//! This crate is an implementation of [`reth-db-api`] for MDBX, as well as a few other common
+//! This crate is an implementation of `reth-db-api` for MDBX, as well as a few other common
 //! database types.
 //!
 //! # Overview
@@ -13,7 +13,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod implementation;
 pub mod lockfile;
@@ -103,7 +103,7 @@ pub mod test_utils {
         }
 
         /// Returns the reference to inner db.
-        pub fn db(&self) -> &DB {
+        pub const fn db(&self) -> &DB {
             self.db.as_ref().unwrap()
         }
 
@@ -162,7 +162,7 @@ pub mod test_utils {
     /// Get a temporary directory path to use for the database
     pub fn tempdir_path() -> PathBuf {
         let builder = tempfile::Builder::new().prefix("reth-test-").rand_bytes(8).tempdir();
-        builder.expect(ERROR_TEMPDIR).into_path()
+        builder.expect(ERROR_TEMPDIR).keep()
     }
 
     /// Create read/write database for testing
@@ -185,12 +185,13 @@ pub mod test_utils {
     #[track_caller]
     pub fn create_test_rw_db_with_path<P: AsRef<Path>>(path: P) -> Arc<TempDatabase<DatabaseEnv>> {
         let path = path.as_ref().to_path_buf();
+        let emsg = format!("{ERROR_DB_CREATION}: {path:?}");
         let db = init_db(
             path.as_path(),
             DatabaseArguments::new(ClientVersion::default())
                 .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Unbounded)),
         )
-        .expect(ERROR_DB_CREATION);
+        .expect(&emsg);
         Arc::new(TempDatabase::new(db, path))
     }
 
@@ -201,8 +202,9 @@ pub mod test_utils {
             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Unbounded));
 
         let path = tempdir_path();
+        let emsg = format!("{ERROR_DB_CREATION}: {path:?}");
         {
-            init_db(path.as_path(), args.clone()).expect(ERROR_DB_CREATION);
+            init_db(path.as_path(), args.clone()).expect(&emsg);
         }
         let db = open_db_read_only(path.as_path(), args).expect(ERROR_DB_OPEN);
         Arc::new(TempDatabase::new(db, path))
