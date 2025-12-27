@@ -1,14 +1,15 @@
 use crate::{
     providers::{
-        ConsistentProvider, ProviderNodeTypes, StaticFileProvider, StaticFileProviderRWRefMut,
+        ConsistentProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider,
+        StaticFileProviderRWRefMut,
     },
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
     BlockSource, CanonChainTracker, CanonStateNotifications, CanonStateSubscriptions,
     ChainSpecProvider, ChainStateBlockReader, ChangeSetReader, DatabaseProviderFactory,
     HashedPostStateProvider, HeaderProvider, ProviderError, ProviderFactory, PruneCheckpointReader,
-    ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader, StateProviderBox,
-    StateProviderFactory, StateReader, StaticFileProviderFactory, TransactionVariant,
-    TransactionsProvider, TrieReader,
+    ReceiptProvider, ReceiptProviderIdExt, RocksDBProviderFactory, StageCheckpointReader,
+    StateProviderBox, StateProviderFactory, StateReader, StaticFileProviderFactory,
+    TransactionVariant, TransactionsProvider, TrieReader,
 };
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
@@ -173,6 +174,17 @@ impl<N: ProviderNodeTypes> StaticFileProviderFactory for BlockchainProvider<N> {
         segment: StaticFileSegment,
     ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
         self.database.get_static_file_writer(block, segment)
+    }
+}
+
+impl<N: ProviderNodeTypes> RocksDBProviderFactory for BlockchainProvider<N> {
+    fn rocksdb_provider(&self) -> RocksDBProvider {
+        self.database.rocksdb_provider()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, _batch: rocksdb::WriteBatchWithTransaction<true>) {
+        unimplemented!("BlockchainProvider wraps ProviderFactory - use DatabaseProvider::set_pending_rocksdb_batch instead")
     }
 }
 
@@ -863,7 +875,7 @@ mod tests {
         // Insert blocks into the database
         for block in &database_blocks {
             provider_rw.insert_block(
-                block.clone().try_recover().expect("failed to seal block with senders"),
+                &block.clone().try_recover().expect("failed to seal block with senders"),
             )?;
         }
 
@@ -993,9 +1005,10 @@ mod tests {
         let provider_rw = factory.provider_rw()?;
         for block in database_blocks {
             provider_rw.insert_block(
-                block.clone().try_recover().expect("failed to seal block with senders"),
+                &block.clone().try_recover().expect("failed to seal block with senders"),
             )?;
         }
+
         provider_rw.commit()?;
 
         // Create a new provider
@@ -1091,7 +1104,7 @@ mod tests {
         let provider_rw = factory.provider_rw()?;
         for block in database_blocks {
             provider_rw.insert_block(
-                block.clone().try_recover().expect("failed to seal block with senders"),
+                &block.clone().try_recover().expect("failed to seal block with senders"),
             )?;
         }
         provider_rw.commit()?;
@@ -1308,7 +1321,7 @@ mod tests {
 
         // Insert and commit the block.
         let provider_rw = factory.provider_rw()?;
-        provider_rw.insert_block(block_1)?;
+        provider_rw.insert_block(&block_1)?;
         provider_rw.commit()?;
 
         let provider = BlockchainProvider::new(factory)?;

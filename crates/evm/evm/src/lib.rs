@@ -44,8 +44,10 @@ pub mod execute;
 mod aliases;
 pub use aliases::*;
 
+#[cfg(feature = "std")]
 mod engine;
-pub use engine::{ConfigureEngineEvm, ExecutableTxIterator};
+#[cfg(feature = "std")]
+pub use engine::{ConfigureEngineEvm, ExecutableTxIterator, ExecutableTxTuple};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -58,8 +60,6 @@ pub use alloy_evm::{
     block::{state_changes, system_calls, OnStateHook},
     *,
 };
-
-pub use alloy_evm::block::state_changes as state_change;
 
 /// A complete configuration of EVM for Reth.
 ///
